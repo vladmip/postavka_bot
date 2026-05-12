@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/bot.db
+data/storage/
+data/cache/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Локальные дампы/заметки от пользователя
+чо делали.txt
+extracted_doc.txt
+мои мысмли и трпебгования.txt
+переписки и файлы менеджер, фулфилмент/
+План_автоматизации_ФФ.docx
+ТЗ Отгрузка шаблон.xlsx
+ТЗ Приемка шаблон.xlsx
+*.zip
+
