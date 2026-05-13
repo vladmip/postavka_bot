@@ -71,3 +71,45 @@ def cache_set(name: str, data: Any) -> None:
         )
     except Exception as e:
         logger.warning("cache_set(%s) failed: %s", name, e)
+
+
+# ── Persistent cooldown ─────────────────────────────────────────────────────
+# Хранит endpoint → unix-ts когда снова можно дёргать.
+# Переживает рестарт бота — иначе пересоздание процесса = сброс защиты.
+
+_COOLDOWN_FILE = _CACHE_DIR / "ozon_cooldown.json"
+
+
+def cooldown_load() -> dict:
+    """Загрузить cooldown-словарь из файла."""
+    if not _COOLDOWN_FILE.exists():
+        return {}
+    try:
+        return json.loads(_COOLDOWN_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("cooldown_load failed: %s", e)
+        return {}
+
+
+def cooldown_save(data: dict) -> None:
+    """Сохранить cooldown-словарь. Чистим устаревшие записи."""
+    now = time.time()
+    cleaned = {k: v for k, v in data.items() if v > now}
+    try:
+        _COOLDOWN_FILE.write_text(json.dumps(cleaned), encoding="utf-8")
+    except Exception as e:
+        logger.warning("cooldown_save failed: %s", e)
+
+
+def cooldown_remaining(name: str) -> int:
+    """Сколько секунд ещё ждать по конкретному endpoint. 0 если можно."""
+    data = cooldown_load()
+    until = data.get(name, 0)
+    return max(0, int(until - time.time()))
+
+
+def cooldown_set(name: str, seconds: int) -> None:
+    """Установить cooldown на endpoint."""
+    data = cooldown_load()
+    data[name] = time.time() + seconds
+    cooldown_save(data)

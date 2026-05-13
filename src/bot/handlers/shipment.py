@@ -12,7 +12,7 @@ Pipeline:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -180,8 +180,14 @@ def _render_request_card(req) -> tuple:
             rows.append([InlineKeyboardButton(text="🔍 Подобрать склад WB",
                                              callback_data=f"ship_hunt:{req.id}")])
         if has_ozon:
-            rows.append([InlineKeyboardButton(text="🚀 Создать поставку Ozon",
-                                             callback_data=f"ozon_book_card:{req.id}")])
+            rows.append([
+                InlineKeyboardButton(text="🚀 Ozon → DIRECT (РФЦ)",
+                                     callback_data=f"ozon_book_card:{req.id}:direct"),
+            ])
+            rows.append([
+                InlineKeyboardButton(text="🚛 Ozon → CROSSDOCK (хаб)",
+                                     callback_data=f"ozon_book_card:{req.id}:cross"),
+            ])
         rows.append([InlineKeyboardButton(text="🛠 Изменить даты",
                                          callback_data=f"ship_plan:{req.id}")])
     if has_wb:
@@ -358,10 +364,7 @@ async def cb_ship_open(cb: CallbackQuery) -> None:
         text, kb = _render_request_card(req)
     await cb.answer()
     if cb.message:
-        try:
-            await cb.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await cb.message.answer(text, reply_markup=kb)
+        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ship_del:"))
@@ -375,14 +378,23 @@ async def cb_ship_del(cb: CallbackQuery) -> None:
         session.delete(req)
     await cb.answer("Удалено")
     if cb.message:
-        await safe_edit_or_answer(cb.message, f"🗑 Заявка #{rid} удалена.")
+        # Возвращаемся к списку заявок
+        await _render_ship_list(cb.message, edit=True)
 
 
 @router.callback_query(F.data == "ship_more")
 async def cb_ship_more(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await cb.answer("Жду файл…")
     if cb.message:
-        await cb.message.answer("📎 Кинь следующий xlsx-файл выгрузки.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀ К списку заявок", callback_data="menu:ships")],
+        ])
+        await safe_edit_or_answer(
+            cb.message,
+            "📎 Кинь следующий xlsx-файл выгрузки — добавлю в текущую заявку "
+            "или создам новую.",
+            reply_markup=kb,
+        )
 
 
 # ── /ship_plan — этап 2: даты + кросс-док ────────────────────────────────────
@@ -405,32 +417,57 @@ async def cb_ship_plan(cb: CallbackQuery, state: FSMContext) -> None:
     rid = int(cb.data.split(":", 1)[1])
     await cb.answer()
     if cb.message:
-        await _start_plan_wizard(cb.message, state, rid)
+        await _start_plan_wizard(cb.message, state, rid, edit=True)
 
 
-async def _start_plan_wizard(msg: Message, state: FSMContext, rid: int) -> None:
-    """Показать заявку + календарь дат."""
+async def _start_plan_wizard(
+    msg: Message, state: FSMContext, rid: int, *, edit: bool = False,
+) -> None:
+    """Показать заявку + календарь дат. edit=True редактирует исходное сообщение.
+
+    Если у заявки уже есть target_date_from/to — предзаполняет выбранные галочки
+    в календаре (пользователь видит свой прошлый выбор и может его подкорректировать).
+    """
+    from datetime import date as _date
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
             await msg.answer(f"Заявка #{rid} не найдена.")
             return
         n_items = len(req.items)
-        # Соберём список уникальных «направлений» (mp+cluster) для шага кросс-док
         directions = sorted({(it.marketplace, it.cluster) for it in req.items})
+
+        # Восстанавливаем галочки из target_date_from/to
+        today = _date.today()
+        preselected: List[int] = []
+        if req.target_date_from:
+            d_from = req.target_date_from.date()
+            d_to = (req.target_date_to or req.target_date_from).date()
+            d_cur = d_from
+            while d_cur <= d_to:
+                off = (d_cur - today).days
+                if 0 <= off < 14:
+                    preselected.append(off)
+                d_cur += timedelta(days=1)
 
     await state.set_state(ShipPlan.dates)
     await state.update_data(
         ship_plan_rid=rid,
-        ship_plan_selected_offsets=[],
+        ship_plan_selected_offsets=preselected,
         ship_plan_directions=[f"{mp}|{cl}" for mp, cl in directions],
         ship_plan_crossdock={},
     )
-    await msg.answer(
+    text = (
         f"🛠 <b>Планирование заявки #{rid}</b> ({n_items} строк, {len(directions)} направлений)\n\n"
-        f"📅 <b>Шаг 1/2.</b> Выбери целевые даты отгрузки (тапом):",
-        reply_markup=kb_dates_picker(set(), days_ahead=14, min_offset=0),
+        f"📅 <b>Шаг 1/2.</b> Выбери целевые даты отгрузки (тапом):"
     )
+    if preselected:
+        text += f"\n<i>Ранее выбрано: {len(preselected)} даты — можешь добавить/убрать тапом.</i>"
+    kb = kb_dates_picker(set(preselected), days_ahead=14, min_offset=0)
+    if edit:
+        await safe_edit_or_answer(msg, text, reply_markup=kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
 
 
 @router.callback_query(ShipPlan.dates, F.data == "dp_lock")
@@ -505,7 +542,7 @@ async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
         label += f" — {d_to:%Y-%m-%d}"
     await cb.answer(f"Даты: {label}")
     if cb.message:
-        await safe_edit_or_answer(cb.message, f"📅 Целевые даты: <b>{label}</b>")
+        # Сразу к подтверждению — _show_confirm отредактирует это же сообщение
         await _ask_crossdock_mode(cb.message, state)
 
 
@@ -625,7 +662,7 @@ async def _show_confirm(msg: Message, state: FSMContext) -> None:
         [InlineKeyboardButton(text="✖ Отмена", callback_data="cancel")],
     ])
     await state.set_state(ShipPlan.confirm)
-    await msg.answer(text, reply_markup=kb)
+    await safe_edit_or_answer(msg, text, reply_markup=kb)
 
 
 @router.callback_query(ShipPlan.confirm, F.data == "ship_plan_save")
@@ -933,9 +970,16 @@ async def cb_hunt_page(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("skip_dir:"))
 async def cb_skip_direction(cb: CallbackQuery) -> None:
+    parts = cb.data.split(":", 1)
+    rid = int(parts[1]) if len(parts) == 2 else None
     await cb.answer("Пропущено")
-    if cb.message:
-        await cb.message.answer("⏭ Направление пропущено.")
+    if cb.message and rid:
+        # Возвращаемся в карточку заявки
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if req:
+                text, kb = _render_request_card(req)
+                await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 # ── /ship_tz — генератор ТЗ Отгрузка xlsx ───────────────────────────────────

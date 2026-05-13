@@ -26,6 +26,17 @@ class OzonAPIError(Exception):
     pass
 
 
+# Ozon после 16.03.2026 перешёл с integer-кодов на string-enum для FBO draft.
+# Старый int-код в payload → Ozon молча трактует как UNSPECIFIED → scoring 404.
+_SUPPLY_TYPE_ENUM = {1: "CROSSDOCK", 2: "DIRECT", 3: "MULTI_CLUSTER"}
+
+
+def _supply_type_str(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return _SUPPLY_TYPE_ENUM.get(int(value), "DIRECT")
+
+
 class OzonClient:
     # Cooldown по endpoint: после 429 не дёргать N сек.
     # Применяется только к account-level лимитам (draft/*/create — 2/мин, 50/час).
@@ -36,11 +47,18 @@ class OzonClient:
 
     # Endpoints с ГЛОБАЛЬНЫМ rate-limit (общий на всех продавцов).
     # Их НЕ кулдауним; вместо этого долбим короткими ретраями.
-    # Источник: тикет Ozon SS, "На /v2/draft/timeslot/info лимит 2 req/sec для всех продавцов".
+    # Источник: тикет Ozon SS + наблюдения (code:8 "request rate limit per second").
     _GLOBAL_LIMIT_PATHS = frozenset({
         "/v1/draft/timeslot/info",
         "/v2/draft/timeslot/info",
         "/v1/supply-order/timeslot/update",
+        "/v1/draft/create/info",
+        "/v2/draft/create/info",
+        "/v1/draft/supply/create",
+        "/v1/draft/supply/create/info",
+        # v2 финализация — с 16.03.2026 заменяет /v1/draft/supply/create.
+        "/v2/draft/supply/create",
+        "/v2/draft/supply/create/status",
     })
 
     def __init__(self, client_id: str, api_key: str, timeout: float = 30.0,
@@ -68,32 +86,85 @@ class OzonClient:
         """
         import time as _t
         is_global = path in OzonClient._GLOBAL_LIMIT_PATHS
-        if retries_on_429 is None:
-            retries_on_429 = 8 if is_global else 1
-        backoff: List[int] = [2, 2, 2, 3, 3, 4, 5, 6] if is_global else [30]
+        # Anti-abuse: только для endpoints, по которым Ozon SS подтверждали
+        # account-level бан. Дефолтно ставим долгий cooldown ТОЛЬКО если
+        # body 429 говорит о бане (не «per second»). См. ниже sniff body.
+        anti_abuse_paths = {
+            "/v1/draft/supply/create/info",
+        }
+        # /v1/draft/supply/create раньше тоже сидел тут, но Ozon отдаёт по нему
+        # `code:8 "request rate limit per second"` — это глобальный per-second
+        # лимит, а не account-ban. Лечится backoff'ом, как timeslot/info.
+        is_anti_abuse = path in anti_abuse_paths
 
-        # Cooldown check — только для account-level paths
-        if not is_global:
-            cooldown_until = OzonClient._COOLDOWN.get(path, 0)
-            if cooldown_until > _t.time():
-                wait = int(cooldown_until - _t.time())
+        if retries_on_429 is None:
+            # Для global-limit endpoints даём 5 ретраев с короткой паузой
+            # (~20 сек окно). Для anti-abuse — 0 (любой ретрай продлевает бан).
+            # Для остальных (account-level) — 1.
+            if is_anti_abuse:
+                retries_on_429 = 0
+            elif is_global:
+                retries_on_429 = 5
+            else:
+                retries_on_429 = 1
+        # Для global-limit endpoints короткие ретраи 2-5с (лимит per-second),
+        # для account-level — единственный длинный 30с (потом cooldown).
+        backoff: List[int] = [30] if not is_global else [2, 3, 4, 5, 5, 5]
+
+        # Cooldown check — persistent (файл), переживает рестарт бота
+        from src.integrations._cache import cooldown_remaining, cooldown_set
+        # Глобальные лимиты не кулдауним (общая квота с другими продавцами).
+        if is_anti_abuse or not is_global:
+            remaining = cooldown_remaining(path)
+            if remaining > 0:
+                wait_min = remaining // 60
+                wait_sec = remaining % 60
                 raise OzonAPIError(
-                    f"Ozon cooldown на {path}: подожди ещё {wait} сек "
-                    f"(method-specific лимит — temporary block)."
+                    f"Cooldown на {path}: подожди {wait_min}м {wait_sec}с. "
+                    f"Каждый запрос во время cooldown может продлить rate-limit на стороне Ozon."
                 )
 
         url = f"{OZON_BASE}{path}"
         client_kwargs: Dict[str, Any] = {"timeout": self.timeout}
         if self.proxy:
-            client_kwargs["proxy"] = self.proxy
+            if self.proxy.lower().startswith(("socks4://", "socks5://", "socks5h://")):
+                # SOCKS-прокси через httpx-socks с remote DNS (rdns=True).
+                # httpx-socks не понимает schema 'socks5h', нормализуем на 'socks5'.
+                from httpx_socks import AsyncProxyTransport
+                pxy = self.proxy
+                if pxy.lower().startswith("socks5h://"):
+                    pxy = "socks5://" + pxy[len("socks5h://"):]
+                client_kwargs["transport"] = AsyncProxyTransport.from_url(pxy, rdns=True)
+            else:
+                client_kwargs["proxy"] = self.proxy
+        # Краткий payload для логов (без credentials — они в headers).
+        import json as _json
+        payload_preview = ""
+        if method == "POST" and json_body is not None:
+            try:
+                payload_preview = _json.dumps(json_body, ensure_ascii=False)
+            except Exception:
+                payload_preview = repr(json_body)
+            if len(payload_preview) > 600:
+                payload_preview = payload_preview[:600] + "…"
+        elif method == "GET" and params:
+            payload_preview = repr(params)[:300]
+
         for attempt in range(retries_on_429 + 1):
-            logger.info("Ozon %s %s (attempt %d/%d)", method, path, attempt + 1, retries_on_429 + 1)
+            logger.info(
+                "Ozon %s %s (attempt %d/%d) payload=%s",
+                method, path, attempt + 1, retries_on_429 + 1, payload_preview,
+            )
             async with httpx.AsyncClient(**client_kwargs) as cli:
                 if method == "POST":
                     r = await cli.post(url, headers=self._headers, json=json_body or {})
                 else:
                     r = await cli.get(url, headers=self._headers, params=params or {})
-            logger.info("Ozon %s → %s (%d bytes)", path, r.status_code, len(r.content or b""))
+            body_preview = (r.text or "")[:800].replace("\n", " ")
+            logger.info(
+                "Ozon %s → %s (%d bytes) body=%s",
+                path, r.status_code, len(r.content or b""), body_preview,
+            )
             if r.status_code == 429:
                 rl_headers = {k: v for k, v in r.headers.items()
                               if "limit" in k.lower() or "retry" in k.lower() or "rate" in k.lower()}
@@ -108,19 +179,27 @@ class OzonClient:
                                    path, wait_s, attempt + 1, retries_on_429)
                     await asyncio.sleep(wait_s)
                     continue
-                # Закончились ретраи
-                if is_global:
+                # Закончились ретраи — решаем по body, это per-second лимит или account-ban.
+                body_lower = (r.text or "").lower()
+                is_per_second = "per second" in body_lower or '"code":8' in body_lower
+                if is_anti_abuse and not is_per_second:
+                    cooldown_set(path, 15 * 60)
                     raise OzonAPIError(
-                        f"429 {path}: глобальный rate-limit Ozon (2 req/sec на всех продавцов). "
-                        f"Сделано {retries_on_429 + 1} попыток — все упёрлись. Повтори через 30-60 сек."
+                        f"Ozon 429 на {path}: anti-abuse rate limit. "
+                        f"Cooldown 15 мин — каждый ретрай продлевает бан."
                     )
-                OzonClient._COOLDOWN[path] = _t.time() + OzonClient._COOLDOWN_SEC
+                if is_global or is_per_second:
+                    raise OzonAPIError(
+                        f"Ozon 429 на {path}: request rate limit per second. "
+                        f"Повтори через 30-60 сек."
+                    )
+                cooldown_set(path, OzonClient._COOLDOWN_SEC)
                 raise OzonAPIError(
-                    f"429 {path}: Ozon заблокировал endpoint. "
-                    f"Попробуй через {OzonClient._COOLDOWN_SEC // 60} мин."
+                    f"Ozon 429 на {path}: account-level rate limit. "
+                    f"Cooldown {OzonClient._COOLDOWN_SEC // 60} мин."
                 )
             if r.status_code >= 400:
-                raise OzonAPIError(f"{r.status_code} {path}: {r.text[:300]}")
+                raise OzonAPIError(f"{r.status_code} {path}: {r.text[:800]}")
             return r.json()
         raise OzonAPIError(f"Unexpected fallthrough on {path}")
 
@@ -235,9 +314,10 @@ class OzonClient:
         Возвращает operation_id.
 
         Новые endpoints (с 03.2026): items + macrolocal_cluster_id внутри cluster_info.
-        deletion_sku_mode — обязательное; 1 = не удалять SKU с ошибками автоматически.
+        deletion_sku_mode: "PARTIAL" (не дропать валидные SKU) или "FULL" (отклонить
+        всю заявку при первой ошибке). Раньше Ozon принимал int 1 — больше нет.
         """
-        payload: Dict[str, Any] = {"deletion_sku_mode": 1}
+        payload: Dict[str, Any] = {"deletion_sku_mode": "PARTIAL"}
 
         if cluster_ids and len(cluster_ids) > 1:
             path = "/v1/draft/multi-cluster/create"
@@ -257,6 +337,16 @@ class OzonClient:
             payload["cluster_info"] = cluster_info
             if "CROSSDOCK" in (draft_type or "").upper():
                 path = "/v1/draft/crossdock/create"
+                # CROSSDOCK + DROPOFF (type=1): сами везём в хаб (drop_off_warehouse).
+                # Захардкожен ДОМОДЕДОВО_РФЦ_КРОССДОКИНГ для теста — рядом с ЛЕБЕР.
+                # TODO: вынести в UI-выбор после успешного теста.
+                payload["delivery_info"] = {
+                    "type": "DROPOFF",
+                    "drop_off_warehouse": {
+                        "warehouse_id": 1020001853795000,
+                        "warehouse_type": "DELIVERY_POINT",
+                    },
+                }
             else:
                 path = "/v1/draft/direct/create"
         data = await self._post(path, payload)
@@ -281,12 +371,43 @@ class OzonClient:
             logger.warning("Ozon %s no draft_id/operation_id: %s", path, str(data)[:500])
         return str(op)
 
-    async def draft_create_info(self, operation_id: str) -> Dict[str, Any]:
-        """POST /v1/draft/create/info — статус создания.
-        Поля: status (CALCULATION_STATUS_*), draft_id, errors.
+    async def draft_create_info(
+        self,
+        operation_id: str = "",
+        draft_id: int = 0,
+        retries_on_429: int = 0,
+    ) -> Dict[str, Any]:
+        """Получить детали draft'а.
+
+        Возвращает clusters[].warehouses[] с полями is_available, total_score,
+        bundle_ids — то самое scoring от Ozon.
+
+        Новые sync endpoints (с 16.03.2026) возвращают draft_id и требуют
+        POST /v2/draft/create/info. Старый POST /v1/draft/create/info оставлен
+        только для legacy operation_id.
+
+        429 здесь = глобальный per-second лимит Ozon. Внутренних ретраев НЕТ
+        (default retries_on_429=0): частые быстрые попытки только усугубляют
+        перегруз и тратят наши слоты. Внешний _fetch_scoring_persistent шлёт
+        запросы раз в 60-90с с jitter — это и есть «спокойный режим».
         """
-        data = await self._post("/v1/draft/create/info", {"operation_id": operation_id})
-        return data
+        if draft_id:
+            return await self._request(
+                "POST", "/v2/draft/create/info",
+                json_body={"draft_id": int(draft_id)},
+                retries_on_429=retries_on_429,
+            )
+        if not operation_id:
+            raise OzonAPIError("draft_create_info требует draft_id или operation_id")
+        return await self._request(
+            "POST", "/v1/draft/create/info",
+            json_body={"operation_id": operation_id},
+            retries_on_429=retries_on_429,
+        )
+
+    # Тумблер версии endpoint timeslot/info. Ozon SS говорил что v2 имеет
+    # 2 req/sec на всех — но v1 у нас тоже 429. Пробуем v2 как альтернативу.
+    TIMESLOT_INFO_PATH = "/v2/draft/timeslot/info"
 
     async def draft_timeslot_info(
         self,
@@ -294,20 +415,57 @@ class OzonClient:
         date_from: str,
         date_to: str,
         warehouse_ids: Optional[List[int]] = None,
+        cluster_id: Optional[int] = None,
+        supply_type: int = 2,  # 1=CROSSDOCK, 2=DIRECT (порядок выявлен экспериментом)
+        retries_on_429: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """POST /v1/draft/timeslot/info — доступные слоты на draft.
+        """POST /v2/draft/timeslot/info (или /v1/ — см. TIMESLOT_INFO_PATH).
 
-        date_from/date_to: 'YYYY-MM-DDTHH:MM:SSZ'
-        Возвращает drop_off_warehouse_timeslots[] с днями и слотами.
+        date_from/date_to:
+          - v2: 'YYYY-MM-DD' (без времени, проверяется regex'ом)
+          - v1: 'YYYY-MM-DDTHH:MM:SSZ'
+        warehouse_ids:
+          - v2: упаковывается в selected_cluster_warehouses вместе с cluster_id
+          - v1: передаётся как warehouse_ids
+        cluster_id — macrolocal_cluster_id того же кластера что и draft (нужен для v2).
         """
+        path = OzonClient.TIMESLOT_INFO_PATH
+        is_v2 = "/v2/" in path
+        if is_v2:
+            date_from = date_from[:10]
+            date_to = date_to[:10]
         payload: Dict[str, Any] = {
             "draft_id": draft_id,
             "date_from": date_from,
             "date_to": date_to,
         }
-        if warehouse_ids:
+        st_str = _supply_type_str(supply_type)
+        if is_v2:
+            # v2 требует supply_type как enum-строку:
+            # "CROSSDOCK" / "DIRECT" / "MULTI_CLUSTER" (после 16.03.2026, не int).
+            payload["supply_type"] = st_str
+            # selected_cluster_warehouses (1-20 items). Поле wh_id зависит от типа:
+            #   DIRECT → storage_warehouse_id (destination РФЦ)
+            #   CROSSDOCK → drop_off_warehouse_id (приёмочный хаб)
+            #   MULTI_CLUSTER → не использует wh_id
+            if not cluster_id:
+                raise OzonAPIError("v2 timeslot/info требует cluster_id")
+            # Поле wh-id зависит от supply_type:
+            #   DIRECT → storage_warehouse_id обязателен (целевой РФЦ).
+            #   CROSSDOCK → НЕ передавать wh. Хаб уже зашит в draft/crossdock/create
+            #     через delivery_info.drop_off_warehouse, timeslot тянется для него.
+            #     Ozon вернёт 400 "not allowed parameter warehouse_id" если передать.
+            #   MULTI_CLUSTER → wh не используется.
+            entry: Dict[str, Any] = {"macrolocal_cluster_id": int(cluster_id)}
+            if warehouse_ids and st_str == "DIRECT":
+                entry["storage_warehouse_id"] = int(warehouse_ids[0])
+            payload["selected_cluster_warehouses"] = [entry]
+        elif warehouse_ids:
             payload["warehouse_ids"] = warehouse_ids
-        return await self._post("/v1/draft/timeslot/info", payload)
+        return await self._request(
+            "POST", path,
+            json_body=payload, retries_on_429=retries_on_429,
+        )
 
     async def draft_supply_create(
         self,
@@ -318,12 +476,23 @@ class OzonClient:
     ) -> str:
         """POST /v1/draft/supply/create — финализировать draft в реальную поставку.
         Возвращает operation_id.
+
+        Timestamp нормализуется: Ozon возвращает в timeslot/info без Z (например
+        "2026-05-15T16:00:00"), но protobuf здесь требует RFC 3339 с timezone (`Z`).
         """
+        # Нормализуем — добавляем Z если нет timezone-маркера
+        def _norm_ts(t: str) -> str:
+            if not t:
+                return t
+            if t.endswith("Z") or "+" in t[10:] or "-" in t[10:]:
+                return t
+            return t + "Z"
+
         payload = {
             "draft_id": draft_id,
             "timeslot": {
-                "from_in_timezone": timeslot_from,
-                "to_in_timezone": timeslot_to,
+                "from_in_timezone": _norm_ts(timeslot_from),
+                "to_in_timezone": _norm_ts(timeslot_to),
             },
             "warehouse_id": warehouse_id,
         }
@@ -331,9 +500,68 @@ class OzonClient:
         return data.get("operation_id", "")
 
     async def draft_supply_create_info(self, operation_id: str) -> Dict[str, Any]:
-        """POST /v1/draft/supply/create/info — статус финализации."""
+        """POST /v1/draft/supply/create/info — статус финализации (legacy v1)."""
         return await self._post("/v1/draft/supply/create/info",
                                  {"operation_id": operation_id})
+
+    async def draft_supply_create_v2(
+        self,
+        draft_id: int,
+        cluster_id: int,
+        warehouse_id: int,
+        timeslot_from: str,
+        timeslot_to: str,
+        supply_type: Any = 2,
+    ) -> List[str]:
+        """POST /v2/draft/supply/create — финализация в supply (актуальный API).
+
+        С 16.03.2026 заменяет /v1/draft/supply/create. Новый payload:
+            draft_id, selected_cluster_warehouses[{macrolocal_cluster_id,
+            storage_warehouse_id}], timeslot{from/to_in_timezone}, supply_type.
+        Ответ sync: {draft_id, error_reasons[]}. error_reasons пустой → ack ok,
+        дальше нужен polling /v2/draft/supply/create/status до status=SUCCESS.
+
+        retries_on_429=1: финальный endpoint самый чувствительный, агрессивные
+        ретраи на нём могут реально повышать риск account-level бана. Лучше
+        одна вежливая попытка, дальше — пользователь жмёт «🔁 Повторить».
+
+        ⚠ Timestamps БЕЗ Z. v2-парсер Ozon отдаёт ошибку
+        `invalid from_in_timezone: parsing time "...Z": extra text: "Z"`
+        если суффикс Z присутствует. В v1 наоборот — Z обязателен.
+        timeslot/info v2 в response отдаёт без Z, поэтому передаём as-is.
+        """
+        def _strip_z(t: str) -> str:
+            if t and t.endswith("Z"):
+                return t[:-1]
+            return t
+
+        payload = {
+            "draft_id": int(draft_id),
+            "selected_cluster_warehouses": [{
+                "macrolocal_cluster_id": int(cluster_id),
+                "storage_warehouse_id": int(warehouse_id),
+            }],
+            "timeslot": {
+                "from_in_timezone": _strip_z(timeslot_from),
+                "to_in_timezone": _strip_z(timeslot_to),
+            },
+            "supply_type": _supply_type_str(supply_type),
+        }
+        data = await self._request(
+            "POST", "/v2/draft/supply/create",
+            json_body=payload, retries_on_429=1,
+        )
+        reasons = data.get("error_reasons") or []
+        return [r for r in reasons if r and r != "UNSPECIFIED"]
+
+    async def draft_supply_create_status_v2(self, draft_id: int) -> Dict[str, Any]:
+        """POST /v2/draft/supply/create/status — статус финализации (v2).
+
+        Возвращает {error_reasons, order_id, status}.
+        status: UNSPECIFIED | SUCCESS | IN_PROGRESS | FAILED.
+        """
+        return await self._post("/v2/draft/supply/create/status",
+                                 {"draft_id": int(draft_id)})
 
     async def supply_order_timeslot_update(
         self,

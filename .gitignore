@@ -5,6 +5,7 @@ __pycache__/
 data/bot.db
 data/storage/
 data/cache/
+logs/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
@@ -20,4 +21,8 @@ extracted_doc.txt
 ТЗ Отгрузка шаблон.xlsx
 ТЗ Приемка шаблон.xlsx
 *.zip
+
+# Документация Ozon API (PDF + извлечённый текст) — тяжёлые, регенерятся
+Документация Ozon Seller API.pdf
+ozon_api_docs.txt
 
