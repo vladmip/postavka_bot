@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
@@ -40,7 +40,7 @@ logger = logging.getLogger("bot.shipment")
 # DB-значения сохраняются как есть — переводим только при отображении.
 _STATE_LABELS = {
     "draft": "✏ Черновик",
-    "planning": "📅 Запланировано",
+    "planning": "✏ Черновик",
     "slot_searching": "🔍 Поиск слотов",
     "supplies_created": "✅ Забронировано",
 }
@@ -210,6 +210,9 @@ def _render_request_card(req) -> tuple:
     if has_ozon:
         rows.append([InlineKeyboardButton(text="🌐 Ozon ЛК → Поставки",
                                          url="https://seller.ozon.ru/app/supply-orders")])
+    rows.append([
+        InlineKeyboardButton(text="🛒 Состав по кластерам", callback_data=f"ship_items:{req.id}"),
+    ])
     rows.append([
         InlineKeyboardButton(text="📤 ТЗ xlsx", callback_data=f"ship_tz:{req.id}"),
         InlineKeyboardButton(text="📎 + Файл", callback_data="ship_more"),
@@ -1009,6 +1012,67 @@ async def cmd_ship_tz(msg: Message, command: CommandObject) -> None:
         await msg.answer("Использование: <code>/ship_tz ID</code>")
         return
     await _send_ship_tz(msg, rid)
+
+
+@router.callback_query(F.data.startswith("ship_items:"))
+async def cb_ship_items(cb: CallbackQuery) -> None:
+    """Развёрнутый состав заявки по кластерам с маркировкой забронированных."""
+    rid = int(cb.data.split(":", 1)[1])
+    await cb.answer()
+    if not cb.message:
+        return
+
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if not req:
+            await cb.message.answer(f"Заявка #{rid} не найдена.")
+            return
+        # Группируем: (marketplace, cluster) → [(article, qty, booked_supply_id, target_warehouse)]
+        groups: Dict[Tuple[str, str], List[Tuple]] = {}
+        for it in req.items:
+            key = (it.marketplace, it.cluster)
+            groups.setdefault(key, []).append((
+                it.raw_article,
+                it.sku.article if it.sku else None,
+                it.qty,
+                it.booked_supply_id,
+                it.target_warehouse,
+            ))
+
+    if not groups:
+        await cb.message.answer(f"Заявка #{rid} пуста.")
+        return
+
+    lines = [f"🛒 <b>Состав заявки #{rid}</b>\n"]
+    mp_emoji = {"wb": "🟣", "ozon": "🔵"}
+    keys_sorted = sorted(groups.keys(), key=lambda x: (x[0] != "ozon", x[1]))
+    for mp, cl in keys_sorted:
+        items = groups[(mp, cl)]
+        total = sum(qty for _, _, qty, _, _ in items)
+        booked_count = sum(1 for _, _, _, bsid, _ in items if bsid)
+        emoji = mp_emoji.get(mp, "•")
+        booked_mark = ""
+        if booked_count and booked_count == len(items):
+            booked_mark = " ✅ Забронировано"
+        elif booked_count:
+            booked_mark = f" ⚠ Частично забронировано ({booked_count}/{len(items)})"
+        lines.append(f"{emoji} <b>{cl}</b> ({len(items)} SKU, {total} шт){booked_mark}")
+        for raw, art, qty, bsid, twh in items:
+            label = art or raw
+            book_info = ""
+            if bsid:
+                book_info = f"  ✓ → {twh or '?'} · #{bsid}"
+            lines.append(f"   • <code>{label}</code> × {qty}{book_info}")
+        lines.append("")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ К карточке", callback_data=f"ship_open:{rid}")],
+    ])
+    text = "\n".join(lines)
+    # Telegram лимит на edit_text = 4096. Если длиннее — режем превью.
+    if len(text) > 3900:
+        text = text[:3850] + "\n\n<i>…длинный список, обрезано</i>"
+    await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ship_tz:"))

@@ -10,7 +10,7 @@ from aiogram.filters import Filter
 from aiogram.types import Message, CallbackQuery, TelegramObject, BotCommand
 
 from src.config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID
-from src.bot.handlers import common, catalog, upload, integrations, shipment, ozon_book, returns
+from src.bot.handlers import common, catalog, upload, integrations, shipment, ozon_book, returns, favorites
 from src.bot.middleware import LogAndCatchMiddleware
 
 
@@ -79,7 +79,7 @@ async def main() -> None:
     user_filter = OnlyAllowedUser()
     for r in (common.router, catalog.router,
               shipment.router, ozon_book.router, upload.router, integrations.router,
-              returns.router):
+              returns.router, favorites.router):
         r.message.filter(user_filter)
         r.callback_query.filter(user_filter)
         dp.include_router(r)

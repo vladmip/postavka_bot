@@ -20,6 +20,7 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
         [InlineKeyboardButton(text="📥 Возвраты", callback_data="menu:returns")],
+        [InlineKeyboardButton(text="⭐ Точки кроссдока", callback_data="menu:favorites")],
         [InlineKeyboardButton(text="🔗 Привязать каталог к МП", callback_data="menu:sku_link")],
         [InlineKeyboardButton(text="🛠 Диагностика", callback_data="menu:diag")],
         [InlineKeyboardButton(text="📚 Справка", callback_data="menu:help")],

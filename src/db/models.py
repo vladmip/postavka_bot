@@ -209,3 +209,35 @@ class ShipmentItem(Base):
 
     request: Mapped["ShipmentRequest"] = relationship("ShipmentRequest", back_populates="items")
     sku: Mapped[Optional["Sku"]] = relationship("Sku", foreign_keys=[sku_id])
+
+
+class OzonDraftCache(Base):
+    """Кэш созданных Ozon-драфтов. Драфт живёт 30 мин у Ozon; переиспользуем
+    в окне 25 мин, чтобы не палить лимит 2/мин на /v1/draft/*/create."""
+    __tablename__ = "ozon_drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("shipment_requests.id", ondelete="CASCADE"), index=True,
+    )
+    cluster: Mapped[str] = mapped_column(String(64))
+    cluster_id: Mapped[int] = mapped_column(Integer)        # macrolocal_cluster_id
+    draft_id: Mapped[int] = mapped_column(Integer)          # Ozon draft_id
+    supply_type: Mapped[int] = mapped_column(Integer)       # 1=CROSSDOCK, 2=DIRECT, 3=MULTI
+    drop_off_warehouse_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class FavoriteCrossdockPoint(Base):
+    """Любимые drop-off точки для кроссдока: ПВЗ/хабы/ФФ — что угодно."""
+    __tablename__ = "favorite_crossdock_points"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128))           # display name
+    warehouse_id: Mapped[int] = mapped_column(Integer)
+    point_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

@@ -125,38 +125,43 @@ async def cb_ret_ozon(cb: CallbackQuery) -> None:
     except OzonAPIError as e:
         logger.info("get-pdf failed: %s", e)
 
-    if not pdf_attached and actionable:
+    if not all_returns:
+        await safe_edit_or_answer(cb.message, "ℹ Возвратов в Ozon нет.", reply_markup=_back_kb())
+        return
+
+    # Если PDF получен — шлём ОДНИМ сообщением: документ + caption со сводкой.
+    # Если PDF нет — текст со списком + инструкцией нажать в ЛК.
+    if pdf_attached:
+        caption_lines = [f"📄 <b>Ozon — возвраты к получению: {len(actionable)}</b>"]
+        for r in (fbo + fbs)[:8]:
+            prod = r.get("product") or {}
+            place = r.get("place") or {}
+            name = (prod.get("name") or "?")[:35]
+            sku = prod.get("offer_id") or prod.get("sku") or "?"
+            wh = (place.get("name") or "?")[:25]
+            caption_lines.append(f"• {name} [{sku}] → {wh}")
+        if len(fbo) + len(fbs) > 8:
+            caption_lines.append(f"…и ещё {len(fbo) + len(fbs) - 8}")
+        caption = "\n".join(caption_lines)[:1020]  # Telegram caption лимит 1024
+
+        # Удаляем сообщение «🔍 Тяну…» и шлём PDF одним документом с caption
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        file = BufferedInputFile(pdf_bytes, filename="ozon_returns.pdf")
+        await cb.message.answer_document(file, caption=caption, reply_markup=_back_kb())
+        return
+
+    # PDF недоступен — текстовый список + инструкция
+    if not actionable:
+        lines.append("✅ Забирать сейчас нечего.")
+    else:
         lines.append(
             "\n📄 <b>PDF этикетки пока нет.</b>\n"
-            "Чтобы её сгенерировать — открой Ozon ЛК → раздел возвратов и нажми "
-            "кнопку <b>«Получить возвраты»</b> в правом верхнем углу. После этого "
-            "возвращайся сюда — PDF приедет документом."
+            "Чтобы её получить — нажми «Получить возвраты» в Ozon ЛК."
         )
-
-    if not all_returns:
-        lines = ["ℹ Возвратов в Ozon нет."]
-
-    # Кнопка прямой ссылки на ЛК Ozon → возвраты (status=30 = «в пункте выдачи»)
-    ozon_returns_url = (
-        "https://seller.ozon.ru/app/returns/supply/common"
-        "?filters=%7B%22returnNumber%22%3A%22%22%2C%22postingNumber%22%3A%22%22"
-        "%2C%22returnSchema%22%3A%22all%22%2C%22productArticle%22%3A%22%22"
-        "%2C%22sort%22%3A%7B%22columnType%22%3A%22state_change%22"
-        "%2C%22sortType%22%3A%22descending%22%7D%2C%22filterBy%22%3A%7B%7D"
-        "%2C%22place%22%3A%22%22%2C%22barcode%22%3A%22%22%7D&status=30"
-    )
-    kb_rows = [
-        [InlineKeyboardButton(text="🌐 Ozon ЛК → «Получить возвраты»",
-                              url=ozon_returns_url)],
-        [InlineKeyboardButton(text="◀ К возвратам", callback_data="menu:returns")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
-    ]
-    full_text = "\n".join(lines)
-    await send_long(cb.message, full_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-
-    if pdf_attached:
-        file = BufferedInputFile(pdf_bytes, filename="ozon_returns_giveout.pdf")
-        await cb.message.answer_document(file, caption="📄 Этикетка получения возвратов Ozon")
+    await send_long(cb.message, "\n".join(lines), reply_markup=_back_kb())
 
 
 @router.callback_query(F.data == "ret:wb")
@@ -220,9 +225,9 @@ async def cb_ret_wb(cb: CallbackQuery) -> None:
             lines.append(f"  …и ещё {len(refunds) - 15}")
 
     lines.append(
-        "\n📄 <b>PDF этикетки получения у WB через API не отдаётся.</b>\n"
-        "Для «забрать товар со склада WB» — открой WB ЛК → Поставки → "
-        "Возвраты, там кнопка «Создать заявку на вывоз».\n"
+        "\n<i>⚠ Это финансовые рефанды (когда деньги вернулись клиенту). "
+        "Возвраты «в пути на ПВЗ» — это покупательский флоу на www.wildberries.ru, "
+        "WB не отдаёт его через Seller API. PDF этикетки тоже только из ЛК.</i>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

@@ -13,6 +13,61 @@
 
 ---
 
+## 2026-05-13 (13:13) — CROSSDOCK end-to-end + UX-сардельки + точки кроссдока
+
+### CROSSDOCK финализирован
+- `OzonClient.draft_create` — убран хардкод `drop_off_warehouse=ДОМОДЕДОВО_РФЦ_КРОССДОКИНГ`. Теперь требует параметр `drop_off_point_warehouse_id` от вызывающего; для CROSSDOCK кидает ошибку если не передан.
+- `_fetch_scoring_persistent`: для `status=SUCCESS` НЕ ретраит даже когда `wh_list` пустой. У Ozon при CROSSDOCK scoring возвращает `storage_warehouse=null` (РФЦ назначения Ozon выбирает сам), это нормальное поведение.
+- `_show_scored_warehouse_picker`: при CROSSDOCK пропускает шаг выбора склада, сразу идёт к `_fetch_slots_for_drafts`. Логика «выбери конкретный РФЦ» только для DIRECT.
+- Также фикс: переменная `state` в parser scoring перекрывала параметр функции — переименована в `wh_state`.
+
+### Точки кроссдока (фаза 2 + 3)
+- Новые таблицы `favorite_crossdock_points` (id, name, warehouse_id, point_type, use_count, last_used_at) и `ozon_drafts` (cache draft_id для переиспользования <25 мин).
+- Меню → «⭐ Точки кроссдока»: список любимых, добавление через имя/ID с поиском, удаление.
+- Поиск через `/v1/warehouse/fbo/list` filter=CROSSDOCK + fallback на `/v1/cluster/list`. FBS endpoint не используем (по требованию пользователя).
+- UI: типы переведены на русский (РФЦ/СЦ/Кроссдок/Точка сдачи/ПВЗ), маркер «(Рекомендуется)» только для крупных. Сортировка: крупные → ПВЗ.
+- Pagination 8 на страницу с «◀ Назад / Вперёд ▶».
+- Common-prefix stripping срезает только по границам слов (`_`, ` `, `,`, `.`, `-`, `/`) и только при ≥4 результатах на странице.
+- Module-кэш `_RECENT_MATCHES` как safety belt если FSM state потеряется.
+- В CROSSDOCK-флоу: до создания draft бот спрашивает drop-off-точку для каждого кластера. UI: ⭐ Любимые сразу + 🏭 «Все хабы» (пагинированный список 71 CROSS_DOCK из cluster_list) + ✏ «Ввести имя» (поиск как в favorites).
+
+### Drafts persistence
+- Таблица `ozon_drafts(request_id, cluster, cluster_id, draft_id, supply_type, drop_off_warehouse_id, created_at, used_at)`.
+- `src/services/draft_cache.py`: `get_fresh_draft`, `save_draft`, `mark_draft_used`, `cleanup_expired`. TTL 25 мин (Ozon держит draft 30 мин, оставляем запас).
+- При повторном «🚀 Создать поставку Ozon» бот переиспользует свежие drafts без `POST /draft/*/create` — экономит 15 сек на каждый кластер + не палит лимит 2/мин.
+
+### Pre-check SKU
+- Перед `draft_create` бот тянет каталог текущего Ozon-кабинета (`product_list`+`product_info_list`) и сверяет наши `ozon_sku` со списком. Если есть «чужие» SKU (из другого кабинета) — блокирует с явным сообщением и инструкцией пересинхронизировать через `/sku_link_ozon`.
+
+### UX: одна «сарделька» вместо россыпи сообщений
+- `src/bot/helpers.py`: `progress_start` / `progress_add` / `progress_reset` — единый status-message, обновляется через `edit_text` по мере прогресса. При переполнении 3800 символов — стартует новое.
+- Замены `msg.answer(...)` на `progress_add(...)` в `_create_drafts_and_fetch_scoring`, `_fetch_scoring_persistent`, `_show_scored_warehouse_picker`, `_fetch_slots_for_drafts`, `_do_book_slot`.
+- Сообщения с кнопками (drop-off picker, slot picker, final summary) остаются отдельно — Telegram inline keyboard на edit'нутом сообщении сложно менять.
+
+### Возвраты
+- Ozon: добавлен `/v1/returns/list` (universal FBO+FBS). Фильтр на сторону бота: показываем только actionable (visual.status «В пункте выдачи» / `ArrivedAtReturnPlace`), архив скрываем. PDF этикетки получения отдаётся одним сообщением + caption со списком SKU.
+- WB: `GET /api/v1/supplier/sales?dateFrom=30d` → фильтр по `saleID` начинающимся с `R` (рефанды). Внятная подсказка что возвраты «в пути» в seller-API не доступны (только в `wildberries.ru/lk/myorders/delivery`).
+- Ключевое: Ozon `get-pdf` возвращает JSON с base64 в поле `pdf` (не `file_content` как в офиц. доке) — поддерживаем оба ключа.
+
+### Скриншоты от пользователя
+- `handle_photo` в upload.py сохраняет фото в `data/screenshots/{ts}_{uniq}.jpg` и отвечает путём. Claude читает напрямую через Read tool.
+
+### Структурные правки
+- 🛒 «Состав по кластерам» в карточке заявки — показывает все SKU по группам, отметка `✓ → склад · #order_id` для забронированных.
+- `_state_label`: русские подписи статусов в UI. `planning` теперь показывается как «✏ Черновик» (как и `draft`) — пользователь так лучше воспринимает.
+- Авто-прогресс к следующему кластеру после успешной брони (был latent bug что rid не передавался в `_do_book_slot` через auto-walk path).
+- Skip уже забронированных кластеров при повторном входе в Ozon-флоу.
+- Auto-walk: фиксил отсутствие `cluster_id`/`supply_type` в slot dict (нужны для v2 API).
+
+### Memory обновлён
+- `reference_ozon_fbo_api.md`: раздел про возвраты + `get-pdf` отдаёт `pdf` key.
+- `feedback_dev_principles.md` (новый): «без костылей, MVP-ready, лишнее стирать сразу».
+
+### Статус
+End-to-end CROSSDOCK работает: создан реальный order_id=104267181 на Ростов через МО_ЩЕРБИНКА_ХАБ.
+
+---
+
 ## 2026-05-13 (10:30) — UX-блок: фильтр дат, русские статусы, ТЗ Отгрузка, возвраты Ozon+WB, скриншоты, pre-check SKU
 
 Большой блок UX/функциональных правок после первой успешной поставки.

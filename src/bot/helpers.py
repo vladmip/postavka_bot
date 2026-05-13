@@ -1,4 +1,9 @@
-"""Утилиты для безопасной работы с Telegram API."""
+"""Утилиты для безопасной работы с Telegram API.
+
+Также — accumulating progress log (одна «сарделька» в чате вместо 10 сообщений).
+Идея: создаём одно сообщение, накапливаем строки и редактируем его (edit_text).
+Если лимит 4096 близко — стартуем новое.
+"""
 import logging
 from typing import Optional
 
@@ -59,3 +64,37 @@ async def send_long(msg: Message, text: str, reply_markup: Optional[InlineKeyboa
             await msg.answer(p, reply_markup=rm)
         except Exception as e:
             logger.exception("send_long part %d failed: %s", i, e)
+
+
+# ── Accumulating progress log ─────────────────────────────────────────────
+
+
+async def progress_start(msg: Message, state, header: str) -> None:
+    """Создать одно status-сообщение и сохранить в state. Дальше — progress_add."""
+    m = await msg.answer(header)
+    await state.update_data(ob_progress_msg_id=m.message_id, ob_progress_text=header)
+
+
+async def progress_add(msg: Message, state, line: str) -> None:
+    """Дописать строку в накопительный status-message. edit_text если влезает,
+    иначе стартует новое сообщение."""
+    data = await state.get_data()
+    msg_id = data.get("ob_progress_msg_id")
+    cur = data.get("ob_progress_text") or ""
+    new = (cur + "\n" + line) if cur else line
+    if msg_id and len(new) < 3800:
+        try:
+            await msg.bot.edit_message_text(
+                new, chat_id=msg.chat.id, message_id=msg_id,
+            )
+            await state.update_data(ob_progress_text=new)
+            return
+        except Exception as e:
+            logger.debug("progress edit_text failed: %s — start new", e)
+    m = await msg.answer(line)
+    await state.update_data(ob_progress_msg_id=m.message_id, ob_progress_text=line)
+
+
+async def progress_reset(state) -> None:
+    """Сбросить (например после завершения флоу) — чтобы следующий вызов начал новое."""
+    await state.update_data(ob_progress_msg_id=None, ob_progress_text=None)

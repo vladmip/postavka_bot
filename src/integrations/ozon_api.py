@@ -337,13 +337,18 @@ class OzonClient:
             payload["cluster_info"] = cluster_info
             if "CROSSDOCK" in (draft_type or "").upper():
                 path = "/v1/draft/crossdock/create"
-                # CROSSDOCK + DROPOFF (type=1): сами везём в хаб (drop_off_warehouse).
-                # Захардкожен ДОМОДЕДОВО_РФЦ_КРОССДОКИНГ для теста — рядом с ЛЕБЕР.
-                # TODO: вынести в UI-выбор после успешного теста.
+                # CROSSDOCK = DROPOFF: товар везут в drop_off_warehouse,
+                # Ozon развозит по конечным РФЦ. Хаб обязательно передаётся
+                # вызывающим — через drop_off_point_warehouse_id.
+                if not drop_off_point_warehouse_id:
+                    raise OzonAPIError(
+                        "Для CROSSDOCK обязателен drop_off_point_warehouse_id "
+                        "(выбери точку отгрузки в боте перед draft_create)."
+                    )
                 payload["delivery_info"] = {
                     "type": "DROPOFF",
                     "drop_off_warehouse": {
-                        "warehouse_id": 1020001853795000,
+                        "warehouse_id": int(drop_off_point_warehouse_id),
                         "warehouse_type": "DELIVERY_POINT",
                     },
                 }
@@ -562,6 +567,64 @@ class OzonClient:
         """
         return await self._post("/v2/draft/supply/create/status",
                                  {"draft_id": int(draft_id)})
+
+    # ── FBO drop-off/хабы — для FBO кроссдока (Щербинка и др.) ─────────────
+
+    async def warehouse_fbo_list(
+        self,
+        supply_types: Optional[List[str]] = None,
+        search: str = "",
+    ) -> List[Dict[str, Any]]:
+        """POST /v1/warehouse/fbo/list — список FBO drop-off точек для поставок.
+
+        supply_types: ["CREATE_TYPE_CROSSDOCK"] для FBO-кроссдок-хабов,
+                      ["CREATE_TYPE_DIRECT"] для прямых поставок.
+                      По умолчанию оба типа.
+        search: текст для поиска, минимум 4 символа.
+
+        Возвращает [{address, coordinates, name, warehouse_id, warehouse_type}],
+        где warehouse_type ∈ {DELIVERY_POINT, ORDERS_RECEIVING_POINT,
+        SORTING_CENTER, FULL_FILLMENT, CROSS_DOCK}.
+        """
+        if not search or len(search) < 4:
+            return []
+        if not supply_types:
+            supply_types = ["CREATE_TYPE_CROSSDOCK", "CREATE_TYPE_DIRECT"]
+        payload = {
+            "filter_by_supply_type": supply_types,
+            "search": search,
+        }
+        data = await self._post("/v1/warehouse/fbo/list", payload)
+        return data.get("search", []) or []
+
+    # ── FBS drop-off (для поиска любимых точек кроссдока) ──────────────────
+
+    async def warehouse_fbs_drop_off_list(
+        self,
+        country_code: str = "RU",
+        latitude: float = 55.755826,
+        longitude: float = 37.6173,
+        address_search: str = "",
+        types: Optional[List[str]] = None,
+        is_kgt: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """POST /v1/warehouse/fbs/create/drop-off/list — список drop-off точек.
+
+        Возвращает [{id, address, type (PVZ/PPZ/SC), coordinates}, ...].
+        Используется для поиска ПВЗ/ППЗ/СЦ по адресу при добавлении любимой точки.
+        """
+        payload: Dict[str, Any] = {
+            "country_code": country_code,
+            "is_kgt": is_kgt,
+            "coordinates": {"latitude": latitude, "longitude": longitude},
+            "search": {
+                "address": address_search,
+            },
+        }
+        if types:
+            payload["search"]["types"] = types
+        data = await self._post("/v1/warehouse/fbs/create/drop-off/list", payload)
+        return data.get("points", []) or []
 
     # ── Возвраты (FBO/FBS Giveout) ──────────────────────────────────────────
 
