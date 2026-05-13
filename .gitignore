@@ -5,6 +5,7 @@ __pycache__/
 data/bot.db
 data/storage/
 data/cache/
+data/screenshots/
 logs/
 *.egg-info/
 .pytest_cache/
@@ -17,6 +18,7 @@ dist/
 extracted_doc.txt
 мои мысмли и трпебгования.txt
 переписки и файлы менеджер, фулфилмент/
+файлы для показа клоду/
 План_автоматизации_ФФ.docx
 ТЗ Отгрузка шаблон.xlsx
 ТЗ Приемка шаблон.xlsx

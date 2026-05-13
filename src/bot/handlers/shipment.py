@@ -36,6 +36,20 @@ router = Router()
 logger = logging.getLogger("bot.shipment")
 
 
+# Перевод служебных state-значений в человекочитаемые подписи (для UI).
+# DB-значения сохраняются как есть — переводим только при отображении.
+_STATE_LABELS = {
+    "draft": "✏ Черновик",
+    "planning": "📅 Запланировано",
+    "slot_searching": "🔍 Поиск слотов",
+    "supplies_created": "✅ Забронировано",
+}
+
+
+def _state_label(state: str) -> str:
+    return _STATE_LABELS.get(state, state)
+
+
 class ShipPick(StatesGroup):
     pick_request = State()
 
@@ -90,7 +104,7 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
                 emoji = "🔵"; bucket = oz_rows
             else:
                 emoji = "🟡"; bucket = mix_rows
-            label = f"{emoji} #{r.id} [{r.state}] · {n_items} строк · {date_s}"
+            label = f"{emoji} #{r.id} [{_state_label(r.state)}] · {n_items} строк · {date_s}"
             bucket.append(InlineKeyboardButton(text=label[:55], callback_data=f"ship_open:{r.id}"))
 
     if not total:
@@ -149,7 +163,7 @@ def _render_request_card(req) -> tuple:
     has_wb = any(it.marketplace == "wb" for it in req.items)
 
     text = (
-        f"📦 <b>Заявка #{req.id}</b> [{req.state}]\n"
+        f"📦 <b>Заявка #{req.id}</b> [{_state_label(req.state)}]\n"
         f"Создана: {req.created_at:%Y-%m-%d %H:%M}\n"
         f"Файлов: {len(files)}\n\n"
         f"<b>Распределение:</b>\n{summary}"
@@ -536,6 +550,7 @@ async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(
         ship_plan_target_date_from=d_from.isoformat(),
         ship_plan_target_date_to=d_to.isoformat() if d_to else None,
+        ship_plan_target_dates=[d.isoformat() for d in dates],
     )
     label = f"{d_from:%Y-%m-%d}"
     if d_to:
@@ -672,6 +687,7 @@ async def cb_sp_save(cb: CallbackQuery, state: FSMContext) -> None:
     rid = data["ship_plan_rid"]
     d_from = data.get("ship_plan_target_date_from")
     d_to = data.get("ship_plan_target_date_to")
+    d_list = data.get("ship_plan_target_dates")
     crossdock = data.get("ship_plan_crossdock", {})
     await state.clear()
 
@@ -684,6 +700,7 @@ async def cb_sp_save(cb: CallbackQuery, state: FSMContext) -> None:
             req.target_date_from = _dt.fromisoformat(d_from)
         if d_to:
             req.target_date_to = _dt.fromisoformat(d_to)
+        req.target_dates_json = d_list or None
         req.crossdock_warehouses_json = crossdock
         req.state = "planning"
 
@@ -729,7 +746,7 @@ async def _run_hunt(msg: Message, rid: int) -> None:
             await msg.answer(f"Заявка #{rid} не найдена.")
             return
         if req.state not in {"planning", "slot_searching", "draft"}:
-            await msg.answer(f"Заявка #{rid} в состоянии [{req.state}] — разведка не нужна.")
+            await msg.answer(f"Заявка #{rid} в состоянии [{_state_label(req.state)}] — разведка не нужна.")
             return
 
         # Целевые даты

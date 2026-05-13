@@ -19,6 +19,7 @@ router = Router()
 def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
+        [InlineKeyboardButton(text="📥 Возвраты", callback_data="menu:returns")],
         [InlineKeyboardButton(text="🔗 Привязать каталог к МП", callback_data="menu:sku_link")],
         [InlineKeyboardButton(text="🛠 Диагностика", callback_data="menu:diag")],
         [InlineKeyboardButton(text="📚 Справка", callback_data="menu:help")],
@@ -120,6 +121,29 @@ async def cb_menu_ships(cb: CallbackQuery) -> None:
     if cb.message:
         from src.bot.handlers.shipment import _render_ship_list
         await _render_ship_list(cb.message, edit=True)
+
+
+# ── menu:returns ──────────────────────────────────────────────────────────
+
+
+@router.callback_query(lambda c: c.data == "menu:returns")
+async def cb_menu_returns(cb: CallbackQuery) -> None:
+    await cb.answer()
+    if cb.message:
+        text = (
+            "📥 <b>Возвраты</b>\n\n"
+            "Тяну PDF этикетки получения возвратов из маркетплейса. "
+            "Одна PDF на партию + список товаров внутри.\n\n"
+            "Выбери маркетплейс:"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔵 Ozon — этикетка получения PDF",
+                                  callback_data="ret:ozon")],
+            [InlineKeyboardButton(text="🟣 Wildberries — PDF возвратов",
+                                  callback_data="ret:wb")],
+            [InlineKeyboardButton(text="◀ Назад", callback_data="menu:home")],
+        ])
+        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 # ── menu:sku_link ─────────────────────────────────────────────────────────

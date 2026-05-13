@@ -33,6 +33,26 @@ from src.services.reconciler import reconcile_prihod
 router = Router()
 
 
+_SCREENSHOTS_DIR = Path(__file__).parent.parent.parent.parent / "data" / "screenshots"
+_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@router.message(F.photo)
+async def handle_photo(msg: Message) -> None:
+    """Сохраняем скрины в data/screenshots/ — чтобы Claude мог их Read'ом читать."""
+    photo = msg.photo[-1]  # самая большая версия
+    ts = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    fname = f"{ts}_{photo.file_unique_id}.jpg"
+    target = _SCREENSHOTS_DIR / fname
+    file = await msg.bot.get_file(photo.file_id)
+    await msg.bot.download_file(file.file_path, destination=target)
+    caption_extra = f"\n💬 Подпись: <i>{msg.caption}</i>" if msg.caption else ""
+    await msg.answer(
+        f"📷 Скрин сохранён:\n<code>{target.as_posix()}</code>{caption_extra}\n\n"
+        f"<i>Скажи мне в чате — я открою и посмотрю что на нём.</i>"
+    )
+
+
 @router.message(F.document)
 async def handle_document(msg: Message, state: FSMContext) -> None:
     doc = msg.document

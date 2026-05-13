@@ -219,6 +219,19 @@ class WBClient:
         data = await self._get(WB_STATISTICS, "/api/v1/supplier/stocks", params)
         return data if isinstance(data, list) else []
 
+    # ── Возвраты (Statistics API) ───────────────────────────────────────────
+
+    async def sales(self, date_from: str, flag: int = 0) -> List[Dict[str, Any]]:
+        """GET /api/v1/supplier/sales?dateFrom=YYYY-MM-DD&flag=0 (statistics-api).
+
+        flag=0 — все события с lastChangeDate >= dateFrom.
+        Возврат отличается полем `saleID`, начинающимся с "R" (refund).
+        ⚠ Лимит ~1 req/min.
+        """
+        params = {"dateFrom": date_from, "flag": flag}
+        data = await self._get(WB_STATISTICS, "/api/v1/supplier/sales", params)
+        return data if isinstance(data, list) else []
+
     # ── Content API: каталог карточек (для линковки SKU ↔ nmID) ─────────────
 
     async def cards_list(self, limit_total: int = 5000) -> List[Dict[str, Any]]:

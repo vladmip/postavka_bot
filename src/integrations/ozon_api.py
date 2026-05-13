@@ -563,6 +563,122 @@ class OzonClient:
         return await self._post("/v2/draft/supply/create/status",
                                  {"draft_id": int(draft_id)})
 
+    # ── Возвраты (FBO/FBS Giveout) ──────────────────────────────────────────
+
+    async def returns_list(
+        self, *, filter_dict: Optional[Dict[str, Any]] = None, limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """POST /v1/returns/list — универсальный список возвратов (FBO + FBS).
+
+        Возвращает массив с полями: id, posting_number, order_id, schema (Fbo/Fbs),
+        product {sku, offer_id, name, quantity, price}, place {id, name, address},
+        return_reason_name, visual.status, logistic.return_date и т.п.
+        """
+        out: List[Dict[str, Any]] = []
+        last_id = 0
+        while True:
+            payload: Dict[str, Any] = {"limit": min(limit, 500), "last_id": last_id}
+            if filter_dict:
+                payload["filter"] = filter_dict
+            data = await self._post("/v1/returns/list", payload)
+            chunk = data.get("returns") or []
+            out.extend(chunk)
+            if not data.get("has_next") or not chunk or len(out) >= limit:
+                break
+            last = chunk[-1].get("id")
+            try:
+                last_id = int(last) if last else 0
+            except (ValueError, TypeError):
+                last_id = 0
+            if not last_id:
+                break
+        return out[:limit]
+
+    async def returns_giveout_is_enabled(self) -> bool:
+        """POST /v1/return/giveout/is-enabled — можно ли вообще забрать возвраты."""
+        data = await self._post("/v1/return/giveout/is-enabled", {})
+        return bool(data.get("enabled"))
+
+    async def returns_giveout_list(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """POST /v1/return/giveout/list — список партий возвратов.
+
+        Возвращает: [{giveout_id, giveout_status, approved_articles_count,
+        total_articles_count, warehouse_address, warehouse_name, warehouse_id, created_at}]
+        Статусы: UNSPECIFIED | CREATED | APPROVED | COMPLETED | CANCELLED.
+        """
+        out: List[Dict[str, Any]] = []
+        last_id = 0
+        while True:
+            data = await self._post(
+                "/v1/return/giveout/list",
+                {"last_id": last_id, "limit": min(limit, 500)},
+            )
+            chunk = data.get("giveouts") or []
+            out.extend(chunk)
+            if not chunk or len(out) >= limit:
+                break
+            last_id = chunk[-1].get("giveout_id") or 0
+            if not last_id:
+                break
+        return out[:limit]
+
+    async def returns_giveout_info(self, giveout_id: int) -> Dict[str, Any]:
+        """POST /v1/return/giveout/info — состав партии возвратов (товары внутри).
+
+        Возвращает: {giveout_id, giveout_status, warehouse_name, warehouse_address,
+        articles: [{name, approved, delivery_schema, seller_id}, ...]}
+        """
+        return await self._post("/v1/return/giveout/info", {"giveout_id": int(giveout_id)})
+
+    async def returns_giveout_get_pdf(self) -> bytes:
+        """POST /v1/return/giveout/get-pdf — PDF этикетки на партию возвратов.
+
+        Ozon отдаёт application/pdf напрямую (не base64 в JSON, как в схеме доков).
+        Возвращает bytes — содержимое PDF.
+        """
+        import httpx
+        url = f"{OZON_BASE}/v1/return/giveout/get-pdf"
+        client_kwargs: Dict[str, Any] = {"timeout": self.timeout}
+        if self.proxy:
+            if self.proxy.lower().startswith(("socks4://", "socks5://", "socks5h://")):
+                from httpx_socks import AsyncProxyTransport
+                pxy = self.proxy
+                if pxy.lower().startswith("socks5h://"):
+                    pxy = "socks5://" + pxy[len("socks5h://"):]
+                client_kwargs["transport"] = AsyncProxyTransport.from_url(pxy, rdns=True)
+            else:
+                client_kwargs["proxy"] = self.proxy
+        async with httpx.AsyncClient(**client_kwargs) as cli:
+            r = await cli.post(url, headers=self._headers, json={})
+        ct = (r.headers.get("content-type") or "").lower()
+        logger.info("Ozon /v1/return/giveout/get-pdf → %s (%d bytes, ct=%s)",
+                    r.status_code, len(r.content or b""), ct)
+        if r.status_code >= 400:
+            raise OzonAPIError(f"{r.status_code} /v1/return/giveout/get-pdf: {r.text[:500]}")
+        # Ozon чаще всего отдаёт JSON с base64-кодированным PDF в одном
+        # из полей: 'pdf' (как в реальности) или 'file_content' (как в доках).
+        # Реже — сырой application/pdf. Поддерживаем все варианты.
+        if "json" in ct or r.content[:1] == b"{":
+            try:
+                data = r.json()
+                fc = data.get("pdf") or data.get("file_content") or data.get("content")
+                if fc:
+                    import base64
+                    if fc.startswith("data:"):
+                        fc = fc.split(",", 1)[-1]
+                    decoded = base64.b64decode(fc, validate=False)
+                    logger.info(
+                        "Ozon PDF (из JSON): %d bytes, head=%r",
+                        len(decoded), decoded[:8],
+                    )
+                    return decoded
+                logger.warning("Ozon get-pdf JSON без PDF-поля: keys=%s",
+                               list(data.keys())[:10])
+            except Exception as e:
+                logger.warning("Ozon get-pdf JSON parse failed: %s", e)
+        logger.info("Ozon PDF raw: head=%r", r.content[:8])
+        return r.content
+
     async def supply_order_timeslot_update(
         self,
         supply_order_id: int,

@@ -174,6 +174,10 @@ class ShipmentRequest(Base):
     # Параметры отгрузки (заполняются на этапе wizard)
     target_date_from: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     target_date_to: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Конкретные выбранные даты (список ISO-строк "YYYY-MM-DD"). Если None —
+    # используется диапазон from..to. Введено, чтобы фильтровать слоты Ozon
+    # по точным галочкам пользователя (Ozon-API принимает только диапазон).
+    target_dates_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     crossdock_warehouses_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # Для каждого направления: {'wb_Центральный': 'Внуково', 'ozon_Москва...': 'any'}
 

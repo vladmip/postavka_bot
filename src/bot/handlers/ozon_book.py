@@ -176,6 +176,42 @@ def _parse_v2_timeslots(
     return out
 
 
+async def _validate_skus_in_current_account(
+    oz: OzonClient, items_to_check: List[int]
+) -> Tuple[List[int], Dict[int, str]]:
+    """Pre-check: проверяет, что все ozon_sku из items_to_check реально существуют
+    в текущем Ozon-кабинете. Защита от стейлых артикулов с другого аккаунта.
+
+    Возвращает (missing_skus, sku_to_offer_id) — missing_skus это те, которые
+    отсутствуют в кабинете. sku_to_offer_id — для известных, чтобы показать
+    пользователю «sku=123 = offer_id=KINDER».
+    """
+    try:
+        prods = await oz.product_list(limit=5000)
+        ids = [p.get("product_id") for p in prods if p.get("product_id")]
+        if not ids:
+            return list(items_to_check), {}
+        infos = await oz.product_info_list(ids)
+    except OzonAPIError as e:
+        logger.warning("pre-check sku validation failed: %s", e)
+        # Не блокируем при ошибке API на pre-check — пусть основной флоу сам решает
+        return [], {}
+
+    valid: Dict[int, str] = {}
+    for it in infos:
+        offer_id = it.get("offer_id") or ""
+        v = it.get("sku") or it.get("fbo_sku") or it.get("fbs_sku") or it.get("product_id")
+        try:
+            v = int(v) if v else None
+        except (ValueError, TypeError):
+            v = None
+        if v:
+            valid[v] = offer_id
+
+    missing = [s for s in items_to_check if s not in valid]
+    return missing, valid
+
+
 def _build_items_for_cluster(req: ShipmentRequest, cluster: str) -> Tuple[List[Dict], List[str]]:
     """Собрать items для draft из заявки.
     Возвращает (items, missing_articles).
@@ -296,6 +332,10 @@ async def _start_ozon_book_wizard(
             summaries.append((cl, len(items), total_qty, missing))
         date_from = req.target_date_from.date().isoformat()
         date_to = (req.target_date_to or req.target_date_from).date().isoformat()
+        # Список конкретно выбранных дат (для фильтрации слотов на нашей стороне:
+        # Ozon-API принимает только диапазон date_from..date_to и возвращает все
+        # дни между ними, включая невыбранные).
+        date_picks = list(req.target_dates_json or [])
 
     if not summaries:
         await msg.answer(f"В заявке #{rid} нет Ozon-направлений.")
@@ -323,6 +363,7 @@ async def _start_ozon_book_wizard(
         ob_clusters=[s[0] for s in summaries],
         ob_date_from=date_from,
         ob_date_to=date_to,
+        ob_date_picks=date_picks,
         ob_type=ob_type,
         ob_wh_choices={},
         ob_cluster_idx=0,
@@ -378,6 +419,35 @@ async def _fetch_scoring_persistent(
 
         clusters_info = info.get("clusters") or []
         status = (clusters_info[0] if clusters_info else {}).get("status") or info.get("status")
+        status_upper_top = str(status or "").upper()
+        # FAILED + errors[].items_validation — фатальный отказ Ozon (товар
+        # не в ассортименте кластера, и т.п.). Ретраить бесполезно — это
+        # серверная политика, а не «scoring ещё считается».
+        errors = info.get("errors") or []
+        if status_upper_top == "FAILED" and errors:
+            lines: List[str] = []
+            for err in errors[:3]:
+                err_msg = err.get("error_message") or err.get("message") or "?"
+                validations = err.get("items_validation") or []
+                if validations:
+                    for v in validations[:5]:
+                        for ri in (v.get("rejected_items") or [])[:5]:
+                            reasons = ", ".join(ri.get("reasons") or [])
+                            lines.append(
+                                f"   SKU <code>{ri.get('sku')}</code> в кластере {v.get('macrolocal_cluster_id')}: {reasons}"
+                            )
+                else:
+                    reasons = ", ".join(err.get("error_reasons") or [])
+                    lines.append(f"   {err_msg}: {reasons}")
+            detail = "\n".join(lines) if lines else "(детали Ozon не вернул)"
+            await msg.answer(
+                f"  🚫 <b>Ozon отклонил draft</b> (status=FAILED).\n{detail}\n\n"
+                f"<i>Самая частая причина OUT_OF_ASSORTMENT — товар не в "
+                f"ассортименте кластера для FBO. Иногда Ozon ЛК пускает в обход API "
+                f"(другой контракт/тип поставки). Проверь карточку товара в Seller "
+                f"Center: «Доступность по кластерам» / «Регионы».</i>"
+            )
+            return []
         n_unspecified = 0
         for c in clusters_info:
             for w in (c.get("warehouses") or []):
@@ -463,6 +533,49 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
     oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
     drafts_made: List[Dict] = []
     scored_by_cluster: Dict[str, List[Dict]] = {}  # cluster → [{wh_id, name, score, available, reason}]
+
+    # Pre-check: проверяем, что все ozon_sku из заявки реально есть в текущем
+    # Ozon-кабинете. Без этого мы рискуем получить OUT_OF_ASSORTMENT (если
+    # ozon_sku из другого кабинета) или, что хуже, успешно отправить мусор.
+    all_skus_to_check: List[int] = []
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if req:
+            for cl in clusters:
+                items_check, _ = _build_items_for_cluster(req, cl)
+                for it in items_check:
+                    if it["sku"] not in all_skus_to_check:
+                        all_skus_to_check.append(it["sku"])
+    if all_skus_to_check:
+        await msg.answer("🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
+        missing, valid_map = await _validate_skus_in_current_account(oz, all_skus_to_check)
+        if missing:
+            # Подтащим article+offer_id для понятного сообщения
+            lines: List[str] = []
+            with db_session() as session:
+                from src.db.models import Sku
+                bad_skus = session.query(Sku).filter(Sku.ozon_sku.in_(missing)).all()
+                seen_sku = set()
+                for s in bad_skus:
+                    seen_sku.add(s.ozon_sku)
+                    lines.append(
+                        f"  • <code>{s.article}</code> (offer_id=<code>{s.ozon_offer_id or '?'}</code>, "
+                        f"sku=<code>{s.ozon_sku}</code>)"
+                    )
+                for s in missing:
+                    if s not in seen_sku:
+                        lines.append(f"  • sku=<code>{s}</code> (нет в нашей БД)")
+            await msg.answer(
+                f"🚫 <b>Стоп — артикулы не из текущего кабинета.</b>\n\n"
+                f"В Ozon (client_id={CLIENT_ID_OZON}) нет таких SKU:\n"
+                + "\n".join(lines[:15])
+                + ("\n  …" if len(lines) > 15 else "")
+                + "\n\nОзон ответил бы <code>OUT_OF_ASSORTMENT</code> и заявка бы не прошла.\n"
+                "<i>Открой меню → 🔗 Привязать каталог → или </i><code>/sku_link_ozon</code><i> "
+                "чтобы пересинхронизировать SKU.</i>"
+            )
+            await state.clear()
+            return
 
     for cl in clusters:
         await msg.answer(f"🔄 Кластер <b>«{cl}»</b>…")
@@ -926,6 +1039,46 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
 
     oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
 
+    # Pre-check SKU (см. _create_drafts_and_fetch_scoring — та же логика)
+    all_skus_to_check: List[int] = []
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if req:
+            for cl in clusters:
+                items_check, _ = _build_items_for_cluster(req, cl)
+                for it in items_check:
+                    if it["sku"] not in all_skus_to_check:
+                        all_skus_to_check.append(it["sku"])
+    if all_skus_to_check:
+        await msg.answer("🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
+        missing, _ = await _validate_skus_in_current_account(oz, all_skus_to_check)
+        if missing:
+            lines: List[str] = []
+            with db_session() as session:
+                from src.db.models import Sku
+                bad_skus = session.query(Sku).filter(Sku.ozon_sku.in_(missing)).all()
+                seen_sku = set()
+                for s in bad_skus:
+                    seen_sku.add(s.ozon_sku)
+                    lines.append(
+                        f"  • <code>{s.article}</code> (offer_id=<code>{s.ozon_offer_id or '?'}</code>, "
+                        f"sku=<code>{s.ozon_sku}</code>)"
+                    )
+                for s in missing:
+                    if s not in seen_sku:
+                        lines.append(f"  • sku=<code>{s}</code> (нет в нашей БД)")
+            await msg.answer(
+                f"🚫 <b>Стоп — артикулы не из текущего кабинета.</b>\n\n"
+                f"В Ozon (client_id={CLIENT_ID_OZON}) нет таких SKU:\n"
+                + "\n".join(lines[:15])
+                + ("\n  …" if len(lines) > 15 else "")
+                + "\n\nОзон ответил бы <code>OUT_OF_ASSORTMENT</code> и заявка бы не прошла.\n"
+                "<i>Открой меню → 🔗 Привязать каталог → или </i><code>/sku_link_ozon</code><i> "
+                "чтобы пересинхронизировать SKU.</i>"
+            )
+            await state.clear()
+            return
+
     # Под каждый кластер — отдельный draft с выбранным drop-off складом
     drafts_made: List[Dict] = []
     for cl in clusters:
@@ -1079,6 +1232,20 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
             )
             continue
 
+        # Фильтруем по выбранным пользователем датам (Ozon-API принимает только
+        # диапазон date_from..date_to и возвращает все дни между ними).
+        date_picks = data.get("ob_date_picks") or []
+        if date_picks:
+            picks_set = set(date_picks)
+            total_before = len(parsed_slots)
+            parsed_slots = [e for e in parsed_slots if e["from"][:10] in picks_set]
+            if total_before and not parsed_slots:
+                await msg.answer(
+                    f"🔴 Для «{d['cluster']}» слоты есть, но не на выбранные тобой даты "
+                    f"({', '.join(sorted(picks_set))}). Открой «🛠 Изменить даты»."
+                )
+                continue
+
         lines = [f"🟢 <b>{d['cluster']}</b> — {len(parsed_slots)} слотов"]
         for entry in parsed_slots[:20]:
             slot_counter += 1
@@ -1133,6 +1300,7 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 failed_drafts,
                 data["ob_date_from_iso"],
                 data["ob_date_to_iso"],
+                data.get("ob_date_picks") or [],
             ))
             _AUTO_POLL_TASKS[rid] = task
 
@@ -1184,6 +1352,7 @@ async def _auto_poll_slots(
     drafts: List[Dict],
     date_from_iso: str,
     date_to_iso: str,
+    date_picks: Optional[List[str]] = None,
 ) -> None:
     """Раз в 60 сек дёргает timeslot/info. До 25 мин (draft живёт 30 мин).
     При успехе — постит слоты пользователю и завершается.
@@ -1226,6 +1395,9 @@ async def _auto_poll_slots(
                         fallback_wh_id=wh_id_filter,
                         fallback_wh_name="",
                     )
+                    if date_picks:
+                        picks_set = set(date_picks)
+                        entries = [e for e in entries if e["from"][:10] in picks_set]
                     for e in entries:
                         all_slot_entries.append({
                             "draft_id": d["draft_id"],
