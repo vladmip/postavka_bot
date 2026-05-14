@@ -122,6 +122,42 @@ _FOUND_SLOTS: Dict[str, Dict] = {}
 # Защищает от двойного запроса при двойном тапе слота (Telegram задержки + человек).
 _BOOKING_IN_FLIGHT: set = set()
 
+# Single-flight lock на уровне «весь wizard для заявки»: TTL 30 минут.
+# Защищает от двойного тапа «🚀 Создать поставку Ozon» в карточке заявки.
+# Значение — timestamp начала. Авто-снимается через 30 мин.
+import time as _time
+_WIZARD_IN_FLIGHT: Dict[int, float] = {}
+_WIZARD_TTL_SEC = 30 * 60
+
+
+def _wizard_acquire(rid: int) -> bool:
+    """True если lock взят, False если уже занят (рестарт wizard'а блокируется)."""
+    now = _time.time()
+    # GC: убираем просроченные locks (защита от висяков)
+    for k in list(_WIZARD_IN_FLIGHT.keys()):
+        if now - _WIZARD_IN_FLIGHT[k] > _WIZARD_TTL_SEC:
+            _WIZARD_IN_FLIGHT.pop(k, None)
+    if rid in _WIZARD_IN_FLIGHT:
+        return False
+    _WIZARD_IN_FLIGHT[rid] = now
+    return True
+
+
+def _wizard_release(rid: int) -> None:
+    _WIZARD_IN_FLIGHT.pop(rid, None)
+
+
+async def _release_wizard_for_state(state: FSMContext) -> None:
+    """Снять wizard-lock на основе rid из текущего FSM-state. Используется
+    в early-exits внутри multi-step wizard'а, чтобы lock не висел до TTL."""
+    try:
+        data = await state.get_data()
+        rid = data.get("ob_rid")
+        if rid:
+            _wizard_release(int(rid))
+    except Exception:
+        pass
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -215,9 +251,10 @@ async def _validate_skus_in_current_account(
 
 
 def _build_items_for_cluster(req: ShipmentRequest, cluster: str) -> Tuple[List[Dict], List[str]]:
-    """Собрать items для draft из заявки.
+    """Собрать items для draft из заявки. Использует ozon_product.sku (числовой).
+
     Возвращает (items, missing_articles).
-    items: [{"sku": int, "quantity": int}]  ← Ozon API требует sku (числовой product_id).
+    items: [{"sku": int, "quantity": int}]  ← Ozon API требует sku.
     """
     items: List[Dict] = []
     missing: List[str] = []
@@ -225,11 +262,11 @@ def _build_items_for_cluster(req: ShipmentRequest, cluster: str) -> Tuple[List[D
     for it in req.items:
         if it.marketplace != "ozon" or it.cluster != cluster:
             continue
-        sku = it.sku
-        if not sku or not sku.ozon_sku:
+        op = it.ozon_product
+        if not op or not op.sku:
             missing.append(it.raw_article)
             continue
-        by_sku[sku.ozon_sku] = by_sku.get(sku.ozon_sku, 0) + it.qty
+        by_sku[op.sku] = by_sku.get(op.sku, 0) + it.qty
     for ozon_sku, qty in by_sku.items():
         items.append({"sku": ozon_sku, "quantity": qty})
     return items, missing
@@ -308,21 +345,49 @@ async def cmd_ozon_book(msg: Message, command: CommandObject, state: FSMContext)
 async def cb_ozon_book_from_card(cb: CallbackQuery, state: FSMContext) -> None:
     """Триггер /ozon_book из карточки заявки. Формат: ozon_book_card:<rid> или ozon_book_card:<rid>:<mode>.
     Mode: 'direct' (default) | 'cross'.
+
+    Single-flight: если wizard уже бежит для этой заявки — игнорируем повторный
+    тап (anti-double-click). Кнопки на исходной карточке сразу гасим чтобы
+    юзер не мог тапнуть второй раз пока мастер думает.
     """
     parts = cb.data.split(":")
     rid = int(parts[1])
     mode = parts[2] if len(parts) >= 3 else "direct"
+    if not _wizard_acquire(rid):
+        await cb.answer(
+            f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения.",
+            show_alert=True,
+        )
+        return
     await cb.answer(f"Запускаю Ozon-мастер ({mode.upper()})…")
+    # Гасим кнопки на карточке чтобы исключить повторный клик.
     if cb.message:
-        await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        try:
+            launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+        except Exception:
+            _wizard_release(rid)
+            raise
+        if not launched:
+            # Early exit (нет ключей/нет дат/всё забронировано) — снять lock сразу,
+            # иначе юзер будет ждать 30 мин TTL чтобы перезапустить.
+            _wizard_release(rid)
+    else:
+        _wizard_release(rid)
 
 
 async def _start_ozon_book_wizard(
     msg: Message, state: FSMContext, rid: int, *, mode: str = "direct",
-) -> None:
+) -> bool:
+    """Возвращает True если wizard взлетел в multi-step FSM-режим, False — если
+    был early-exit (нет ключей/нет дат/всё уже забронировано). Caller использует
+    результат чтобы решить — снимать ли lock сразу."""
     if not APIKEY_OZON or not CLIENT_ID_OZON:
         await msg.answer("⚠ Ozon-ключи не заданы. /api_check для проверки.")
-        return
+        return False
 
     # Собираем Ozon-направления заявки
     summaries: List[Tuple[str, int, int, List[str]]] = []  # (cluster, n_items, total_qty, missing)
@@ -330,12 +395,12 @@ async def _start_ozon_book_wizard(
         req = get_shipment_request(session, rid)
         if not req:
             await msg.answer(f"Заявка #{rid} не найдена.")
-            return
+            return False
         if not req.target_date_from:
             await msg.answer(
                 f"⚠ У заявки #{rid} нет целевых дат. Сначала /ship_plan."
             )
-            return
+            return False
 
         all_oz_clusters = sorted({it.cluster for it in req.items if it.marketplace == "ozon"})
         # Кластер уже забронирован, если у ЛЮБОГО его item проставлен booked_supply_id.
@@ -363,7 +428,7 @@ async def _start_ozon_book_wizard(
             )
         else:
             await msg.answer(f"В заявке #{rid} нет Ozon-направлений.")
-        return
+        return False
 
     lines = [f"📦 <b>Создание Ozon-поставок для заявки #{rid}</b>\n"]
     if booked_clusters:
@@ -400,12 +465,32 @@ async def _start_ozon_book_wizard(
         ob_dropoff_choices={},  # cluster_name → {wh_id, name}
     )
     lines.append(f"\n📦 Режим: <b>{type_label}</b>")
-    await msg.answer("\n".join(lines))
+    # Начинаем новую «сардельку» с info card. Drop-off-picker и slot-picker
+    # остаются отдельными (нужны inline-кнопки), но всё остальное (info →
+    # drop-off-confirm → создание драфтов → scoring) попадает в одно сообщение.
+    await progress_reset(state)
+    await progress_start(msg, state, "\n".join(lines))
     if mode == "cross":
-        # CROSSDOCK: спрашиваем drop-off-точку для каждого кластера
-        await _ask_dropoff_for_next_cluster(msg, state)
+        from src.services.draft_cache import get_dropoff_choices_for_request
+        with db_session() as session:
+            cached_choices = get_dropoff_choices_for_request(session, rid)
+        oz_clusters = [s[0] for s in summaries]
+        if oz_clusters and all(c in cached_choices for c in oz_clusters):
+            await state.update_data(ob_dropoff_choices=cached_choices)
+            await progress_add(
+                msg, state,
+                "\n♻ Drop-off-точки восстановлены из прошлого выбора:\n"
+                + "\n".join(
+                    f"  • <b>{cached_choices[c]['name']}</b> → «{c}»"
+                    for c in oz_clusters
+                )
+            )
+            await _create_drafts_and_fetch_scoring(msg, state)
+        else:
+            await _ask_dropoff_for_next_cluster(msg, state)
     else:
         await _create_drafts_and_fetch_scoring(msg, state)
+    return True
 
 
 async def _fetch_scoring_persistent_with_state(
@@ -414,6 +499,21 @@ async def _fetch_scoring_persistent_with_state(
     """Обёртка над _fetch_scoring_persistent, использующая progress_add вместо
     msg.answer когда передан state. Так status падает в одну «сардельку»."""
     return await _fetch_scoring_persistent(oz, draft_id, msg, state=state)
+
+
+async def _invalidate_failed_draft(draft_id: int) -> None:
+    """Удалить cached draft если scoring провалился — чтобы при повторном
+    входе бот не подтянул его и выбранный drop-off-хаб заново."""
+    from src.db.models import OzonDraftCache
+    try:
+        with db_session() as session:
+            row = session.query(OzonDraftCache).filter(
+                OzonDraftCache.draft_id == draft_id
+            ).first()
+            if row:
+                session.delete(row)
+    except Exception as e:
+        logger.warning("invalidate_failed_draft failed: %s", e)
 
 
 async def _fetch_scoring_persistent(
@@ -470,27 +570,60 @@ async def _fetch_scoring_persistent(
         errors = info.get("errors") or []
         if status_upper_top == "FAILED" and errors:
             lines: List[str] = []
+            # Собираем все error_reasons чтобы выбрать правильную подсказку
+            all_reasons: set = set()
             for err in errors[:3]:
                 err_msg = err.get("error_message") or err.get("message") or "?"
                 validations = err.get("items_validation") or []
                 if validations:
                     for v in validations[:5]:
                         for ri in (v.get("rejected_items") or [])[:5]:
-                            reasons = ", ".join(ri.get("reasons") or [])
+                            reasons = ri.get("reasons") or []
+                            for r in reasons:
+                                all_reasons.add(str(r).upper())
                             lines.append(
-                                f"   SKU <code>{ri.get('sku')}</code> в кластере {v.get('macrolocal_cluster_id')}: {reasons}"
+                                f"   SKU <code>{ri.get('sku')}</code> в кластере "
+                                f"{v.get('macrolocal_cluster_id')}: {', '.join(reasons)}"
                             )
                 else:
-                    reasons = ", ".join(err.get("error_reasons") or [])
-                    lines.append(f"   {err_msg}: {reasons}")
+                    reasons = err.get("error_reasons") or []
+                    for r in reasons:
+                        all_reasons.add(str(r).upper())
+                    # error_message может быть сам по себе важной причиной
+                    if err_msg and err_msg != "?":
+                        all_reasons.add(err_msg.upper())
+                    lines.append(f"   {err_msg}: {', '.join(reasons) if reasons else ''}")
             detail = "\n".join(lines) if lines else "(детали Ozon не вернул)"
+
+            # Подсказка зависит от типа ошибки
+            hint = ""
+            if any("DROP_OFF_POINT_HAS_NO_TIMESLOTS" in r or "NO_TIMESLOTS" in r for r in all_reasons):
+                hint = (
+                    "<i>У выбранной drop-off-точки нет таймслотов для этого кластера "
+                    "на твои даты. Попробуй: (1) расширить диапазон дат, (2) выбрать "
+                    "другой drop-off хаб (через ⭐ Точки кроссдока).</i>"
+                )
+            elif any("OUT_OF_ASSORTMENT" in r for r in all_reasons):
+                hint = (
+                    "<i>Товар не в ассортименте кластера для FBO. Проверь карточку "
+                    "товара в Seller Center: «Доступность по кластерам» / «Регионы».</i>"
+                )
+            elif any("INVALID_ROUTE" in r for r in all_reasons):
+                hint = (
+                    "<i>Из выбранной drop-off-точки маршрут до этого кластера не "
+                    "обслуживается Ozon. Попробуй другой хаб.</i>"
+                )
+            else:
+                hint = (
+                    "<i>Ozon отклонил scoring. См. конкретную причину выше.</i>"
+                )
             await _say(
-                f"  🚫 <b>Ozon отклонил draft</b> (status=FAILED).\n{detail}\n\n"
-                f"<i>Самая частая причина OUT_OF_ASSORTMENT — товар не в "
-                f"ассортименте кластера для FBO. Иногда Ozon ЛК пускает в обход API "
-                f"(другой контракт/тип поставки). Проверь карточку товара в Seller "
-                f"Center: «Доступность по кластерам» / «Регионы».</i>"
+                f"  🚫 <b>Ozon отклонил draft</b> (status=FAILED).\n{detail}\n\n{hint}"
             )
+            # Удаляем cached draft чтобы при повторном входе тот же drop-off
+            # не подтянулся заново и не зациклил ту же ошибку.
+            if any("NO_TIMESLOTS" in r or "INVALID_ROUTE" in r for r in all_reasons):
+                await _invalidate_failed_draft(draft_id)
             return []
         n_unspecified = 0
         for c in clusters_info:
@@ -592,9 +725,9 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
                 for it in items_check:
                     if it["sku"] not in all_skus_to_check:
                         all_skus_to_check.append(it["sku"])
-    # Стартуем накопительный status-message (одна «сарделька» вместо кучи)
-    await progress_reset(state)
-    await progress_start(msg, state, "⚙ <b>Создаю поставку Ozon…</b>")
+    # Продолжаем «сардельку» начатую в _start_ozon_book_wizard. Если её нет
+    # (например прямой вход через /ozon_book) — progress_start создаст новую.
+    await progress_start(msg, state, "\n⚙ <b>Создаю поставку Ozon…</b>")
 
     if all_skus_to_check:
         await progress_add(msg, state, "🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
@@ -603,14 +736,13 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
             # Подтащим article+offer_id для понятного сообщения
             lines: List[str] = []
             with db_session() as session:
-                from src.db.models import Sku
-                bad_skus = session.query(Sku).filter(Sku.ozon_sku.in_(missing)).all()
+                from src.db.models import OzonProduct
+                bad = session.query(OzonProduct).filter(OzonProduct.sku.in_(missing)).all()
                 seen_sku = set()
-                for s in bad_skus:
-                    seen_sku.add(s.ozon_sku)
+                for p in bad:
+                    seen_sku.add(p.sku)
                     lines.append(
-                        f"  • <code>{s.article}</code> (offer_id=<code>{s.ozon_offer_id or '?'}</code>, "
-                        f"sku=<code>{s.ozon_sku}</code>)"
+                        f"  • <code>{p.offer_id}</code> (sku=<code>{p.sku}</code>)"
                     )
                 for s in missing:
                     if s not in seen_sku:
@@ -650,8 +782,15 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
                 "draft_id": cached["draft_id"],
                 "supply_type": cached["supply_type"],
             })
-            wh_list = await _fetch_scoring_persistent(oz, cached["draft_id"], msg, state=state)
-            scored_by_cluster[cl] = wh_list
+            is_cross = "CROSSDOCK" in (draft_type or "").upper()
+            if is_cross:
+                # CROSSDOCK: scoring всегда даёт wh_list=[] (Ozon сам выбирает РФЦ).
+                # Re-fetch не нужен → не палим лимит 2/sec для повторных заходов.
+                scored_by_cluster[cl] = []
+            else:
+                # DIRECT: scoring результат нужен для picker'а РФЦ. Re-fetch.
+                wh_list = await _fetch_scoring_persistent(oz, cached["draft_id"], msg, state=state)
+                scored_by_cluster[cl] = wh_list
             continue
 
         # 2. Свежего нет — создаём новый
@@ -683,6 +822,7 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
         # Для CROSSDOCK: достаём drop-off-точку, выбранную ранее юзером для этого кластера
         dropoff_choices = data.get("ob_dropoff_choices") or {}
         drop_off_wh = None
+        drop_off_name = None
         if "CROSSDOCK" in (draft_type or "").upper():
             choice = dropoff_choices.get(cl)
             if not choice:
@@ -692,6 +832,7 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
                 )
                 continue
             drop_off_wh = int(choice.get("wh_id"))
+            drop_off_name = choice.get("name")
         try:
             op_id = await oz.draft_create(
                 items=items, cluster_ids=[cid], draft_type=draft_type,
@@ -714,7 +855,8 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
         # Сохраняем в кэш для переиспользования
         with db_session() as session:
             save_draft(session, rid, cl, cid, draft_id, supply_type,
-                       drop_off_warehouse_id=drop_off_wh)
+                       drop_off_warehouse_id=drop_off_wh,
+                       drop_off_warehouse_name=drop_off_name)
 
         drafts_made.append({
             "cluster": cl, "cluster_id": cid, "draft_id": draft_id,
@@ -733,6 +875,7 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
 
     if not drafts_made:
         await progress_add(msg, state, "⚠ Ни один draft не создан.")
+        await _release_wizard_for_state(state)
         await state.clear()
         return
 
@@ -773,6 +916,7 @@ async def _show_scored_warehouse_picker(msg: Message, state: FSMContext) -> None
 
     if idx >= len(clusters):
         await msg.answer("✅ Все кластеры выбраны.")
+        await _release_wizard_for_state(state)
         await state.clear()
         return
 
@@ -1167,9 +1311,8 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 for it in items_check:
                     if it["sku"] not in all_skus_to_check:
                         all_skus_to_check.append(it["sku"])
-    # Стартуем накопительный progress (одна «сарделька»)
-    await progress_reset(state)
-    await progress_start(msg, state, "⚙ <b>Создаю поставку Ozon…</b>")
+    # Продолжаем «сардельку» от _start_ozon_book_wizard или создаём новую
+    await progress_start(msg, state, "\n⚙ <b>Создаю поставку Ozon…</b>")
 
     if all_skus_to_check:
         await progress_add(msg, state, "🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
@@ -1177,14 +1320,13 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
         if missing:
             lines: List[str] = []
             with db_session() as session:
-                from src.db.models import Sku
-                bad_skus = session.query(Sku).filter(Sku.ozon_sku.in_(missing)).all()
+                from src.db.models import OzonProduct
+                bad = session.query(OzonProduct).filter(OzonProduct.sku.in_(missing)).all()
                 seen_sku = set()
-                for s in bad_skus:
-                    seen_sku.add(s.ozon_sku)
+                for p in bad:
+                    seen_sku.add(p.sku)
                     lines.append(
-                        f"  • <code>{s.article}</code> (offer_id=<code>{s.ozon_offer_id or '?'}</code>, "
-                        f"sku=<code>{s.ozon_sku}</code>)"
+                        f"  • <code>{p.offer_id}</code> (sku=<code>{p.sku}</code>)"
                     )
                 for s in missing:
                     if s not in seen_sku:
@@ -1196,6 +1338,7 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 + ("\n  …" if len(lines) > 15 else "")
                 + "\n<i>Открой меню → 🔗 Привязать каталог → /sku_link_ozon</i>"
             )
+            await _release_wizard_for_state(state)
             await state.clear()
             return
 
@@ -1278,6 +1421,7 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
 
     if not drafts_made:
         await progress_add(msg, state, "⚠ Ни один draft не создан.")
+        await _release_wizard_for_state(state)
         await state.clear()
         return
 
@@ -1307,8 +1451,7 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
         return
 
     oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
-    all_buttons: List[List[InlineKeyboardButton]] = []
-    slot_counter = 0
+    clusters_with_slots: List[Dict] = []  # для нового picker'а (per-cluster)
     failed_drafts: List[Dict] = []  # для возможного retry
 
     # Даты уже забронированных кластеров — чтобы подсвечивать «✓ та же дата»
@@ -1340,7 +1483,24 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 supply_type=d.get("supply_type", 2),
             )
         except OzonAPIError as e:
-            await progress_add(msg, state, f"  ⚠ timeslot/info «{d['cluster']}»: <code>{str(e)[:200]}</code>")
+            err_str = str(e)
+            # Специальный кейс: "can't find any calculation tasks" — у draft'a
+            # вообще нет scoring задач. Обычно это значит что у выбранной
+            # drop-off-точки нет таймслотов для этого кластера (Ozon-логистика
+            # не возит из этой точки в этот кластер на эти даты).
+            if "calculation tasks" in err_str.lower() or "scoring result" in err_str.lower():
+                await progress_add(
+                    msg, state,
+                    f"  🚫 «{d['cluster']}»: у drop-off-точки нет таймслотов "
+                    f"для этого кластера. Выбери другой хаб."
+                )
+                # Инвалидируем cached draft — при повторе запросит drop-off заново
+                await _invalidate_failed_draft(d["draft_id"])
+            else:
+                await progress_add(
+                    msg, state,
+                    f"  ⚠ timeslot/info «{d['cluster']}»: <code>{err_str[:200]}</code>"
+                )
             failed_drafts.append(d)
             continue
 
@@ -1364,42 +1524,35 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 )
                 continue
 
-        # Краткий заголовок — в общую «сардельку», а сами слоты только кнопками ниже
+        # Сортируем по дате-времени, сохраняем ВСЕ слоты этого кластера —
+        # picker покажет их со страничной навигацией.
+        parsed_slots.sort(key=lambda e: e["from"])
+        dropoff_choices = data.get("ob_dropoff_choices") or {}
+        dropoff_name = (dropoff_choices.get(d["cluster"]) or {}).get("name") or ""
+        clusters_with_slots.append({
+            "cluster": d["cluster"],
+            "draft_id": d["draft_id"],
+            "cluster_id": d.get("cluster_id"),
+            "supply_type": d.get("supply_type", 2),
+            "drop_off_name": dropoff_name,
+            "slots": parsed_slots,
+        })
         await progress_add(msg, state, f"🟢 <b>{d['cluster']}</b> — {len(parsed_slots)} слотов")
-        if booked_dates:
-            await progress_add(
-                msg, state,
-                f"<i>✓ — дата уже забронирована в другом кластере "
-                f"({', '.join(sorted(booked_dates))})</i>"
-            )
-        for entry in parsed_slots[:20]:
-            slot_counter += 1
-            date_short = entry["from"][:10]
-            t_hm = entry["from"][11:16]
-            sync_mark = "✓ " if date_short in booked_dates else ""
-            btn_label = f"📌 {sync_mark}{date_short} {t_hm}"
-            cb_data = f"obslot:{slot_counter}"
-            all_buttons.append([InlineKeyboardButton(text=btn_label[:40], callback_data=cb_data)])
-            await state.update_data(**{
-                f"slot_{slot_counter}": {
-                    "draft_id": d["draft_id"],
-                    "cluster_id": d.get("cluster_id"),
-                    "supply_type": d.get("supply_type", 2),
-                    "warehouse_id": entry["warehouse_id"],
-                    "warehouse_name": entry["warehouse_name"],
-                    "from": entry["from"],
-                    "to": entry["to"],
-                    "cluster": d["cluster"],
-                }
-            })
 
-    if all_buttons:
-        all_buttons.append([InlineKeyboardButton(text="✖ Отмена", callback_data="cancel")])
-        await state.set_state(OzonBook.pick_slot)
-        await msg.answer(
-            f"✅ Найдено {slot_counter} слотов. Выбери:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=all_buttons[:30]),
+    if clusters_with_slots:
+        # Имена failed-кластеров — показываем их в обзоре с пометкой «нужен другой drop-off».
+        failed_cluster_names = [d["cluster"] for d in failed_drafts]
+        await state.update_data(
+            ob_picker_clusters=clusters_with_slots,
+            ob_picker_idx=0,
+            ob_picker_page=0,
+            ob_picker_choices={},
+            ob_picker_msg_id=None,
+            ob_overview_msg_id=None,
+            ob_failed_clusters=failed_cluster_names,
         )
+        await state.set_state(OzonBook.pick_slot)
+        await _render_date_overview(msg, state)
         return
 
     # Разделяем причины: 429 / 404 not-in-scoring / реально нет слотов
@@ -1413,7 +1566,17 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
         err_kind = "unknown"
 
     if failed_drafts:
-        # Универсальный путь: предлагаем "🔁 Повторить" + "◀ Другой склад"
+        # Обогащаем failed_drafts данными для возможного пересоздания (live > 28 мин):
+        # drop_off_warehouse_id из cached draft + draft_type из state.
+        dropoff_choices = data.get("ob_dropoff_choices") or {}
+        draft_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
+        for fd in failed_drafts:
+            choice = dropoff_choices.get(fd["cluster"]) or {}
+            fd["drop_off_warehouse_id"] = choice.get("wh_id")
+            fd["drop_off_warehouse_name"] = choice.get("name")
+            fd["draft_type"] = draft_type
+            fd["created_ts"] = _time.time()
+
         existing = _AUTO_POLL_TASKS.get(rid)
         auto_running = bool(existing and not existing.done())
         if not auto_running:
@@ -1469,6 +1632,52 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
 # ── Auto-poll: фоновое периодическое получение слотов после 429 ──────────
 
 
+async def _recreate_draft_for_auto_poll(
+    oz: OzonClient, rid: int, fd: Dict,
+) -> Optional[int]:
+    """Пересоздаёт draft для failed_draft записи. items берём из БД по rid+cluster,
+    drop_off / тип / cluster_id — из самой записи fd (обогащено caller'ом).
+
+    Возвращает new draft_id или None если не вышло. Не кидает наружу — auto-poll
+    должен переживать неудачу пересоздания (просто продолжит долбить старый).
+    """
+    try:
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if not req:
+                return None
+            items, _missing = _build_items_for_cluster(req, fd["cluster"])
+        if not items:
+            return None
+        op_id = await oz.draft_create(
+            items=items,
+            cluster_ids=[int(fd["cluster_id"])] if fd.get("cluster_id") else None,
+            draft_type=fd.get("draft_type") or "CREATE_TYPE_DIRECT",
+            drop_off_point_warehouse_id=fd.get("drop_off_warehouse_id"),
+        )
+        if op_id.startswith("sync:"):
+            new_id = int(op_id.split(":", 1)[1])
+        else:
+            info = await _wait_draft_ready(oz, op_id)
+            new_id = int(info.get("draft_id") or info.get("calculation_id") or 0)
+        if not new_id:
+            return None
+        # Сохраняем в кэш, чтобы UI знал про новый draft.
+        from src.services.draft_cache import save_draft as _save_draft
+        with db_session() as session:
+            _save_draft(
+                session, rid, fd["cluster"], int(fd.get("cluster_id") or 0), new_id,
+                fd.get("supply_type", 2),
+                drop_off_warehouse_id=fd.get("drop_off_warehouse_id"),
+                drop_off_warehouse_name=fd.get("drop_off_warehouse_name"),
+            )
+        return new_id
+    except Exception as e:
+        logger.warning("auto-poll recreate draft failed (cluster=%s): %s",
+                       fd.get("cluster"), e)
+        return None
+
+
 async def _auto_poll_slots(
     bot,
     chat_id: int,
@@ -1478,14 +1687,17 @@ async def _auto_poll_slots(
     date_to_iso: str,
     date_picks: Optional[List[str]] = None,
 ) -> None:
-    """Раз в 60 сек дёргает timeslot/info. До 25 мин (draft живёт 30 мин).
-    При успехе — постит слоты пользователю и завершается.
-    При реальном «слотов нет» — тоже завершается с уведомлением.
+    """Раз в 60 сек дёргает timeslot/info. До 60 мин общая длительность.
+    Каждые ~28 мин пересоздаёт drafts (Ozon draft живёт 30 мин). Если за час
+    слотов нет — пишет финальное «не нашёл, братан» сообщение.
+    Изоляция: ключом в _AUTO_POLL_TASKS служит rid — параллельные заявки
+    запускают свои независимые auto-poll и не мешают друг другу.
     """
     import time as _t
 
-    deadline = _t.time() + 25 * 60  # 25 минут
-    interval = 60                    # секунд между попытками
+    deadline = _t.time() + 60 * 60   # 60 минут
+    interval = 60                     # секунд между попытками
+    recreate_after = 28 * 60          # пересоздаём draft если ему > 28 мин
     attempts = 0
     status_msg_id: Optional[int] = None
 
@@ -1497,6 +1709,15 @@ async def _auto_poll_slots(
         while _t.time() < deadline:
             attempts += 1
             oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+            # Пересоздаём drafts которым >28 мин — иначе Ozon вернёт 404 expired.
+            for fd in drafts:
+                if fd.get("created_ts") and _t.time() - fd["created_ts"] > recreate_after:
+                    new_id = await _recreate_draft_for_auto_poll(oz, rid, fd)
+                    if new_id:
+                        logger.info("auto-poll: recreated draft for cluster=%s old=%d new=%d",
+                                    fd["cluster"], fd["draft_id"], new_id)
+                        fd["draft_id"] = new_id
+                        fd["created_ts"] = _t.time()
             all_slot_entries: List[Dict] = []
             any_429 = False
             any_ok = False
@@ -1561,13 +1782,26 @@ async def _auto_poll_slots(
                 return
 
             if any_ok and not all_slot_entries:
-                # API ответил, но реально пусто на эти даты
-                await bot.send_message(
-                    chat_id,
-                    f"🔴 Авто-поиск слотов #{rid}: запросы проходят, но <b>на выбранные даты слотов нет</b>. "
-                    f"Можешь расширить даты через «🛠 Изменить даты» в карточке.",
-                )
-                return
+                # API ответил, но реально пусто на эти даты — продолжаем долбить
+                # ещё (Ozon может открыть слоты позже), но не чаще раз в 5 мин шлём
+                # отчёт. Если за весь час так и не появятся — сработает deadline-финал.
+                if attempts % 5 == 0:
+                    try:
+                        if status_msg_id:
+                            await bot.edit_message_text(
+                                chat_id=chat_id, message_id=status_msg_id,
+                                text=f"🔴 Авто-поиск #{rid}: слотов на выбранные даты пока нет. "
+                                     f"Жду открытия (попытка {attempts}/~60).",
+                            )
+                        else:
+                            m = await bot.send_message(
+                                chat_id,
+                                f"🔴 Авто-поиск #{rid}: слотов на выбранные даты пока нет. "
+                                f"Жду открытия (попытка {attempts}/~60).",
+                            )
+                            status_msg_id = m.message_id
+                    except Exception:
+                        pass
 
             # Все 429 — продолжаем. Каждые 5 минут — отчёт.
             if attempts % 5 == 0:
@@ -1589,11 +1823,12 @@ async def _auto_poll_slots(
 
             await asyncio.sleep(interval)
 
-        # Дедлайн — поставка не получилась
+        # Дедлайн — час прошёл, слотов так и нет.
         await bot.send_message(
             chat_id,
-            f"⏰ Авто-поиск слотов #{rid} истёк через 25 мин. Лимит Ozon так и не отпустил. "
-            f"Drafts протухнут через несколько минут — придётся пересоздавать заново.",
+            f"😔 Извини, братан — за час Ozon так и не отдал слотов для заявки #{rid}. "
+            f"Лимиты упёрлись или у drop-off-точки маршрута в эти кластеры нет. "
+            f"Попробуй позже / поменяй drop-off / расширь даты.",
         )
     except asyncio.CancelledError:
         logger.info("auto-poll cancelled: rid=%d", rid)
@@ -1735,10 +1970,17 @@ async def _do_book_slot(
 
     if cb.message:
         if success:
+            # Drop-off: для CROSSDOCK имя хаба из slot['drop_off_name'],
+            # для DIRECT — имя РФЦ из slot['warehouse_name'].
+            drop_off_display = (
+                slot.get("drop_off_name")
+                or (slot.get("warehouse_name") if slot.get("warehouse_name") and slot.get("warehouse_id") else None)
+                or "—"
+            )
             await _say(
                 f"✅ <b>Поставка создана в Ozon ЛК!</b> order_id <code>{order_id}</code> · "
                 f"Кластер {slot['cluster']} · "
-                f"Drop-off {slot['warehouse_name'] if slot.get('warehouse_name') and slot['warehouse_name'] != '#0' else '—'} · "
+                f"Drop-off {drop_off_display} · "
                 f"Слот {slot['from'][:16]}–{slot['to'][11:16]}"
             )
             if rid:
@@ -1753,37 +1995,16 @@ async def _do_book_slot(
                                     it.booked_slot_at = datetime.fromisoformat(
                                         slot["from"].replace("Z", "+00:00").split("+")[0]
                                     )
-                        req.state = "supplies_created"
+                        from src.services.shipment_service import refresh_request_state_after_booking
+                        refresh_request_state_after_booking(req)
                 # Помечаем draft как использованный — в кэше не отдадим повторно.
                 from src.services.draft_cache import mark_draft_used
                 with db_session() as session:
                     mark_draft_used(session, int(slot["draft_id"]))
 
-            # Подсказка пользователю: если есть ещё не забронированные Ozon-кластеры,
-            # предложить продолжить с ними одной кнопкой.
-            if rid:
-                with db_session() as session:
-                    req = get_shipment_request(session, rid)
-                    if req:
-                        remaining = sorted({
-                            it.cluster for it in req.items
-                            if it.marketplace == "ozon" and not it.booked_supply_id
-                        })
-                if remaining:
-                    kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(
-                            text=f"🚀 Забронировать остальные ({len(remaining)})",
-                            callback_data=f"ozon_book_card:{rid}",
-                        )],
-                        [InlineKeyboardButton(
-                            text="◀ К карточке заявки",
-                            callback_data=f"ship_open:{rid}",
-                        )],
-                    ])
-                    await cb.message.answer(
-                        f"⏭ Осталось забронировать: <b>{', '.join(remaining)}</b>.",
-                        reply_markup=kb,
-                    )
+            # Кнопку «Забронировать остальные» убрали — основной flow теперь
+            # через picker (bulk-book). Этот код выполняется только для
+            # auto-poll результата (одиночные слоты), где докручивать нечего.
         else:
             errs = final.get("error_reasons") or []
             err_s = ", ".join(str(e) for e in errs[:5])
@@ -1825,27 +2046,641 @@ async def cb_ob_retry(cb: CallbackQuery, state: FSMContext) -> None:
         await _fetch_slots_for_drafts(cb.message, state)
 
 
-@router.callback_query(OzonBook.pick_slot, F.data.startswith("obslot:"))
-async def cb_ob_slot_pick(cb: CallbackQuery, state: FSMContext) -> None:
-    slot_n = int(cb.data.split(":", 1)[1])
+# ── Новый picker: один edit-message, выбор по очереди, в конце bulk-book ─
+
+SLOTS_PER_PAGE = 15
+
+
+def _is_crossdock_wh(name: Optional[str], wh_id) -> bool:
+    """True если slot — CROSSDOCK (warehouse_id=0 или пустой/служебный)."""
+    if not name or name in ("—", "#0"):
+        return True
+    try:
+        return int(wh_id) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+async def _render_date_overview(msg: Message, state: FSMContext) -> None:
+    """Сводный обзорный экран: по каждой дате показывает «M/N кластеров доступны»
+    + кнопки авто-подбора на конкретную дату + кнопку ручного выбора.
+
+    Под капотом строит date_map = {date_iso → set(cluster_names)}, сортирует и
+    рендерит. Failed-кластеры (без слотов вообще) показывает отдельно.
+    """
     data = await state.get_data()
-    slot = data.get(f"slot_{slot_n}")
-    if not slot:
-        await cb.answer("Слот пропал — повтори /ozon_book", show_alert=True)
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    failed_names: List[str] = data.get("ob_failed_clusters") or []
+    msg_id = data.get("ob_overview_msg_id")
+    rid = data.get("ob_rid")
+
+    if not clusters:
+        # Нечего показывать — fallback к picker (он сам handle'нет пустое).
+        await _render_picker_panel(msg, state)
         return
 
-    rid = data["ob_rid"]
-    # Single-flight: блокируем повторный тап
-    lock_key = f"draft_{slot['draft_id']}"
-    if lock_key in _BOOKING_IN_FLIGHT:
-        await cb.answer("Бронирование этого слота уже идёт — подожди.", show_alert=True)
+    # date_iso → set(cluster_names) с хотя бы одним слотом в эту дату
+    date_map: Dict[str, set] = {}
+    for c in clusters:
+        cname = c["cluster"]
+        dates = {s["from"][:10] for s in c.get("slots") or []}
+        for d in dates:
+            date_map.setdefault(d, set()).add(cname)
+
+    total = len(clusters)
+    sorted_dates = sorted(date_map.keys())
+
+    lines: List[str] = [f"📅 <b>Сводка по датам</b> · заявка #{rid or '?'}", ""]
+    lines.append(f"Кластеров со слотами: <b>{total}</b>")
+    if failed_names:
+        lines.append(
+            f"⚠ Без слотов ({len(failed_names)}): " + ", ".join(failed_names)
+        )
+        lines.append("   <i>смени drop-off через карточку заявки → Ozon CROSSDOCK</i>")
+    lines.append("")
+
+    bar_w = 8
+    for d in sorted_dates:
+        avail = len(date_map[d])
+        filled = round(bar_w * avail / total)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        d_short = f"{d[8:10]}.{d[5:7]}"
+        # Список кластеров если их немного, иначе только счётчик
+        cl_names = sorted(date_map[d])
+        if len(cl_names) <= 4:
+            tail = " — " + ", ".join(cl_names)
+        else:
+            tail = ""
+        lines.append(f"<code>{d_short}</code> {bar} {avail}/{total}{tail}")
+
+    lines.append("")
+    lines.append("Выбери дату → бот возьмёт самый ранний слот в этот день для каждого кластера.")
+    lines.append("Или жми «🎯 Выбрать слоты вручную» — откроется детальный picker.")
+
+    text = "\n".join(lines)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    # Кнопки авто-подбора: даты с покрытием ≥1, сортируем по убыванию покрытия,
+    # потом по дате. Максимум 6 кнопок чтоб не загромождать.
+    sorted_for_buttons = sorted(
+        sorted_dates,
+        key=lambda d: (-len(date_map[d]), d),
+    )[:6]
+    for d in sorted_for_buttons:
+        avail = len(date_map[d])
+        d_short = f"{d[8:10]}.{d[5:7]}"
+        rows.append([InlineKeyboardButton(
+            text=f"🚀 Все на {d_short} ({avail}/{total})",
+            callback_data=f"obauto:{d}",
+        )])
+
+    rows.append([InlineKeyboardButton(
+        text="🎯 Выбрать слоты вручную", callback_data="obmanual",
+    )])
+    rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="obpcancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if msg_id:
+        try:
+            await msg.bot.edit_message_text(
+                text, chat_id=msg.chat.id, message_id=msg_id, reply_markup=kb,
+            )
+            return
+        except Exception as e:
+            logger.warning("overview edit failed: %s — sending new", e)
+    m = await msg.answer(text, reply_markup=kb)
+    await state.update_data(ob_overview_msg_id=m.message_id, ob_picker_msg_id=m.message_id)
+
+
+async def _render_picker_panel(msg: Message, state: FSMContext) -> None:
+    """Рендерит/редактирует ОДНУ панель выбора слотов.
+
+    Показывает слоты текущего кластера (ob_picker_idx) с pagination.
+    Юзер тапает слот → сохраняем выбор → idx+=1 → re-render.
+    Когда все кластеры покрыты — показываем confirm-экран.
+    """
+    data = await state.get_data()
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    idx: int = int(data.get("ob_picker_idx") or 0)
+    page: int = int(data.get("ob_picker_page") or 0)
+    choices: Dict[str, Dict] = data.get("ob_picker_choices") or {}
+    msg_id = data.get("ob_picker_msg_id")
+    rid = data.get("ob_rid")
+
+    if not clusters:
+        await msg.answer("⚠ Нет данных для выбора слотов.")
         return
-    _BOOKING_IN_FLIGHT.add(lock_key)
-    await state.clear()
+
+    if idx >= len(clusters):
+        await _render_confirm_panel(msg, state)
+        return
+
+    cur = clusters[idx]
+    slots = cur["slots"]
+    pages_total = max(1, (len(slots) + SLOTS_PER_PAGE - 1) // SLOTS_PER_PAGE)
+    if page >= pages_total:
+        page = pages_total - 1
+        await state.update_data(ob_picker_page=page)
+    page_slots = slots[page * SLOTS_PER_PAGE : (page + 1) * SLOTS_PER_PAGE]
+
+    lines: List[str] = []
+    lines.append(f"🎯 <b>Выбор таймслотов</b> · заявка #{rid or '?'}")
+    drop_off = cur.get("drop_off_name") or "—"
+    lines.append("")
+    lines.append(
+        f"[{idx + 1}/{len(clusters)}] 🟡 <b>{cur['cluster']}</b>"
+    )
+    lines.append(
+        f"Drop-off: <i>{drop_off}</i> · слотов: {len(slots)} · стр {page + 1}/{pages_total}"
+    )
+    lines.append("Тапни слот ⬇")
+    lines.append("")
+    lines.append("<b>Прогресс:</b>")
+    for i, c in enumerate(clusters):
+        ch = choices.get(str(i))
+        if ch:
+            d_short = f"{ch['from'][8:10]}.{ch['from'][5:7]}"
+            t_short = ch["from"][11:16]
+            lines.append(f"  ✅ {c['cluster']} — {d_short} {t_short}")
+        elif i == idx:
+            lines.append(f"  🟡 {c['cluster']} — выбираю…")
+        else:
+            lines.append(f"  ⏳ {c['cluster']}")
+
+    text = "\n".join(lines)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for offset, s in enumerate(page_slots):
+        global_sn = page * SLOTS_PER_PAGE + offset
+        d_short = f"{s['from'][8:10]}.{s['from'][5:7]}"
+        t_short = s["from"][11:16]
+        if _is_crossdock_wh(s.get("warehouse_name"), s.get("warehouse_id")):
+            label = f"{d_short} {t_short}"
+        else:
+            wh_short = (s.get("warehouse_name") or "")[:14]
+            label = f"{d_short} {t_short} · {wh_short}"
+        rows.append([InlineKeyboardButton(
+            text=label[:40], callback_data=f"obps:{idx}:{global_sn}",
+        )])
+
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"obpg:{idx}:{page - 1}"))
+    if page < pages_total - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶", callback_data=f"obpg:{idx}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    if idx > 0:
+        prev_cl = clusters[idx - 1]["cluster"]
+        rows.append([InlineKeyboardButton(
+            text=f"↩ Перевыбрать «{prev_cl}»",
+            callback_data=f"obpback:{idx - 1}",
+        )])
+
+    rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="obpcancel")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if msg_id:
+        try:
+            await msg.bot.edit_message_text(
+                text, chat_id=msg.chat.id, message_id=msg_id, reply_markup=kb,
+            )
+            return
+        except Exception as e:
+            logger.warning("picker edit failed: %s — sending new", e)
+
+    m = await msg.answer(text, reply_markup=kb)
+    await state.update_data(ob_picker_msg_id=m.message_id)
+
+
+async def _render_confirm_panel(msg: Message, state: FSMContext) -> None:
+    """Финальный экран: сводка всех выборов + кнопка «🚀 Забронировать всё»."""
+    data = await state.get_data()
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    choices: Dict[str, Dict] = data.get("ob_picker_choices") or {}
+    msg_id = data.get("ob_picker_msg_id")
+    rid = data.get("ob_rid")
+
+    lines: List[str] = [f"🎯 <b>Сводка выборов</b> · заявка #{rid or '?'}", ""]
+    for i, c in enumerate(clusters):
+        ch = choices.get(str(i))
+        if ch:
+            d_short = f"{ch['from'][8:10]}.{ch['from'][5:7]}"
+            t_short = ch["from"][11:16]
+            if _is_crossdock_wh(ch.get("warehouse_name"), ch.get("warehouse_id")):
+                # CROSSDOCK: РФЦ определит Ozon — не показываем заглушку «#0».
+                lines.append(f"  ✅ <b>{c['cluster']}</b> — {d_short} {t_short}")
+            else:
+                wh = ch.get("warehouse_name") or "—"
+                lines.append(f"  ✅ <b>{c['cluster']}</b> — {d_short} {t_short} → <i>{wh}</i>")
+        else:
+            lines.append(f"  ⚠ <b>{c['cluster']}</b> — не выбран")
+    lines.append("")
+    lines.append("Жми «🚀 Забронировать всё» — бот по очереди создаст поставки в Ozon ЛК.")
+
+    text = "\n".join(lines)
+    rows = [
+        [InlineKeyboardButton(text="🚀 Забронировать всё", callback_data="obpconfirm")],
+    ]
+    if clusters:
+        last_cl = clusters[-1]["cluster"]
+        rows.append([InlineKeyboardButton(
+            text=f"↩ Перевыбрать «{last_cl}»",
+            callback_data=f"obpback:{len(clusters) - 1}",
+        )])
+    rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="obpcancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if msg_id:
+        try:
+            await msg.bot.edit_message_text(
+                text, chat_id=msg.chat.id, message_id=msg_id, reply_markup=kb,
+            )
+            return
+        except Exception as e:
+            logger.warning("confirm edit failed: %s", e)
+    m = await msg.answer(text, reply_markup=kb)
+    await state.update_data(ob_picker_msg_id=m.message_id)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data == "obmanual")
+async def cb_ob_overview_manual(cb: CallbackQuery, state: FSMContext) -> None:
+    """С обзорного экрана → ручной picker."""
+    await cb.answer()
+    if cb.message:
+        # Picker будет edit'ить то же сообщение что и overview (ob_picker_msg_id).
+        await _render_picker_panel(cb.message, state)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data.startswith("obauto:"))
+async def cb_ob_overview_auto(cb: CallbackQuery, state: FSMContext) -> None:
+    """Авто-подбор на дату: для каждого кластера берём самый ранний слот в эту
+    дату; кластеры без слотов в этот день пропускаем. Затем сразу confirm-panel."""
+    parts = cb.data.split(":", 1)
+    if len(parts) != 2 or not cb.message:
+        await cb.answer("Битый callback", show_alert=True)
+        return
+    target_date = parts[1]  # YYYY-MM-DD
+    await cb.answer(f"Подбираю на {target_date[8:10]}.{target_date[5:7]}…")
+    data = await state.get_data()
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    choices: Dict[str, Dict] = {}
+    skipped: List[str] = []
+    for i, c in enumerate(clusters):
+        same_day = [s for s in (c.get("slots") or []) if s["from"][:10] == target_date]
+        if not same_day:
+            skipped.append(c["cluster"])
+            continue
+        same_day.sort(key=lambda s: s["from"])
+        chosen = same_day[0]
+        choices[str(i)] = {
+            "cluster": c["cluster"],
+            "cluster_id": c.get("cluster_id"),
+            "draft_id": c["draft_id"],
+            "supply_type": c.get("supply_type", 2),
+            "drop_off_name": c.get("drop_off_name"),
+            "warehouse_id": chosen["warehouse_id"],
+            "warehouse_name": chosen["warehouse_name"],
+            "from": chosen["from"],
+            "to": chosen["to"],
+        }
+    if not choices:
+        await cb.message.answer(
+            f"⚠ На дату {target_date} нет ни одного доступного кластера — попробуй другую."
+        )
+        return
+    # idx ставим за пределы — _render_confirm_panel в picker сразу нарисует summary
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_idx=len(clusters),
+    )
+    if skipped:
+        await cb.message.answer(
+            f"ℹ Пропустил кластеры без слотов на {target_date}: {', '.join(skipped)}"
+        )
+    await _render_confirm_panel(cb.message, state)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data.startswith("obps:"))
+async def cb_ob_picker_pick(cb: CallbackQuery, state: FSMContext) -> None:
+    """Тап по слоту — запоминаем, переходим к следующему кластеру."""
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer("Битый callback", show_alert=True)
+        return
     try:
-        await _do_book_slot(cb, slot, rid=rid, state=state)
-    finally:
-        _BOOKING_IN_FLIGHT.discard(lock_key)
+        idx = int(parts[1])
+        global_sn = int(parts[2])
+    except ValueError:
+        await cb.answer("Битый callback", show_alert=True)
+        return
+    data = await state.get_data()
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    if idx >= len(clusters):
+        await cb.answer("Неверный индекс кластера", show_alert=True)
+        return
+    slots = clusters[idx]["slots"]
+    if global_sn >= len(slots):
+        await cb.answer("Слот вне диапазона", show_alert=True)
+        return
+    s = slots[global_sn]
+    cur = clusters[idx]
+    choice = {
+        "draft_id": cur["draft_id"],
+        "cluster_id": cur.get("cluster_id"),
+        "supply_type": cur.get("supply_type", 2),
+        "warehouse_id": s["warehouse_id"],
+        "warehouse_name": s["warehouse_name"],
+        "drop_off_name": cur.get("drop_off_name") or "",
+        "from": s["from"],
+        "to": s["to"],
+        "cluster": cur["cluster"],
+    }
+    choices = dict(data.get("ob_picker_choices") or {})
+    choices[str(idx)] = choice
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_idx=idx + 1,
+        ob_picker_page=0,
+    )
+    await cb.answer(f"✓ {cur['cluster']}: {s['from'][8:10]}.{s['from'][5:7]} {s['from'][11:16]}")
+    if cb.message:
+        await _render_picker_panel(cb.message, state)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data.startswith("obpg:"))
+async def cb_ob_picker_page(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пагинация внутри текущего кластера."""
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    try:
+        idx = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await cb.answer()
+        return
+    data = await state.get_data()
+    cur_idx = int(data.get("ob_picker_idx") or 0)
+    if idx != cur_idx:
+        await cb.answer("Этот кластер уже не активен — выбираем другой.", show_alert=True)
+        return
+    await state.update_data(ob_picker_page=page)
+    await cb.answer()
+    if cb.message:
+        await _render_picker_panel(cb.message, state)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data.startswith("obpback:"))
+async def cb_ob_picker_back(cb: CallbackQuery, state: FSMContext) -> None:
+    """Сброс выбора с target_idx и далее — перевыбор."""
+    try:
+        target_idx = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    data = await state.get_data()
+    choices = {
+        k: v for k, v in (data.get("ob_picker_choices") or {}).items()
+        if int(k) < target_idx
+    }
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_idx=target_idx,
+        ob_picker_page=0,
+    )
+    await cb.answer("Перевыбираем…")
+    if cb.message:
+        await _render_picker_panel(cb.message, state)
+
+
+@router.callback_query(OzonBook.pick_slot, F.data == "obpcancel")
+async def cb_ob_picker_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer("Отменено")
+    data = await state.get_data()
+    msg_id = data.get("ob_picker_msg_id")
+    rid = data.get("ob_rid")
+    if msg_id and cb.message:
+        try:
+            await cb.bot.edit_message_text(
+                "✖ Выбор слотов отменён.",
+                chat_id=cb.message.chat.id,
+                message_id=msg_id,
+            )
+        except Exception:
+            pass
+    if rid:
+        _wizard_release(int(rid))
+    await state.clear()
+
+
+@router.callback_query(OzonBook.pick_slot, F.data == "obpconfirm")
+async def cb_ob_picker_confirm(cb: CallbackQuery, state: FSMContext) -> None:
+    """Bulk-book всех выбранных слотов."""
+    await cb.answer("Бронирую все…")
+    data = await state.get_data()
+    clusters: List[Dict] = data.get("ob_picker_clusters") or []
+    choices: Dict[str, Dict] = data.get("ob_picker_choices") or {}
+    rid = data.get("ob_rid")
+    msg_id = data.get("ob_picker_msg_id")
+    if not cb.message:
+        return
+    if not choices:
+        await cb.message.answer("⚠ Нечего бронировать — ни одного слота не выбрано.")
+        return
+
+    # Превращаем picker-panel в running-статус (он же станет «сарделькой» брони).
+    header = f"⚙ <b>Bulk-бронирование</b> заявки #{rid or '?'} — {len(choices)} поставок"
+    try:
+        await cb.bot.edit_message_text(
+            header,
+            chat_id=cb.message.chat.id,
+            message_id=msg_id or cb.message.message_id,
+        )
+        await state.update_data(
+            ob_progress_msg_id=msg_id, ob_progress_text=header,
+            ob_picker_msg_id=None,
+        )
+    except Exception as e:
+        logger.warning("bulk header edit failed: %s", e)
+
+    ok_count = 0
+    fail_count = 0
+    summary: List[str] = []
+    # Ozon /v2/draft/supply/create — узкий per-second лимит. Если дёргать его
+    # подряд без пауз, второй-третий кластер ловит 429. Жёсткая пауза ≥60с
+    # между кластерами разжимает окно. После 429 у предыдущего — пауза дольше.
+    pause_between = 60
+    pause_after_429 = 90
+    keys = sorted(choices.keys(), key=int)
+    last_was_429 = False
+    for idx, i_str in enumerate(keys):
+        slot = choices[i_str]
+        if idx > 0:
+            wait_s = pause_after_429 if last_was_429 else pause_between
+            await progress_add(
+                cb.message, state,
+                f"\n⏱ Пауза {wait_s}с перед следующим кластером (Ozon per-second лимит)…",
+            )
+            await asyncio.sleep(wait_s)
+        await progress_add(
+            cb.message, state,
+            f"\n⏳ <b>{slot['cluster']}</b>: draft {slot['draft_id']} → "
+            f"{slot['from'][:16]}–{slot['to'][11:16]}",
+        )
+        lock_key = f"draft_{slot['draft_id']}"
+        if lock_key in _BOOKING_IN_FLIGHT:
+            await progress_add(cb.message, state, "  ⚠ Параллельная бронь уже идёт — пропуск.")
+            summary.append((slot["cluster"], "⚠"))
+            last_was_429 = False
+            continue
+        _BOOKING_IN_FLIGHT.add(lock_key)
+        try:
+            ok, was_429 = await _book_one_slot(cb.bot, cb.message, state, slot, rid)
+        except Exception as e:
+            logger.exception("bulk book exception: %s", e)
+            await progress_add(cb.message, state, f"  ❌ Exception: <code>{str(e)[:200]}</code>")
+            ok = False
+            was_429 = False
+        finally:
+            _BOOKING_IN_FLIGHT.discard(lock_key)
+        last_was_429 = was_429
+        if ok:
+            ok_count += 1
+            summary.append((slot["cluster"], "✅"))
+        else:
+            fail_count += 1
+            summary.append((slot["cluster"], "❌"))
+
+    final_lines = "\n".join(f"  {mark} {cl}" for cl, mark in summary)
+    await progress_add(
+        cb.message, state,
+        f"\n🏁 <b>Готово.</b> Успешно: {ok_count}, ошибки: {fail_count}\n{final_lines}",
+    )
+
+    ob_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
+    resume_mode = "cross" if "CROSSDOCK" in ob_type else "direct"
+    rows: List[List[InlineKeyboardButton]] = []
+    if rid and fail_count > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🔁 Продолжить с оставшимися ({fail_count})",
+            callback_data=f"ozon_book_card:{rid}:{resume_mode}",
+        )])
+    if rid:
+        rows.append([InlineKeyboardButton(
+            text="◀ К карточке заявки", callback_data=f"ship_open:{rid}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🌐 Ozon ЛК → Поставки",
+        url="https://seller.ozon.ru/app/supply-orders",
+    )])
+    try:
+        await cb.message.answer(
+            "Что дальше?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception:
+        pass
+    if rid:
+        _wizard_release(int(rid))
+    await state.clear()
+
+
+async def _book_one_slot(bot, msg, state, slot: Dict, rid: Optional[int]) -> Tuple[bool, bool]:
+    """Booking одного слота. Возвращает (ok, was_429_on_supply_create).
+    Пишет статусы в сардельку через progress_add.
+
+    Retry-логика на 429: до 2 повторов с паузой 45 сек (Ozon /v2/draft/supply/create
+    имеет per-second лимит — при bulk-bookинге легко словить даже с паузами между
+    вызовами). was_429=True означает что в этой брони был хотя бы один 429 на
+    supply/create — bulk-loop использует это чтобы увеличить паузу до следующего
+    кластера.
+    """
+    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    cluster_id = slot.get("cluster_id")
+    if not cluster_id:
+        await progress_add(msg, state, "  ❌ Нет cluster_id — пропуск.")
+        return False, False
+
+    errors = None
+    max_attempts = 3
+    saw_429 = False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            errors = await oz.draft_supply_create_v2(
+                draft_id=slot["draft_id"],
+                cluster_id=int(cluster_id),
+                warehouse_id=slot["warehouse_id"],
+                timeslot_from=slot["from"],
+                timeslot_to=slot["to"],
+                supply_type=slot.get("supply_type", 2),
+            )
+            break
+        except OzonAPIError as e:
+            err_str = str(e)
+            is_429 = "429" in err_str or "rate limit" in err_str.lower()
+            if is_429:
+                saw_429 = True
+            if is_429 and attempt < max_attempts:
+                await progress_add(
+                    msg, state,
+                    f"  ⏸ Ozon 429 (попытка {attempt}/{max_attempts}) — жду 60с…",
+                )
+                await asyncio.sleep(60)
+                continue
+            await progress_add(msg, state, f"  ❌ supply/create: <code>{err_str[:200]}</code>")
+            return False, saw_429
+    if errors:
+        await progress_add(msg, state, f"  ❌ Ozon отклонил: <code>{', '.join(errors[:5])}</code>")
+        return False, saw_429
+    await progress_add(msg, state, "  ⏳ polling status…")
+    final = None
+    for _ in range(30):
+        await asyncio.sleep(2)
+        try:
+            info = await oz.draft_supply_create_status_v2(slot["draft_id"])
+        except OzonAPIError as e:
+            await progress_add(msg, state, f"  ⚠ status: <code>{str(e)[:200]}</code>")
+            return False, saw_429
+        status = str(info.get("status") or "").upper()
+        if status in {"SUCCESS", "FAILED"}:
+            final = info
+            break
+    if not final:
+        await progress_add(msg, state, "  ⚠ Таймаут — supply возможно ещё создаётся в Ozon.")
+        return False, saw_429
+    status = str(final.get("status") or "?")
+    if status.upper() != "SUCCESS":
+        errs = final.get("error_reasons") or []
+        err_s = ", ".join(str(e) for e in errs[:5])
+        await progress_add(msg, state, f"  ❌ status={status} · {err_s}")
+        return False, saw_429
+    order_id = final.get("order_id")
+    drop_off_display = slot.get("drop_off_name") or slot.get("warehouse_name") or "—"
+    await progress_add(
+        msg, state,
+        f"  ✅ order_id <code>{order_id}</code> · drop-off {drop_off_display}",
+    )
+    if rid:
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if req and order_id:
+                for it in req.items:
+                    if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
+                        it.booked_supply_id = str(order_id)
+                        it.target_warehouse = slot["warehouse_name"]
+                        it.booked_slot_at = datetime.fromisoformat(
+                            slot["from"].replace("Z", "+00:00").split("+")[0]
+                        )
+                from src.services.shipment_service import refresh_request_state_after_booking
+                refresh_request_state_after_booking(req)
+        from src.services.draft_cache import mark_draft_used
+        with db_session() as session:
+            mark_draft_used(session, int(slot["draft_id"]))
+    return True, saw_429
 
 
 # ── CROSSDOCK: выбор drop-off-точки для каждого кластера ─────────────────
@@ -1861,14 +2696,15 @@ async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None
     choices: Dict = data.get("ob_dropoff_choices") or {}
 
     if idx >= len(clusters):
-        await msg.answer(
-            "✅ Drop-off-точки выбраны для всех кластеров.\n"
-            "<i>(Везёшь товар в drop-off → Ozon развозит по РФЦ кластера)</i>\n"
+        # Drop-off-picker был отдельным сообщением (кнопки). Подтверждение
+        # выбора падает в основную «сардельку» (info card → drop-off → scoring).
+        await progress_add(
+            msg, state,
+            "\n✅ Drop-off-точки выбраны:\n"
             + "\n".join(
-                f"  • <b>{v.get('name')}</b> → кластер «{c}»"
+                f"  • <b>{v.get('name')}</b> → «{c}»"
                 for c, v in choices.items()
             )
-            + "\n\n⏳ Создаю драфты…"
         )
         await _create_drafts_and_fetch_scoring(msg, state)
         return

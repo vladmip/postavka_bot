@@ -55,6 +55,42 @@ class SkuKitLink(Base):
     component: Mapped["Sku"] = relationship("Sku", foreign_keys=[component_sku_id])
 
 
+class OzonProduct(Base):
+    """Снапшот товара из Ozon Seller API. Заполняется через /refresh_ozon_catalog.
+    Это единственный источник правды для Ozon-флоу: matching xlsx → товар,
+    pre-check перед draft_create, генерация ТЗ Отгрузка."""
+    __tablename__ = "ozon_products"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    offer_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    sku: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # числовой Ozon SKU
+    name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    barcode_primary: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    raw_barcodes_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    def __repr__(self) -> str:
+        return f"<OzonProduct {self.offer_id} sku={self.sku}>"
+
+
+class WbProduct(Base):
+    """Снапшот товара из WB Content API. Заполняется через /refresh_wb_catalog."""
+    __tablename__ = "wb_products"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nm_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    article: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    barcode_primary: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    raw_barcodes_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    def __repr__(self) -> str:
+        return f"<WbProduct nm={self.nm_id} {self.article}>"
+
+
 SUPPLY_STATES = (
     "draft", "intake_sent", "intake_done", "shipment_sent",
     "picked", "shipped", "accepted", "closed", "cancelled",
@@ -197,6 +233,13 @@ class ShipmentItem(Base):
         ForeignKey("shipment_requests.id", ondelete="CASCADE"), index=True,
     )
     sku_id: Mapped[Optional[int]] = mapped_column(ForeignKey("skus.id"), nullable=True)
+    # Прямые ссылки на маркет-каталоги. По одной из двух (в зависимости от marketplace).
+    ozon_product_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ozon_products.id"), nullable=True, index=True,
+    )
+    wb_product_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("wb_products.id"), nullable=True, index=True,
+    )
     raw_article: Mapped[str] = mapped_column(String(128))
     marketplace: Mapped[str] = mapped_column(String(8))      # 'wb' | 'ozon'
     cluster: Mapped[str] = mapped_column(String(64))         # 'Центральный', 'Москва, МО и Дальние регионы'
@@ -209,6 +252,12 @@ class ShipmentItem(Base):
 
     request: Mapped["ShipmentRequest"] = relationship("ShipmentRequest", back_populates="items")
     sku: Mapped[Optional["Sku"]] = relationship("Sku", foreign_keys=[sku_id])
+    ozon_product: Mapped[Optional["OzonProduct"]] = relationship(
+        "OzonProduct", foreign_keys=[ozon_product_id],
+    )
+    wb_product: Mapped[Optional["WbProduct"]] = relationship(
+        "WbProduct", foreign_keys=[wb_product_id],
+    )
 
 
 class OzonDraftCache(Base):
@@ -225,6 +274,7 @@ class OzonDraftCache(Base):
     draft_id: Mapped[int] = mapped_column(Integer)          # Ozon draft_id
     supply_type: Mapped[int] = mapped_column(Integer)       # 1=CROSSDOCK, 2=DIRECT, 3=MULTI
     drop_off_warehouse_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    drop_off_warehouse_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

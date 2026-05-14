@@ -28,3 +28,7 @@ extracted_doc.txt
 Документация Ozon Seller API.pdf
 ozon_api_docs.txt
 
+# Claude Code локальные настройки и плагины — у каждого свои
+.claude/settings.local.json
+.claude/plugins/
+

@@ -337,55 +337,15 @@ async def cmd_ozon_stocks(msg: Message) -> None:
     await send_long(msg, "\n".join(lines))
 
 
-# ── чистка мусора из каталога ───────────────────────────────────────────────
-
-
-@router.message(Command("sku_clean"))
-async def cmd_sku_clean(msg: Message) -> None:
-    """Найти и удалить мусорные SKU (служебные команды, голые баркоды и т.п.)."""
-    from src.services.catalog_cleanup import find_trash, delete_skus
-    with db_session() as session:
-        candidates = find_trash(session)
-    if not candidates:
-        await msg.answer("✅ Мусорных SKU в каталоге не найдено.")
-        return
-
-    lines = [f"🧹 <b>Кандидаты на удаление:</b> {len(candidates)}\n"]
-    for c in candidates[:30]:
-        flags = ", ".join(c["flags"])
-        lines.append(f"  • id={c['id']} <code>{c['article'][:35]}</code> · {flags}")
-    if len(candidates) > 30:
-        lines.append(f"  …и ещё {len(candidates) - 30}")
-
-    ids_str = ",".join(str(c["id"]) for c in candidates)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🗑 Удалить {len(candidates)} шт",
-            callback_data=f"sku_clean_go:{ids_str[:55]}",
-        )],
-        [InlineKeyboardButton(text="✖ Отмена", callback_data="menu:home")],
-    ])
-    await send_long(msg, "\n".join(lines), reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("sku_clean_go:"))
-async def cb_sku_clean_go(cb: CallbackQuery) -> None:
-    from src.services.catalog_cleanup import find_trash, delete_skus
-    await cb.answer("Удаляю…")
-    # Не доверяем ID из callback_data (могут быть устаревшие). Перечисляем заново.
-    with db_session() as session:
-        candidates = find_trash(session)
-        ids = [c["id"] for c in candidates]
-        n = delete_skus(session, ids)
-    if cb.message:
-        await cb.message.answer(f"✅ Удалено: {n} SKU.")
-
-
-# ── импорт каталога: связать локальные SKU с Ozon offer_id / WB nm_id ───────
+# ── импорт каталога: snapshot Ozon/WB catalog ──────────────────────────────
 
 @router.message(Command("sku_link_ozon"))
 async def cmd_sku_link_ozon(msg: Message) -> None:
-    """Подтянуть offer_id из Ozon и проставить SKU.ozon_offer_id по barcode."""
+    """Полный snapshot Ozon-каталога в локальную таблицу ozon_products.
+
+    Стирает старые записи и записывает заново — никакого matching по barcode
+    с локальным каталогом. ozon_products теперь источник правды для Ozon-флоу.
+    """
     if not APIKEY_OZON or not CLIENT_ID_OZON:
         await msg.answer("⚠ Ozon-ключи не заданы. /api_check.")
         return
@@ -404,105 +364,68 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
         await msg.answer(f"⚠ Ozon API: <code>{str(e)[:500]}</code>")
         return
 
-    # Соберём barcode → (offer_id, sku_id)
-    bc_to_data: Dict[str, tuple] = {}
-    for it in infos:
-        offer_id = it.get("offer_id")
-        if not offer_id:
-            continue
-        # Numeric Ozon SKU/product_id (нужно для draft/create)
-        # У Ozon бывают разные имена поля: sku, product_id, fbo_sku, fbs_sku
-        ozon_sku = (
-            it.get("sku") or it.get("product_id")
-            or it.get("fbo_sku") or it.get("fbs_sku")
-        )
-        try:
-            ozon_sku = int(ozon_sku) if ozon_sku else None
-        except (ValueError, TypeError):
-            ozon_sku = None
-
-        bcs = []
-        if it.get("barcode"):
-            bcs.append(str(it["barcode"]))
-        for b in it.get("barcodes") or []:
-            if b:
-                bcs.append(str(b))
-        for b in bcs:
-            bc_to_data.setdefault(b, (offer_id, ozon_sku))
-
-    # Дополнительный индекс: offer_id (нормализованный) → (offer_id, ozon_sku).
-    # Защита от кириллица/латиница в offer_id, когда штрихкоды не помогли.
-    from src.services.catalog_service import normalize_for_match
-    offer_to_data: Dict[str, tuple] = {}
-    for it in infos:
-        offer_id = it.get("offer_id")
-        if not offer_id:
-            continue
-        ozon_sku = (
-            it.get("sku") or it.get("product_id")
-            or it.get("fbo_sku") or it.get("fbs_sku")
-        )
-        try:
-            ozon_sku = int(ozon_sku) if ozon_sku else None
-        except (ValueError, TypeError):
-            ozon_sku = None
-        offer_to_data.setdefault(normalize_for_match(offer_id), (offer_id, ozon_sku))
-
-    matched = 0
-    matched_by = {"barcode": 0, "article": 0}
-    unmatched_skus: List[str] = []
+    from src.db.models import OzonProduct
+    added = updated = 0
     with db_session() as session:
-        skus = session.query(Sku).all()
-        for s in skus:
-            # 1) Точный/нормализованный матч по штрихкоду
-            entry = bc_to_data.get(s.barcode)
-            if not entry and s.barcode:
-                # Пробуем normalize: kandidat по нормализованному ключу
-                norm = normalize_for_match(s.barcode)
-                for k, v in bc_to_data.items():
-                    if normalize_for_match(k) == norm:
-                        entry = v
-                        break
-            if entry:
-                offer, ozon_sku_num = entry
-                s.ozon_offer_id = offer
-                if ozon_sku_num:
-                    s.ozon_sku = ozon_sku_num
-                matched += 1
-                matched_by["barcode"] += 1
+        existing = {p.offer_id: p for p in session.query(OzonProduct).all()}
+        seen_offers = set()
+        for it in infos:
+            offer_id = it.get("offer_id")
+            if not offer_id:
                 continue
-            # 2) Fallback по article ↔ offer_id (с normalize)
-            if s.article:
-                entry2 = offer_to_data.get(normalize_for_match(s.article))
-                if entry2:
-                    offer, ozon_sku_num = entry2
-                    s.ozon_offer_id = offer
-                    if ozon_sku_num:
-                        s.ozon_sku = ozon_sku_num
-                    matched += 1
-                    matched_by["article"] += 1
-                    continue
-            if not s.ozon_offer_id:
-                unmatched_skus.append(s.article)
+            seen_offers.add(offer_id)
+            ozon_sku = (
+                it.get("sku") or it.get("product_id")
+                or it.get("fbo_sku") or it.get("fbs_sku")
+            )
+            try:
+                ozon_sku = int(ozon_sku) if ozon_sku else None
+            except (ValueError, TypeError):
+                ozon_sku = None
+            name = it.get("name") or ""
+            bcs = []
+            if it.get("barcode"):
+                bcs.append(str(it["barcode"]))
+            for b in it.get("barcodes") or []:
+                if b:
+                    bcs.append(str(b))
+            primary_bc = bcs[0] if bcs else None
+
+            if offer_id in existing:
+                p = existing[offer_id]
+                p.sku = ozon_sku
+                p.name = name[:256]
+                p.barcode_primary = primary_bc
+                p.raw_barcodes_json = bcs
+                updated += 1
+            else:
+                session.add(OzonProduct(
+                    offer_id=offer_id,
+                    sku=ozon_sku,
+                    name=name[:256],
+                    barcode_primary=primary_bc,
+                    raw_barcodes_json=bcs,
+                ))
+                added += 1
+
+        # Удаляем те что есть локально но нет в актуальном каталоге
+        stale = [p for offer, p in existing.items() if offer not in seen_offers]
+        for p in stale:
+            session.delete(p)
 
     lines = [
-        f"✅ Привязал Ozon offer_id+sku к {matched} SKU из {len(skus)}.",
-        f"  • по штрихкоду: {matched_by['barcode']}",
-        f"  • по артикулу (article↔offer_id с normalize): {matched_by['article']}",
-        f"Каталог Ozon: {len(prods)} товаров, {len(bc_to_data)} barcodes.",
+        f"✅ Каталог Ozon синхронизирован.",
+        f"  • новых: {added}",
+        f"  • обновлено: {updated}",
+        f"  • удалено (нет в кабинете): {len(stale)}",
+        f"Всего в Ozon: {len(prods)} товаров.",
     ]
-    if unmatched_skus:
-        lines.append(f"\n<b>Без привязки ({len(unmatched_skus)}):</b>")
-        for a in unmatched_skus[:30]:
-            lines.append(f"  <code>{a}</code>")
-        if len(unmatched_skus) > 30:
-            lines.append(f"  …и ещё {len(unmatched_skus) - 30}")
     await send_long(msg, "\n".join(lines))
 
 
 @router.message(Command("sku_link_wb"))
 async def cmd_sku_link_wb(msg: Message) -> None:
-    """Подтянуть nm_id из WB Content API (карточки) и проставить SKU.wb_nm_id по barcode."""
+    """Полный snapshot WB-каталога в локальную таблицу wb_products."""
     if not APIKEY_WB:
         await msg.answer("⚠ APIKEY_WB не задан. /api_check.")
         return
@@ -521,40 +444,53 @@ async def cmd_sku_link_wb(msg: Message) -> None:
         await msg.answer("Карточек нет.")
         return
 
-    # Карточка: nmID + sizes[].skus (список barcode)
-    bc_to_nm: Dict[str, int] = {}
-    for c in cards:
-        nm = c.get("nmID")
-        if not nm:
-            continue
-        for size in c.get("sizes") or []:
-            for bc in size.get("skus") or []:
-                bc_s = str(bc).strip()
-                if bc_s:
-                    bc_to_nm.setdefault(bc_s, int(nm))
-
-    matched = 0
-    unmatched_skus: List[str] = []
+    from src.db.models import WbProduct
+    added = updated = 0
     with db_session() as session:
-        skus = session.query(Sku).all()
-        for s in skus:
-            nm = bc_to_nm.get(s.barcode)
-            if nm:
-                s.wb_nm_id = nm
-                matched += 1
-            elif not s.wb_nm_id:
-                unmatched_skus.append(s.article)
+        existing = {p.nm_id: p for p in session.query(WbProduct).all()}
+        seen_nms = set()
+        for c in cards:
+            nm = c.get("nmID")
+            if not nm:
+                continue
+            nm = int(nm)
+            seen_nms.add(nm)
+            article = c.get("vendorCode") or ""
+            name = c.get("title") or ""
+            bcs = []
+            for size in c.get("sizes") or []:
+                for bc in size.get("skus") or []:
+                    bcs.append(str(bc).strip())
+            primary_bc = bcs[0] if bcs else None
+
+            if nm in existing:
+                p = existing[nm]
+                p.article = article[:128] or None
+                p.name = name[:256] or None
+                p.barcode_primary = primary_bc
+                p.raw_barcodes_json = bcs
+                updated += 1
+            else:
+                session.add(WbProduct(
+                    nm_id=nm,
+                    article=article[:128] or None,
+                    name=name[:256] or None,
+                    barcode_primary=primary_bc,
+                    raw_barcodes_json=bcs,
+                ))
+                added += 1
+        # Удаляем те что нет в актуальном каталоге
+        stale = [p for nm, p in existing.items() if nm not in seen_nms]
+        for p in stale:
+            session.delete(p)
 
     lines = [
-        f"✅ Привязал WB nm_id к {matched} SKU из {len(skus)}.",
-        f"WB карточки: {len(cards)}, уникальных barcode: {len(bc_to_nm)}.",
+        f"✅ Каталог WB синхронизирован.",
+        f"  • новых: {added}",
+        f"  • обновлено: {updated}",
+        f"  • удалено (нет в кабинете): {len(stale)}",
+        f"Всего в WB: {len(cards)} карточек.",
     ]
-    if unmatched_skus:
-        lines.append(f"\n<b>Без привязки ({len(unmatched_skus)}):</b>")
-        for a in unmatched_skus[:30]:
-            lines.append(f"  <code>{a}</code>")
-        if len(unmatched_skus) > 30:
-            lines.append(f"  …и ещё {len(unmatched_skus) - 30}")
     await send_long(msg, "\n".join(lines))
 
 

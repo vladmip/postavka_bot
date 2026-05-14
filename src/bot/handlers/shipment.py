@@ -180,9 +180,6 @@ def _render_request_card(req) -> tuple:
         for k, v in crossdock.items():
             text += f"\n  {k}: {v}"
 
-    if files:
-        text += "\n\n<b>Источники:</b>\n" + "\n".join(f"  • {f}" for f in files[-3:])
-
     rows = []
     # Этап 1: даты ещё не выбраны
     if req.state == "draft":
@@ -767,11 +764,12 @@ async def _run_hunt(msg: Message, rid: int) -> None:
         for it in req.items:
             if it.marketplace != "wb":
                 continue
-            sku = it.sku
-            if not sku or not sku.barcode:
+            p = it.wb_product
+            bc = p.barcode_primary if p else None
+            if not bc:
                 continue
             bucket = wb_goods_by_cluster.setdefault(it.cluster, {})
-            bucket[sku.barcode] = bucket.get(sku.barcode, 0) + it.qty
+            bucket[bc] = bucket.get(bc, 0) + it.qty
         if req.state == "draft":
             req.state = "slot_searching"
 
@@ -1031,9 +1029,16 @@ async def cb_ship_items(cb: CallbackQuery) -> None:
         groups: Dict[Tuple[str, str], List[Tuple]] = {}
         for it in req.items:
             key = (it.marketplace, it.cluster)
+            # Берём «канонический» артикул из маркет-каталога если есть
+            mp = (it.marketplace or "").lower()
+            canon = None
+            if mp == "ozon" and it.ozon_product:
+                canon = it.ozon_product.offer_id
+            elif mp == "wb" and it.wb_product:
+                canon = it.wb_product.article or str(it.wb_product.nm_id)
             groups.setdefault(key, []).append((
                 it.raw_article,
-                it.sku.article if it.sku else None,
+                canon,
                 it.qty,
                 it.booked_supply_id,
                 it.target_warehouse,

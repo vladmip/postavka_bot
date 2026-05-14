@@ -96,14 +96,38 @@ def _col_label(col: ColKey) -> str:
 
 
 def generate_ship_tz(req: ShipmentRequest) -> bytes:
-    """Сгенерировать ТЗ Отгрузка xlsx для заявки. Возвращает bytes."""
-    # Группируем qty по (cluster, target_warehouse, sku_id) — это совпадает с уникальной колонкой.
+    """Сгенерировать ТЗ Отгрузка xlsx для заявки. Возвращает bytes.
+
+    Источник данных: ozon_products / wb_products (через item.ozon_product / item.wb_product).
+    Ключ группировки SKU — внутренний id маркет-каталога (ozon_product.id или wb_product.id),
+    одинаковый сквозной для уникальной товарной строки.
+    """
     by_col_sku: Dict[Tuple[ColKey, int], int] = {}
-    skus_meta: Dict[int, Dict] = {}
+    skus_meta: Dict[int, Dict] = {}  # product_id → {barcode, name, article}
     unmatched: List[Dict] = []
 
+    def _product_key_and_meta(it):
+        """Вернуть (key_id, meta_dict) для item или None если не привязан."""
+        mp = (it.marketplace or "").lower()
+        if mp == "ozon" and it.ozon_product:
+            p = it.ozon_product
+            return p.id, {
+                "barcode": p.barcode_primary or "",
+                "name": p.name or "",
+                "article": p.offer_id,
+            }
+        if mp == "wb" and it.wb_product:
+            p = it.wb_product
+            return p.id, {
+                "barcode": p.barcode_primary or "",
+                "name": p.name or "",
+                "article": p.article or str(p.nm_id),
+            }
+        return None
+
     for it in req.items:
-        if it.sku is None:
+        info = _product_key_and_meta(it)
+        if info is None:
             unmatched.append({
                 "marketplace": it.marketplace,
                 "cluster": it.cluster,
@@ -111,6 +135,7 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
                 "qty": it.qty,
             })
             continue
+        key_id, meta = info
         slot = _fmt_slot(it.booked_slot_at) if it.booked_slot_at else None
         col_key: ColKey = (
             it.cluster,
@@ -118,14 +143,10 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
             it.booked_supply_id or None,
             slot,
         )
-        k = (col_key, it.sku.id)
+        k = (col_key, key_id)
         by_col_sku[k] = by_col_sku.get(k, 0) + it.qty
-        if it.sku.id not in skus_meta:
-            skus_meta[it.sku.id] = {
-                "barcode": it.sku.barcode,
-                "name": it.sku.name,
-                "article": it.sku.article,
-            }
+        if key_id not in skus_meta:
+            skus_meta[key_id] = meta
 
     wb_cols = _build_columns(req, "wb")
     oz_cols = _build_columns(req, "ozon")
@@ -133,8 +154,11 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
     def skus_for(mp: str) -> List[int]:
         seen: List[int] = []
         for it in req.items:
-            if it.marketplace == mp and it.sku is not None and it.sku.id not in seen:
-                seen.append(it.sku.id)
+            info = _product_key_and_meta(it)
+            if not info:
+                continue
+            if (it.marketplace or "").lower() == mp and info[0] not in seen:
+                seen.append(info[0])
         return seen
 
     wb_skus = skus_for("wb")

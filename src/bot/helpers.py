@@ -70,7 +70,16 @@ async def send_long(msg: Message, text: str, reply_markup: Optional[InlineKeyboa
 
 
 async def progress_start(msg: Message, state, header: str) -> None:
-    """Создать одно status-сообщение и сохранить в state. Дальше — progress_add."""
+    """Создать одно status-сообщение или продолжить существующее.
+
+    Если в state есть ob_progress_msg_id — добавляем header как новую строку
+    к существующей сардельке (через progress_add). Иначе — новое сообщение.
+    """
+    data = await state.get_data()
+    if data.get("ob_progress_msg_id"):
+        # Уже есть сарделька — просто добавляем заголовок к ней
+        await progress_add(msg, state, header)
+        return
     m = await msg.answer(header)
     await state.update_data(ob_progress_msg_id=m.message_id, ob_progress_text=header)
 

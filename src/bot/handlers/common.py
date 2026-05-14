@@ -80,9 +80,8 @@ def _diag_menu_kb() -> InlineKeyboardMarkup:
 
 def _sku_link_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟣 Привязать к Wildberries", callback_data="run:sku_link_wb")],
-        [InlineKeyboardButton(text="🔵 Привязать к Ozon", callback_data="run:sku_link_ozon")],
-        [InlineKeyboardButton(text="🧹 Почистить мусор из каталога", callback_data="run:sku_clean")],
+        [InlineKeyboardButton(text="🟣 Обновить WB каталог", callback_data="run:sku_link_wb")],
+        [InlineKeyboardButton(text="🔵 Обновить Ozon каталог", callback_data="run:sku_link_ozon")],
         [InlineKeyboardButton(text="◀ Назад", callback_data="menu:home")],
     ])
 
@@ -186,12 +185,6 @@ async def cb_run_sku_link_ozon(cb: CallbackQuery) -> None:
         await cmd_sku_link_ozon(cb.message)
 
 
-@router.callback_query(lambda c: c.data == "run:sku_clean")
-async def cb_run_sku_clean(cb: CallbackQuery) -> None:
-    await cb.answer("Ищу мусор…")
-    if cb.message:
-        from src.bot.handlers.integrations import cmd_sku_clean
-        await cmd_sku_clean(cb.message)
 
 
 # ── menu:diag — подменю диагностики ──────────────────────────────────────

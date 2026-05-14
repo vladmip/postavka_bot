@@ -52,6 +52,7 @@ def save_draft(
     draft_id: int,
     supply_type: int,
     drop_off_warehouse_id: Optional[int] = None,
+    drop_off_warehouse_name: Optional[str] = None,
 ) -> None:
     """Сохранить только что созданный draft в кэш."""
     row = OzonDraftCache(
@@ -61,8 +62,36 @@ def save_draft(
         draft_id=draft_id,
         supply_type=supply_type,
         drop_off_warehouse_id=drop_off_warehouse_id,
+        drop_off_warehouse_name=drop_off_warehouse_name,
     )
     session.add(row)
+
+
+def get_dropoff_choices_for_request(
+    session: Session, request_id: int,
+) -> dict:
+    """Восстановить { cluster_name: {wh_id, name} } из cached drafts заявки.
+
+    Нужно для повторного входа в CROSSDOCK-флоу — чтобы не спрашивать
+    drop-off-точку заново, если она уже была выбрана и сохранена в draft."""
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(minutes=DRAFT_TTL_MIN)
+    rows = (
+        session.query(OzonDraftCache)
+        .filter(
+            OzonDraftCache.request_id == request_id,
+            OzonDraftCache.created_at >= cutoff,
+            OzonDraftCache.drop_off_warehouse_id.isnot(None),
+        )
+        .all()
+    )
+    return {
+        r.cluster: {
+            "wh_id": r.drop_off_warehouse_id,
+            "name": r.drop_off_warehouse_name or f"#{r.drop_off_warehouse_id}",
+        }
+        for r in rows
+    }
 
 
 def mark_draft_used(session: Session, draft_id: int) -> None:
