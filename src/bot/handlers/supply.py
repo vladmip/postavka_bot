@@ -354,65 +354,9 @@ async def cb_dp_toggle(cb: CallbackQuery, state: FSMContext) -> None:
             pass
 
 
-@router.callback_query(SupplyNew.slot_date, F.data == "dp_cl")
-async def cb_dp_clear(cb: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    min_offset = data.get("min_offset", 0)
-    await state.update_data(selected_offsets=[])
-    await cb.answer("Сброшено")
-    if cb.message:
-        try:
-            await cb.message.edit_reply_markup(
-                reply_markup=kb_dates_picker(set(), min_offset=min_offset)
-            )
-        except Exception:
-            pass
-
-
 @router.callback_query(SupplyNew.slot_date, F.data == "dp_skip")
 async def cb_dp_skip(cb: CallbackQuery, state: FSMContext) -> None:
     await _finalize_supply(cb, state, slot_at=None, slot_date_to=None, slot_dates=None)
-
-
-@router.callback_query(SupplyNew.slot_date, F.data == "dp_man")
-async def cb_dp_manual(cb: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    mp = data.get("marketplace", "")
-    hint = ""
-    if mp == "ozon":
-        hint = "\nДиапазон: <code>2026-05-19 - 2026-05-21</code> или <code>12-14 мая</code>."
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀ Назад в календарь", callback_data="dp_back_cal"),
-        InlineKeyboardButton(text="✖ Отмена", callback_data="cancel"),
-    ]])
-    await cb.answer()
-    if cb.message:
-        await safe_edit_or_answer(
-            cb.message,
-            f"📅 Введи дату в формате <code>YYYY-MM-DD</code>.{hint}",
-            reply_markup=back_kb,
-        )
-
-
-@router.callback_query(SupplyNew.slot_date, F.data == "dp_back_cal")
-async def cb_dp_back_to_calendar(cb: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    selected = set(data.get("selected_offsets", []))
-    min_offset = data.get("min_offset", 0)
-    mp = data.get("marketplace", "")
-    hint = ""
-    if mp == "wb":
-        hint = f"\n🚫 — даты раньше +{WB_MIN_LEAD_DAYS} дней закрыты (штраф WB)."
-    if mp == "ozon":
-        hint = "\nМожно выбрать одну дату или несколько (диапазон min..max)."
-    await cb.answer()
-    if cb.message:
-        await safe_edit_or_answer(
-            cb.message,
-            f"📅 Выбери дату/диапазон тапом:{hint}",
-            reply_markup=kb_dates_picker(selected, min_offset=min_offset),
-        )
 
 
 @router.callback_query(SupplyNew.slot_date, F.data == "dp_ok")

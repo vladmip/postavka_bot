@@ -129,7 +129,10 @@ async def cb_ret_ozon(cb: CallbackQuery) -> None:
         await safe_edit_or_answer(cb.message, "ℹ Возвратов в Ozon нет.", reply_markup=_back_kb())
         return
 
-    # Если PDF получен — шлём ОДНИМ сообщением: документ + caption со сводкой.
+    # Если PDF получен — PDF без клавиатуры (на document-сообщении edit_text
+    # технически невозможен → back-нав фолбэчилась бы в answer() и плодила бы
+    # дубли при «◀ К возвратам» / «🏠 Меню»). Поэтому кнопки уносим в
+    # маленькое текст-сообщение под PDF — его уже можно перерисовывать edit'ом.
     # Если PDF нет — текст со списком + инструкцией нажать в ЛК.
     if pdf_attached:
         caption_lines = [f"📄 <b>Ozon — возвраты к получению: {len(actionable)}</b>"]
@@ -144,16 +147,21 @@ async def cb_ret_ozon(cb: CallbackQuery) -> None:
             caption_lines.append(f"…и ещё {len(fbo) + len(fbs) - 8}")
         caption = "\n".join(caption_lines)[:1020]  # Telegram caption лимит 1024
 
-        # Удаляем сообщение «🔍 Тяну…» и шлём PDF одним документом с caption
+        # Удаляем сообщение «🔍 Тяну…», шлём PDF + nav-сообщение под ним.
         try:
             await cb.message.delete()
         except Exception:
             pass
         file = BufferedInputFile(pdf_bytes, filename="ozon_returns.pdf")
-        await cb.message.answer_document(file, caption=caption, reply_markup=_back_kb())
+        await cb.message.answer_document(file, caption=caption)
+        await cb.message.answer(
+            "<i>PDF готов — скачай и приложи на ПВЗ.</i>",
+            reply_markup=_back_kb(),
+        )
         return
 
-    # PDF недоступен — текстовый список + инструкция
+    # PDF недоступен — текстовый список + инструкция, в ТОМ ЖЕ сообщении
+    # (через edit_text). send_long тут не нужен: список ограничен MAX_PER_SECTION.
     if not actionable:
         lines.append("✅ Забирать сейчас нечего.")
     else:
@@ -161,7 +169,7 @@ async def cb_ret_ozon(cb: CallbackQuery) -> None:
             "\n📄 <b>PDF этикетки пока нет.</b>\n"
             "Чтобы её получить — нажми «Получить возвраты» в Ozon ЛК."
         )
-    await send_long(cb.message, "\n".join(lines), reply_markup=_back_kb())
+    await safe_edit_or_answer(cb.message, "\n".join(lines), reply_markup=_back_kb())
 
 
 @router.callback_query(F.data == "ret:wb")
@@ -236,4 +244,6 @@ async def cb_ret_wb(cb: CallbackQuery) -> None:
         [InlineKeyboardButton(text="◀ К возвратам", callback_data="menu:returns")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
     ])
-    await send_long(cb.message, "\n".join(lines), reply_markup=kb)
+    # Текст до 15 возвратов + хедер — гарантированно <3900 символов, edit_text
+    # справится. send_long всегда answer() и плодил бы новое сообщение.
+    await safe_edit_or_answer(cb.message, "\n".join(lines), reply_markup=kb)

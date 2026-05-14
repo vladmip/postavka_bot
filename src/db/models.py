@@ -217,6 +217,12 @@ class ShipmentRequest(Base):
     crossdock_warehouses_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # Для каждого направления: {'wb_Центральный': 'Внуково', 'ozon_Москва...': 'any'}
 
+    # Тип Ozon-поставки: "direct" (РФЦ) или "cross" (CROSSDOCK через хаб).
+    # Фиксируется один раз при создании заявки и больше не меняется — у Ozon
+    # под капотом это разные draft API и разные warehouse_id, смешивать нельзя.
+    # NULL = legacy-заявки до миграции, юзер выбирает тип при первом открытии карточки.
+    ozon_supply_type: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
     source_files_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     comments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

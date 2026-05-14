@@ -54,6 +54,11 @@ class ShipPick(StatesGroup):
     pick_request = State()
 
 
+class ShipNewType(StatesGroup):
+    """Выбор типа Ozon-поставки (direct/cross) до создания заявки."""
+    pick_otype = State()
+
+
 class ShipPlan(StatesGroup):
     dates = State()
     crossdock_mode = State()         # один склад для всех или индивидуально
@@ -180,6 +185,10 @@ def _render_request_card(req) -> tuple:
         for k, v in crossdock.items():
             text += f"\n  {k}: {v}"
 
+    if has_ozon and req.ozon_supply_type:
+        otype_label = "🚚 Прямые (РФЦ)" if req.ozon_supply_type == "direct" else "🔀 Кроссдок"
+        text += f"\n\n<b>Тип Ozon-поставки:</b> {otype_label}"
+
     rows = []
     # Этап 1: даты ещё не выбраны
     if req.state == "draft":
@@ -191,14 +200,27 @@ def _render_request_card(req) -> tuple:
             rows.append([InlineKeyboardButton(text="🔍 Подобрать склад WB",
                                              callback_data=f"ship_hunt:{req.id}")])
         if has_ozon:
-            rows.append([
-                InlineKeyboardButton(text="🚀 Ozon → DIRECT (РФЦ)",
-                                     callback_data=f"ozon_book_card:{req.id}:direct"),
-            ])
-            rows.append([
-                InlineKeyboardButton(text="🚛 Ozon → CROSSDOCK (хаб)",
-                                     callback_data=f"ozon_book_card:{req.id}:cross"),
-            ])
+            # Тип Ozon-поставки фиксируется при создании. NULL = legacy-заявка
+            # до миграции — даём юзеру выбрать тип однократно прямо здесь.
+            if req.ozon_supply_type == "direct":
+                rows.append([InlineKeyboardButton(
+                    text="🚀 Создать поставку Ozon → Прямые (РФЦ)",
+                    callback_data=f"ozon_book_card:{req.id}:direct",
+                )])
+            elif req.ozon_supply_type == "cross":
+                rows.append([InlineKeyboardButton(
+                    text="🚛 Создать поставку Ozon → Кроссдок",
+                    callback_data=f"ozon_book_card:{req.id}:cross",
+                )])
+            else:
+                rows.append([InlineKeyboardButton(
+                    text="🚚 Ozon — Прямые (РФЦ)",
+                    callback_data=f"ship_set_otype:{req.id}:d",
+                )])
+                rows.append([InlineKeyboardButton(
+                    text="🔀 Ozon — Кроссдок (хаб)",
+                    callback_data=f"ship_set_otype:{req.id}:c",
+                )])
         rows.append([InlineKeyboardButton(text="🛠 Изменить даты",
                                          callback_data=f"ship_plan:{req.id}")])
     if has_wb:
@@ -277,7 +299,15 @@ async def handle_ship_document(msg: Message, state: FSMContext, stored_path: Pat
     )
 
     if not open_summaries:
-        # Создаём сразу новую заявку
+        # Создаём сразу новую заявку. Для Ozon-файла предварительно спрашиваем
+        # тип поставки (фиксируется в req навсегда).
+        if parsed.marketplace == "ozon":
+            await state.update_data(up_otype_kind="single")
+            await _ask_ozon_type_for_new(
+                msg, state,
+                header=f"📥 OZON «{parsed.cluster_name}» · {len(parsed.items)} позиций",
+            )
+            return
         with db_session() as session:
             req = create_shipment_request(session, source_file=fname)
             result = attach_ship_file(session, req.id, parsed)
@@ -305,14 +335,26 @@ async def cb_ship_new(cb: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     fname = data.get("ship_file_name", "")
     fpath = data.get("ship_file_path", "")
-    await state.clear()
 
     try:
         parsed = parse_ship_file(Path(fpath), original_name=fname)
     except Exception as e:
+        await state.clear()
         await cb.answer(f"Ошибка: {e}", show_alert=True)
         return
 
+    # Для Ozon — сначала спрашиваем тип поставки.
+    if parsed.marketplace == "ozon":
+        await state.update_data(up_otype_kind="single")
+        await cb.answer()
+        if cb.message:
+            await _ask_ozon_type_for_new(
+                cb.message, state,
+                header=f"📥 OZON «{parsed.cluster_name}» · {len(parsed.items)} позиций",
+            )
+        return
+
+    await state.clear()
     with db_session() as session:
         req = create_shipment_request(session, source_file=fname)
         result = attach_ship_file(session, req.id, parsed)
@@ -320,8 +362,10 @@ async def cb_ship_new(cb: CallbackQuery, state: FSMContext) -> None:
 
     await cb.answer("Создано")
     if cb.message:
-        await safe_edit_or_answer(cb.message, f"✅ Создана новая заявка #{rid}")
-        await _send_attach_result(cb.message, rid, result)
+        await _send_attach_result(
+            cb.message, rid, result,
+            header=f"✅ Создана новая заявка #{rid}",
+        )
 
 
 @router.callback_query(ShipPick.pick_request, F.data.startswith("ship_attach:"))
@@ -343,16 +387,31 @@ async def cb_ship_attach(cb: CallbackQuery, state: FSMContext) -> None:
 
     await cb.answer("Привязано")
     if cb.message:
-        await safe_edit_or_answer(cb.message, f"✅ Привязано к заявке #{rid}")
-        await _send_attach_result(cb.message, rid, result)
+        await _send_attach_result(
+            cb.message, rid, result,
+            header=f"✅ Привязано к заявке #{rid}",
+        )
 
 
-async def _send_attach_result(msg_or_cb_msg: Message, rid: int, result) -> None:
-    lines = [
+async def _send_attach_result(
+    msg_or_cb_msg: Message, rid: int, result, header: Optional[str] = None,
+) -> None:
+    """Показать результат привязки файла к заявке.
+
+    Если передан `header` — он встаёт первой строкой (например «✅ Создана заявка #N»),
+    раньше эти заголовки слались отдельным safe_edit_or_answer'ом → было два сообщения
+    подряд. Теперь — один edit-call. На сообщении-файле edit невозможен — fallback в
+    answer() сам сработает.
+    """
+    lines: List[str] = []
+    if header:
+        lines.append(header)
+        lines.append("")
+    lines.append(
         f"📦 Заявка #{rid} — добавлено <b>{result.items_added}</b> строк "
-        f"({result.cluster} / {result.marketplace.upper()})",
-        f"✅ В каталоге: {result.matched}",
-    ]
+        f"({result.cluster} / {result.marketplace.upper()})"
+    )
+    lines.append(f"✅ В каталоге: {result.matched}")
     if result.unmatched_articles:
         lines.append(f"⚠ Не нашёл в каталоге: {len(result.unmatched_articles)}")
         for a in result.unmatched_articles[:15]:
@@ -364,7 +423,9 @@ async def _send_attach_result(msg_or_cb_msg: Message, rid: int, result) -> None:
         [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"ship_open:{rid}")],
         [InlineKeyboardButton(text="📎 Привязать ещё файл", callback_data="ship_more")],
     ])
-    await send_long(msg_or_cb_msg, "\n".join(lines), reply_markup=kb)
+    # До ~15 unmatched-строк × ~30 симв ≈ <1000 символов — гарантированно влезает.
+    # send_long тут не нужен и плодил бы новое сообщение.
+    await safe_edit_or_answer(msg_or_cb_msg, "\n".join(lines), reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("ship_open:"))
@@ -377,6 +438,150 @@ async def cb_ship_open(cb: CallbackQuery) -> None:
             return
         text, kb = _render_request_card(req)
     await cb.answer()
+    if cb.message:
+        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
+
+
+async def _create_zip_together_request(
+    msg: Message, state: FSMContext, paths: List[Path], zip_name: str,
+    *, otype: Optional[str],
+) -> None:
+    """Собрать единую заявку из всех xlsx в zip. Если otype передан — фиксируем
+    его в req.ozon_supply_type. Прогресс — в одну «сардельку»."""
+    from src.bot.helpers import progress_start, progress_add, progress_reset
+    await progress_reset(state)
+    with db_session() as session:
+        req = create_shipment_request(session, source_file=zip_name)
+        if otype:
+            req.ozon_supply_type = otype
+        rid = req.id
+    header_extra = ""
+    if otype:
+        label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+        header_extra = f" · {label}"
+    await progress_start(
+        msg, state,
+        f"📋 Создана единая заявка <b>#{rid}</b>{header_extra} на {len(paths)} файлов.",
+    )
+    ok, errs = 0, 0
+    for path in paths:
+        inner_name = path.name
+        if not _looks_like_ship_file(inner_name):
+            await progress_add(msg, state, f"❔ <code>{inner_name}</code>: пропуск (не ship-выгрузка).")
+            continue
+        try:
+            parsed = parse_ship_file(path)
+            with db_session() as session:
+                attach_ship_file(session, rid, parsed)
+            ok += 1
+            await progress_add(msg, state, f"  ✅ <code>{inner_name}</code>")
+        except Exception as e:
+            errs += 1
+            logger.exception("zip together: failed %s", inner_name)
+            await progress_add(
+                msg, state,
+                f"  ⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}"
+            )
+    await progress_add(msg, state, f"\n📦 Готово: {ok} ок, {errs} с ошибками.")
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if req:
+            text, kb = _render_request_card(req)
+            await msg.answer(text, reply_markup=kb)
+
+
+async def _ask_ozon_type_for_new(msg: Message, state: FSMContext, *, header: str) -> None:
+    """Показать экран выбора типа Ozon-поставки (новый шаг wizard'а до создания заявки).
+
+    Контекст (что делать после выбора) уже должен быть сохранён в state — см.
+    `cb_up_otype` за разветвлением логики.
+    """
+    rows = [
+        [InlineKeyboardButton(text="🚚 Прямые (на РФЦ)", callback_data="up_otype:d")],
+        [InlineKeyboardButton(text="🔀 Кроссдок (хаб)", callback_data="up_otype:c")],
+        [InlineKeyboardButton(text="✖ Отмена", callback_data="up_otype:x")],
+    ]
+    await state.set_state(ShipNewType.pick_otype)
+    await msg.answer(
+        f"{header}\n\n<b>Тип поставки Ozon?</b>\nЗафиксируется навсегда для этой заявки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(ShipNewType.pick_otype, F.data.startswith("up_otype:"))
+async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
+    """Юзер выбрал тип Ozon-поставки на новом wizard-шаге. Создаём заявку с типом."""
+    code = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    kind = data.get("up_otype_kind")  # "single" | "zip"
+    await state.clear()
+
+    if code == "x":
+        await cb.answer("Отменено")
+        if cb.message:
+            await safe_edit_or_answer(cb.message, "✖ Создание заявки отменено.")
+        return
+
+    otype = "direct" if code == "d" else "cross"
+    label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+    await cb.answer(f"Тип: {label}")
+    if not cb.message:
+        return
+
+    if kind == "single":
+        fname = data.get("ship_file_name", "")
+        fpath = data.get("ship_file_path", "")
+        try:
+            parsed = parse_ship_file(Path(fpath), original_name=fname)
+        except Exception as e:
+            await safe_edit_or_answer(cb.message, f"⚠ Не распарсил {fname}: <code>{e}</code>")
+            return
+        with db_session() as session:
+            req = create_shipment_request(session, source_file=fname)
+            req.ozon_supply_type = otype
+            result = attach_ship_file(session, req.id, parsed)
+            rid = req.id
+        await _send_attach_result(
+            cb.message, rid, result,
+            header=f"✅ Создана заявка <b>#{rid}</b> · {label}",
+        )
+        return
+
+    if kind == "zip":
+        paths = [Path(p) for p in (data.get("up_otype_zip_paths") or [])]
+        zip_name = data.get("up_otype_zip_name") or "zip"
+        if not paths:
+            await safe_edit_or_answer(cb.message, "⚠ Пути zip-файлов потеряны, начни заново.")
+            return
+        await _create_zip_together_request(cb.message, state, paths, zip_name, otype=otype)
+        return
+
+
+@router.callback_query(F.data.startswith("ship_set_otype:"))
+async def cb_ship_set_otype(cb: CallbackQuery) -> None:
+    """Один раз зафиксировать тип Ozon-поставки (direct/cross) и перерисовать карточку."""
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer("Битый callback", show_alert=True)
+        return
+    rid = int(parts[1])
+    code = parts[2]
+    if code not in ("d", "c"):
+        await cb.answer("Неизвестный тип", show_alert=True)
+        return
+    otype = "direct" if code == "d" else "cross"
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if not req:
+            await cb.answer("Не найдена", show_alert=True)
+            return
+        if req.ozon_supply_type and req.ozon_supply_type != otype:
+            await cb.answer("Тип уже зафиксирован — изменить нельзя", show_alert=True)
+            return
+        req.ozon_supply_type = otype
+        text, kb = _render_request_card(req)
+    label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+    await cb.answer(f"Тип: {label}")
     if cb.message:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
@@ -509,19 +714,6 @@ async def cb_sp_toggle(cb: CallbackQuery, state: FSMContext) -> None:
             pass
 
 
-@router.callback_query(ShipPlan.dates, F.data == "dp_cl")
-async def cb_sp_clear(cb: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(ship_plan_selected_offsets=[])
-    await cb.answer("Сброшено")
-    if cb.message:
-        try:
-            await cb.message.edit_reply_markup(
-                reply_markup=kb_dates_picker(set(), days_ahead=14, min_offset=0)
-            )
-        except Exception:
-            pass
-
-
 @router.callback_query(ShipPlan.dates, F.data == "dp_skip")
 async def cb_sp_skip(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(ship_plan_target_date_from=None, ship_plan_target_date_to=None)
@@ -530,35 +722,43 @@ async def cb_sp_skip(cb: CallbackQuery, state: FSMContext) -> None:
         await _ask_crossdock_mode(cb.message, state)
 
 
-@router.callback_query(ShipPlan.dates, F.data == "dp_man")
-async def cb_sp_manual(cb: CallbackQuery) -> None:
-    await cb.answer("Сейчас доступен только выбор тапом. Без даты — кнопка ⏭", show_alert=True)
-
-
 @router.callback_query(ShipPlan.dates, F.data == "dp_ok")
 async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
+    """Сразу сохраняем план и показываем карточку — без промежуточного confirm-экрана."""
     from datetime import date as _date, timedelta
+    from datetime import datetime as _dt
     data = await state.get_data()
     selected = sorted(data.get("ship_plan_selected_offsets", []))
     if not selected:
         await cb.answer("Выбери хотя бы одну дату или нажми ⏭", show_alert=True)
         return
+    rid = data["ship_plan_rid"]
     today = _date.today()
     dates = [today + timedelta(days=n) for n in selected]
     d_from = min(dates)
     d_to = max(dates) if len(dates) > 1 else None
-    await state.update_data(
-        ship_plan_target_date_from=d_from.isoformat(),
-        ship_plan_target_date_to=d_to.isoformat() if d_to else None,
-        ship_plan_target_dates=[d.isoformat() for d in dates],
-    )
+    await state.clear()
+
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if not req:
+            await cb.answer("Заявка не найдена", show_alert=True)
+            return
+        req.target_date_from = _dt.fromisoformat(d_from.isoformat())
+        if d_to:
+            req.target_date_to = _dt.fromisoformat(d_to.isoformat())
+        else:
+            req.target_date_to = None
+        req.target_dates_json = [d.isoformat() for d in dates]
+        req.state = "planning"
+        text, kb = _render_request_card(req)
+
     label = f"{d_from:%Y-%m-%d}"
     if d_to:
         label += f" — {d_to:%Y-%m-%d}"
-    await cb.answer(f"Даты: {label}")
+    await cb.answer(f"✅ Даты: {label}")
     if cb.message:
-        # Сразу к подтверждению — _show_confirm отредактирует это же сообщение
-        await _ask_crossdock_mode(cb.message, state)
+        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 async def _ask_crossdock_mode(msg: Message, state: FSMContext) -> None:

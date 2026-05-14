@@ -178,7 +178,7 @@ def kb_dates_picker(
 
     callback = 'dp:N' где N = офсет от сегодня (0..days_ahead-1).
     Multi-select: тап = toggle. ✓ помечает выбранные.
-    'dp_ok' — подтвердить, 'dp_cl' — сброс, 'dp_man' — ручной ввод, 'dp_skip' — без даты.
+    'dp_ok' — подтвердить, 'dp_skip' — без даты.
     Если min_offset > 0 — даты раньше отображаются как 🚫 (callback dp_lock).
     """
     selected_offsets = selected_offsets or set()
@@ -205,13 +205,9 @@ def kb_dates_picker(
 
     n_sel = len(selected_offsets)
     confirm_text = f"✅ Подтвердить ({n_sel})" if n_sel else "✅ Подтвердить"
+    rows.append([InlineKeyboardButton(text=confirm_text, callback_data="dp_ok")])
     rows.append([
-        InlineKeyboardButton(text=confirm_text, callback_data="dp_ok"),
-        InlineKeyboardButton(text="🧹 Сброс", callback_data="dp_cl"),
-    ])
-    rows.append([
-        InlineKeyboardButton(text="✍ Вручную", callback_data="dp_man"),
         InlineKeyboardButton(text="⏭ Без даты", callback_data="dp_skip"),
+        InlineKeyboardButton(text="✖ Отмена", callback_data="cancel"),
     ])
-    rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

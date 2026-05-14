@@ -309,8 +309,10 @@ async def cb_zip_mode(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Отменено")
         return
 
-    from src.bot.handlers.shipment import looks_like_ship_file, handle_ship_document
-    from src.services.shipment_service import create_shipment_request, attach_ship_file
+    from src.bot.handlers.shipment import (
+        looks_like_ship_file, handle_ship_document,
+        _create_zip_together_request, _ask_ozon_type_for_new,
+    )
     from src.parsers.ship_request import parse_ship_file
 
     await cb.answer("Обрабатываю…")
@@ -320,44 +322,31 @@ async def cb_zip_mode(cb: CallbackQuery, state: FSMContext) -> None:
     logger = __import__("logging").getLogger("bot.upload")
 
     if mode == "together":
-        # Все xlsx → ОДНА заявка. Progress в одну «сардельку».
-        from src.bot.helpers import progress_start, progress_add, progress_reset
-        await progress_reset(state)
-        with db_session() as session:
-            req = create_shipment_request(session, source_file=zip_name)
-            rid = req.id
-        await progress_start(
-            cb.message, state,
-            f"📋 Создана единая заявка <b>#{rid}</b> на {len(paths)} файлов.",
-        )
-        ok, errs = 0, 0
-        for path in paths:
-            inner_name = path.name
-            if not looks_like_ship_file(inner_name):
-                await progress_add(cb.message, state, f"❔ <code>{inner_name}</code>: пропуск (не ship-выгрузка).")
-                continue
+        # Все xlsx → ОДНА заявка. Если среди файлов есть хотя бы один Ozon —
+        # сначала спрашиваем тип поставки (новый wizard-шаг), потом создаём
+        # заявку и приатачиваем все файлы.
+        ship_paths = [p for p in paths if looks_like_ship_file(p.name)]
+        has_ozon = False
+        for p in ship_paths:
             try:
-                parsed = parse_ship_file(path)
-                with db_session() as session:
-                    attach_ship_file(session, rid, parsed)
-                ok += 1
-                await progress_add(cb.message, state, f"  ✅ <code>{inner_name}</code>")
-            except Exception as e:
-                errs += 1
-                logger.exception("zip together: failed %s", inner_name)
-                await progress_add(
-                    cb.message, state,
-                    f"  ⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}"
-                )
-        await progress_add(cb.message, state, f"\n📦 Готово: {ok} ок, {errs} с ошибками.")
-        # Показываем карточку заявки с кнопками действий (новое сообщение, нужны кнопки)
-        from src.bot.handlers.shipment import _render_request_card
-        from src.services.shipment_service import get_shipment_request
-        with db_session() as session:
-            req = get_shipment_request(session, rid)
-            if req:
-                text, kb = _render_request_card(req)
-                await cb.message.answer(text, reply_markup=kb)
+                parsed = parse_ship_file(p)
+            except Exception:
+                continue
+            if parsed.marketplace == "ozon":
+                has_ozon = True
+                break
+        if has_ozon:
+            await state.update_data(
+                up_otype_kind="zip",
+                up_otype_zip_paths=[str(p) for p in paths],
+                up_otype_zip_name=zip_name,
+            )
+            await _ask_ozon_type_for_new(
+                cb.message, state,
+                header=f"📦 zip <code>{zip_name}</code> · {len(paths)} файлов",
+            )
+            return
+        await _create_zip_together_request(cb.message, state, paths, zip_name, otype=None)
 
     elif mode == "separate":
         # Каждый xlsx → своя заявка (старое поведение)
