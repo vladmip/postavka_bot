@@ -211,3 +211,37 @@ def kb_dates_picker(
         InlineKeyboardButton(text="✖ Отмена", callback_data="cancel"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_hours_picker(
+    selected_hours: Optional[Set[int]] = None,
+) -> InlineKeyboardMarkup:
+    """Time-picker: часы суток 00-01 .. 23-00 (24 кнопки, multi-select).
+
+    callback = 'hp:N' где N — час начала (0..23). Слот подходит если его
+    час старта ∈ selected_hours. Если selected пуст — фильтра нет, любое время.
+
+    Помимо кнопок: «🎲 Любое время» (выйти без фильтра), «✅ Дальше», «✖ Отмена».
+    """
+    selected_hours = selected_hours or set()
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for h in range(24):
+        text = f"{h:02d}–{(h + 1) % 24:02d}"
+        if h in selected_hours:
+            text = f"✓ {text}"
+        row.append(InlineKeyboardButton(text=text, callback_data=f"hp:{h}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    n_sel = len(selected_hours)
+    next_text = f"✅ Дальше ({n_sel} ч)" if n_sel else "✅ Дальше"
+    rows.append([InlineKeyboardButton(text=next_text, callback_data="hp_ok")])
+    rows.append([
+        InlineKeyboardButton(text="🎲 Любое время", callback_data="hp_any"),
+        InlineKeyboardButton(text="✖ Отмена", callback_data="cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

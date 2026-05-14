@@ -214,6 +214,10 @@ class ShipmentRequest(Base):
     # используется диапазон from..to. Введено, чтобы фильтровать слоты Ozon
     # по точным галочкам пользователя (Ozon-API принимает только диапазон).
     target_dates_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Часы суток для отгрузки (список int 0..23). NULL/пусто = «любое время»,
+    # любой час подходит. Заполняется на time-picker'е после dates-picker'а.
+    # Слот считается подходящим если час старта (slot.from.hour) ∈ списку.
+    target_hours_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     crossdock_warehouses_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # Для каждого направления: {'wb_Центральный': 'Внуково', 'ozon_Москва...': 'any'}
 

@@ -89,8 +89,23 @@ def _sku_link_kb() -> InlineKeyboardMarkup:
 # ── /start (только команда — единственная точка входа без кнопок) ─────────
 
 
+def _release_ozon_locks() -> None:
+    """Сброс зависших wizard-локов Ozon (single-tenant — чистим все).
+
+    Раньше стух 30-мин wizard-лок ловился сообщением «⏳ Ozon-мастер уже запущен»
+    без способа разлочить — теперь /start и /cancel снимают все.
+    """
+    try:
+        from src.bot.handlers.ozon_book import _WIZARD_IN_FLIGHT, _DRAFTS_CREATING
+        _WIZARD_IN_FLIGHT.clear()
+        _DRAFTS_CREATING.clear()
+    except Exception:
+        pass
+
+
 @router.message(Command("start"))
 async def cmd_start(msg: Message) -> None:
+    _release_ozon_locks()
     await msg.answer(_MAIN_TEXT, reply_markup=_main_menu_kb())
 
 
@@ -243,6 +258,7 @@ async def cb_diag_ozon_wh(cb: CallbackQuery) -> None:
 async def cb_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     cur = await state.get_state()
     await state.clear()
+    _release_ozon_locks()
     await cb.answer("Отменено")
     if cb.message:
         # После отмены — сразу возвращаем в меню
@@ -253,4 +269,5 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext) -> None:
 async def cmd_cancel(msg: Message, state: FSMContext) -> None:
     cur = await state.get_state()
     await state.clear()
+    _release_ozon_locks()
     await msg.answer(f"✖ Отменено (был state: {cur or 'none'}). /start чтобы открыть меню.")

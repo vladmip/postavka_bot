@@ -61,6 +61,7 @@ class ShipNewType(StatesGroup):
 
 class ShipPlan(StatesGroup):
     dates = State()
+    hours = State()                  # выбор часов суток после дат (time-picker)
     crossdock_mode = State()         # один склад для всех или индивидуально
     crossdock_each_pick = State()    # выбор направления (если индивидуально)
     crossdock_each_set = State()     # выбор склада для конкретного направления
@@ -175,10 +176,17 @@ def _render_request_card(req) -> tuple:
     )
 
     if req.target_date_from:
-        date_s = f"{req.target_date_from:%Y-%m-%d}"
-        if req.target_date_to:
-            date_s += f" — {req.target_date_to:%Y-%m-%d}"
+        # Реально выбранные даты (target_dates_json) приоритетнее диапазона —
+        # юзер мог выбрать [20, 23] а в from..to сидит «20—23» что обманывает.
+        from src.bot.helpers import format_picked_dates, format_picked_hours
+        date_s = format_picked_dates(
+            req.target_dates_json,
+            fallback_from=req.target_date_from,
+            fallback_to=req.target_date_to,
+        )
         text += f"\n\n<b>Целевые даты:</b> {date_s}"
+        hours_s = format_picked_hours(req.target_hours_json)
+        text += f"\n<b>Часы:</b> {hours_s}"
 
     if crossdock:
         text += "\n\n<b>Кросс-док:</b>"
@@ -186,7 +194,7 @@ def _render_request_card(req) -> tuple:
             text += f"\n  {k}: {v}"
 
     if has_ozon and req.ozon_supply_type:
-        otype_label = "🚚 Прямые (РФЦ)" if req.ozon_supply_type == "direct" else "🔀 Кроссдок"
+        otype_label = "🚚 Прямая" if req.ozon_supply_type == "direct" else "🔀 Кросс-докинг"
         text += f"\n\n<b>Тип Ozon-поставки:</b> {otype_label}"
 
     rows = []
@@ -204,21 +212,21 @@ def _render_request_card(req) -> tuple:
             # до миграции — даём юзеру выбрать тип однократно прямо здесь.
             if req.ozon_supply_type == "direct":
                 rows.append([InlineKeyboardButton(
-                    text="🚀 Создать поставку Ozon → Прямые (РФЦ)",
+                    text="🚀 Создать поставку Ozon → Прямая",
                     callback_data=f"ozon_book_card:{req.id}:direct",
                 )])
             elif req.ozon_supply_type == "cross":
                 rows.append([InlineKeyboardButton(
-                    text="🚛 Создать поставку Ozon → Кроссдок",
+                    text="🚛 Создать поставку Ozon → Кросс-докинг",
                     callback_data=f"ozon_book_card:{req.id}:cross",
                 )])
             else:
                 rows.append([InlineKeyboardButton(
-                    text="🚚 Ozon — Прямые (РФЦ)",
+                    text="🚚 Ozon — Прямая",
                     callback_data=f"ship_set_otype:{req.id}:d",
                 )])
                 rows.append([InlineKeyboardButton(
-                    text="🔀 Ozon — Кроссдок (хаб)",
+                    text="🔀 Ozon — Кросс-докинг",
                     callback_data=f"ship_set_otype:{req.id}:c",
                 )])
         rows.append([InlineKeyboardButton(text="🛠 Изменить даты",
@@ -457,7 +465,7 @@ async def _create_zip_together_request(
         rid = req.id
     header_extra = ""
     if otype:
-        label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+        label = "Прямая" if otype == "direct" else "Кросс-докинг"
         header_extra = f" · {label}"
     await progress_start(
         msg, state,
@@ -497,8 +505,8 @@ async def _ask_ozon_type_for_new(msg: Message, state: FSMContext, *, header: str
     `cb_up_otype` за разветвлением логики.
     """
     rows = [
-        [InlineKeyboardButton(text="🚚 Прямые (на РФЦ)", callback_data="up_otype:d")],
-        [InlineKeyboardButton(text="🔀 Кроссдок (хаб)", callback_data="up_otype:c")],
+        [InlineKeyboardButton(text="🚚 Прямая (на РФЦ)", callback_data="up_otype:d")],
+        [InlineKeyboardButton(text="🔀 Кросс-докинг (хаб)", callback_data="up_otype:c")],
         [InlineKeyboardButton(text="✖ Отмена", callback_data="up_otype:x")],
     ]
     await state.set_state(ShipNewType.pick_otype)
@@ -523,7 +531,7 @@ async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     otype = "direct" if code == "d" else "cross"
-    label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+    label = "Прямая" if otype == "direct" else "Кросс-докинг"
     await cb.answer(f"Тип: {label}")
     if not cb.message:
         return
@@ -580,7 +588,7 @@ async def cb_ship_set_otype(cb: CallbackQuery) -> None:
             return
         req.ozon_supply_type = otype
         text, kb = _render_request_card(req)
-    label = "Прямые (РФЦ)" if otype == "direct" else "Кроссдок"
+    label = "Прямая" if otype == "direct" else "Кросс-докинг"
     await cb.answer(f"Тип: {label}")
     if cb.message:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
@@ -618,7 +626,7 @@ async def cb_ship_more(cb: CallbackQuery) -> None:
 
 # ── /ship_plan — этап 2: даты + кросс-док ────────────────────────────────────
 
-from src.bot.keyboards import kb_dates_picker  # переиспользуем календарь
+from src.bot.keyboards import kb_dates_picker, kb_hours_picker  # переиспользуем календарь и time-picker
 
 
 @router.message(Command("ship_plan"))
@@ -724,9 +732,8 @@ async def cb_sp_skip(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(ShipPlan.dates, F.data == "dp_ok")
 async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
-    """Сразу сохраняем план и показываем карточку — без промежуточного confirm-экрана."""
+    """Подтверждение дат → переход на time-picker (часы суток)."""
     from datetime import date as _date, timedelta
-    from datetime import datetime as _dt
     data = await state.get_data()
     selected = sorted(data.get("ship_plan_selected_offsets", []))
     if not selected:
@@ -735,8 +742,105 @@ async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
     rid = data["ship_plan_rid"]
     today = _date.today()
     dates = [today + timedelta(days=n) for n in selected]
-    d_from = min(dates)
-    d_to = max(dates) if len(dates) > 1 else None
+
+    # Предзаполняем выбор часов из заявки если был раньше — юзер видит свой
+    # прошлый выбор и может скорректировать (как и для дат).
+    preselected_hours: List[int] = []
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if req and req.target_hours_json:
+            preselected_hours = list(req.target_hours_json)
+
+    await state.update_data(
+        ship_plan_target_dates_iso=[d.isoformat() for d in dates],
+        ship_plan_selected_hours=preselected_hours,
+    )
+    await state.set_state(ShipPlan.hours)
+    await cb.answer()
+    if cb.message:
+        n_dates = len(dates)
+        dates_short = ", ".join(f"{d.day:02d}.{d.month:02d}" for d in dates[:6])
+        if n_dates > 6:
+            dates_short += f", …+{n_dates - 6}"
+        hours_hint = ""
+        if preselected_hours:
+            hours_hint = (
+                "\n<i>Восстановил твой прошлый выбор часов — поправь если нужно.</i>"
+            )
+        await safe_edit_or_answer(
+            cb.message,
+            f"🕒 <b>Шаг 2/2.</b> Выбери часы отгрузки (тапом, можно несколько).\n"
+            f"📅 Дат: {n_dates} ({dates_short})\n\n"
+            f"«🎲 <b>Любое время</b>» — без фильтра, бот возьмёт самый ранний слот в день.\n"
+            f"Иначе тапни конкретные часы — слоты вне окна будут отфильтрованы."
+            + hours_hint,
+            reply_markup=kb_hours_picker(set(preselected_hours)),
+        )
+
+
+@router.callback_query(ShipPlan.hours, F.data.startswith("hp:"))
+async def cb_sp_hp_toggle(cb: CallbackQuery, state: FSMContext) -> None:
+    """Тап на час — toggle selected."""
+    try:
+        n = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Битый callback", show_alert=True)
+        return
+    data = await state.get_data()
+    sel = set(data.get("ship_plan_selected_hours") or [])
+    if n in sel:
+        sel.discard(n)
+    else:
+        sel.add(n)
+    await state.update_data(ship_plan_selected_hours=sorted(sel))
+    await cb.answer()
+    if cb.message:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb_hours_picker(sel))
+        except Exception:
+            pass
+
+
+@router.callback_query(ShipPlan.hours, F.data == "hp_any")
+async def cb_sp_hp_any(cb: CallbackQuery, state: FSMContext) -> None:
+    """Любое время — сохраняем без часового фильтра."""
+    await _finalize_plan_with_hours(cb, state, hours=None)
+
+
+@router.callback_query(ShipPlan.hours, F.data == "hp_ok")
+async def cb_sp_hp_ok(cb: CallbackQuery, state: FSMContext) -> None:
+    """Подтвердить выбранные часы."""
+    data = await state.get_data()
+    sel = sorted(data.get("ship_plan_selected_hours") or [])
+    if not sel:
+        await cb.answer(
+            "Тапни хотя бы один час или нажми «🎲 Любое время»",
+            show_alert=True,
+        )
+        return
+    await _finalize_plan_with_hours(cb, state, hours=sel)
+
+
+async def _finalize_plan_with_hours(
+    cb: CallbackQuery, state: FSMContext, hours: Optional[List[int]],
+) -> None:
+    """Сохранить даты + часы в БД и показать карточку заявки.
+
+    hours=None → «любое время» (target_hours_json=NULL, фильтра нет).
+    hours=[9,10,11] → слоты только в эти часы старта.
+    """
+    from datetime import date as _date, datetime as _dt
+    data = await state.get_data()
+    rid = data.get("ship_plan_rid")
+    dates_iso = data.get("ship_plan_target_dates_iso") or []
+    if not rid or not dates_iso:
+        await cb.answer("Состояние потеряно — открой /ship_plan заново", show_alert=True)
+        await state.clear()
+        return
+
+    dates = sorted(_date.fromisoformat(s) for s in dates_iso)
+    d_from = dates[0]
+    d_to = dates[-1] if len(dates) > 1 else None
     await state.clear()
 
     with db_session() as session:
@@ -745,18 +849,13 @@ async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Заявка не найдена", show_alert=True)
             return
         req.target_date_from = _dt.fromisoformat(d_from.isoformat())
-        if d_to:
-            req.target_date_to = _dt.fromisoformat(d_to.isoformat())
-        else:
-            req.target_date_to = None
+        req.target_date_to = _dt.fromisoformat(d_to.isoformat()) if d_to else None
         req.target_dates_json = [d.isoformat() for d in dates]
+        req.target_hours_json = hours  # NULL = «любое время»
         req.state = "planning"
         text, kb = _render_request_card(req)
 
-    label = f"{d_from:%Y-%m-%d}"
-    if d_to:
-        label += f" — {d_to:%Y-%m-%d}"
-    await cb.answer(f"✅ Даты: {label}")
+    await cb.answer("✅ Сохранено")
     if cb.message:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 

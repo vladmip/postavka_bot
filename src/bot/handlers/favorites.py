@@ -205,7 +205,7 @@ def _type_priority(t: str) -> int:
 # и нормальные drop-off-хабы, и мелкие ПВЗ-стиль точки (как МО_АПРЕЛЕВКА_24),
 # поэтому маркер не ставим, чтобы не обмануть.
 _TYPE_LABEL = {
-    "CROSS_DOCK": ("Кроссдок", True),
+    "CROSS_DOCK": ("Кросс-докинг", True),
     "FULL_FILLMENT": ("РФЦ", True),
     "SORTING_CENTER": ("СЦ", True),
     "DISTRIBUTION_CENTER": ("ДЦ", True),

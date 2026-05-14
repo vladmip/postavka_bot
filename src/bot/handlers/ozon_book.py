@@ -404,6 +404,41 @@ async def cb_ozon_book_from_card(cb: CallbackQuery, state: FSMContext) -> None:
         _wizard_release(rid)
 
 
+@router.callback_query(F.data.startswith("ozon_book_auto:"))
+async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
+    """Старт wizard'а в **авто-режиме**: scoring picker пропускается, сразу Auto-walk
+    для каждого оставшегося кластера. Юзер: «не понимаю почему опять смотрит scored,
+    хочу автоматом». Триггерится кнопкой «🚀 Бронировать следующее направление»
+    после успешного booking'а.
+    """
+    parts = cb.data.split(":")
+    rid = int(parts[1])
+    mode = parts[2] if len(parts) >= 3 else "direct"
+    if not _wizard_acquire(rid):
+        await cb.answer(
+            f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения.",
+            show_alert=True,
+        )
+        return
+    await cb.answer(f"Авто-бронирование ({mode.upper()})…")
+    if cb.message:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        # Флаг — будет прочитан в `_show_scored_warehouse_picker` для DIRECT.
+        await state.update_data(ob_auto_walk=True)
+        try:
+            launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+        except Exception:
+            _wizard_release(rid)
+            raise
+        if not launched:
+            _wizard_release(rid)
+    else:
+        _wizard_release(rid)
+
+
 async def _start_ozon_book_wizard(
     msg: Message, state: FSMContext, rid: int, *, mode: str = "direct",
 ) -> bool:
@@ -459,6 +494,9 @@ async def _start_ozon_book_wizard(
         # Ozon-API принимает только диапазон date_from..date_to и возвращает все
         # дни между ними, включая невыбранные).
         date_picks = list(req.target_dates_json or [])
+        # Часы суток. NULL/пусто = «любое время» (без фильтра). Иначе слоты, час
+        # старта которых не в списке, отбрасываем после получения от Ozon.
+        hour_picks = list(req.target_hours_json or [])
 
     if not summaries:
         if booked_clusters:
@@ -470,44 +508,63 @@ async def _start_ozon_book_wizard(
             await msg.answer(f"В заявке #{rid} нет Ozon-направлений.")
         return False
 
-    lines = [f"📦 <b>Создание Ozon-поставок для заявки #{rid}</b>\n"]
-    if booked_clusters:
-        lines.append(
-            f"✅ Уже забронированы ({len(booked_clusters)}): "
-            + ", ".join(booked_clusters) + "\n"
-            "Создаю поставки для оставшихся:\n"
-        )
-    has_missing = False
-    for cl, n_items, total_qty, missing in summaries:
-        lines.append(f"<b>«{cl}»</b>: {n_items} SKU, {total_qty} шт")
-        if missing:
-            has_missing = True
-            lines.append(f"  ⚠ Без offer_id ({len(missing)}): {', '.join(missing[:5])}")
-    lines.append(f"\nДаты: {date_from} — {date_to}")
+    # Если уже в авто-режиме (юзер тапнул «🚀 Бронировать следующее» после
+    # успешного booking'а предыдущего направления) — info card не нужна, юзер
+    # эту инфу видел только что. Просто компактно «🔄 авто-режим: следующее».
+    state_data_pre = await state.get_data()
+    is_auto = bool(state_data_pre.get("ob_auto_walk"))
 
-    if has_missing:
-        lines.append(
-            "\n💡 Запусти /sku_link_ozon чтобы привязать недостающие SKU к Ozon offer_id + sku."
-        )
+    has_missing = any(missing for _, _, _, missing in summaries)
+    # Реально-выбранные даты, а не диапазон from..to (могут не совпадать если
+    # юзер выбрал не подряд — например [20, 23] вместо [20, 21, 22, 23]).
+    from src.bot.helpers import format_picked_dates
+    dates_label = format_picked_dates(date_picks, fallback_from=date_from, fallback_to=date_to)
 
-    # mode: "direct" → DIRECT поставка (везти на РФЦ); "cross" → CROSSDOCK (везти в хаб)
+    # mode: "direct" → Прямая поставка (везти на РФЦ); "cross" → Кросс-докинг (везти в хаб)
     ob_type = "CREATE_TYPE_CROSSDOCK" if mode == "cross" else "CREATE_TYPE_DIRECT"
-    type_label = "CROSSDOCK 🚛" if mode == "cross" else "DIRECT 🚀"
+    type_label = "Кросс-докинг 🚛" if mode == "cross" else "Прямая 🚀"
+
+    if is_auto:
+        # Компактный заголовок — без полного info card, без даты/режима/SKU-списков.
+        remaining = ", ".join(s[0] for s in summaries)
+        lines = [
+            f"🔄 <b>Авто-бронирование оставшихся ({len(summaries)})</b>: {remaining}"
+        ]
+    else:
+        lines = [f"📦 <b>Создание Ozon-поставок для заявки #{rid}</b>\n"]
+        if booked_clusters:
+            lines.append(
+                f"✅ Уже забронированы ({len(booked_clusters)}): "
+                + ", ".join(booked_clusters) + "\n"
+                "Создаю поставки для оставшихся:\n"
+            )
+        for cl, n_items, total_qty, missing in summaries:
+            lines.append(f"<b>«{cl}»</b>: {n_items} SKU, {total_qty} шт")
+            if missing:
+                lines.append(f"  ⚠ Без offer_id ({len(missing)}): {', '.join(missing[:5])}")
+        lines.append(f"\nДаты: {dates_label}")
+        if has_missing:
+            lines.append(
+                "\n💡 Запусти /sku_link_ozon чтобы привязать недостающие SKU к Ozon offer_id + sku."
+            )
     await state.update_data(
         ob_rid=rid,
         ob_clusters=[s[0] for s in summaries],
         ob_date_from=date_from,
         ob_date_to=date_to,
         ob_date_picks=date_picks,
+        ob_hour_picks=hour_picks,
         ob_type=ob_type,
         ob_wh_choices={},
         ob_cluster_idx=0,
         ob_dropoff_choices={},  # cluster_name → {wh_id, name}
     )
-    lines.append(f"\n📦 Режим: <b>{type_label}</b>")
-    # Начинаем новую «сардельку» с info card. Drop-off-picker и slot-picker
-    # остаются отдельными (нужны inline-кнопки), но всё остальное (info →
-    # drop-off-confirm → создание драфтов → scoring) попадает в одно сообщение.
+    if not is_auto:
+        lines.append(f"\n📦 Режим: <b>{type_label}</b>")
+    # Начинаем новую «сардельку» с info card (в auto-режиме — компактным заголовком).
+    # Drop-off-picker и slot-picker остаются отдельными (нужны inline-кнопки), но
+    # всё остальное (info → drop-off-confirm → создание драфтов → scoring) попадает
+    # в одно сообщение.
     await progress_reset(state)
     await progress_start(msg, state, "\n".join(lines))
     if mode == "cross":
@@ -749,7 +806,16 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
     """Создать draft для каждого кластера + получить scored склады через draft/create/info.
     Сохраняет drafts + scored_warehouses в state, потом показывает picker."""
     data = await state.get_data()
-    rid = data["ob_rid"]
+    rid = data.get("ob_rid")
+    if rid is None:
+        # State потерян — был callback из старого сообщения после /start или
+        # clear'а wizard'а. Раньше падало KeyError'ом, теперь мягко выходим.
+        logger.warning("_create_drafts_and_fetch_scoring: ob_rid is None — stale callback")
+        await msg.answer(
+            "⚠ Состояние мастера потеряно. Открой карточку заявки и тапни "
+            "«🚀 Создать поставку Ozon» заново."
+        )
+        return
 
     # Single-flight: callback'и drop-off picker'а (пагинация хабов, «◀ К выбору»,
     # повторный «✓ применить ко всем») могут переоткрыть `_ask_dropoff_for_next_cluster`
@@ -864,7 +930,19 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
                     oz, cached["draft_id"], msg, state=state,
                 )
             if fail_reason:
-                failed_scoring.append({"cluster": cl, "reason": fail_reason})
+                # Сохраняем всё что понадобится auto-poll'у для пересоздания draft'а
+                # (cluster_id, supply_type, drop-off). Auto-poll стартует ниже если
+                # причина транзиентная (NO_TIMESLOTS/INVALID_ROUTE).
+                dropoff_choices = data.get("ob_dropoff_choices") or {}
+                _choice = dropoff_choices.get(cl) or {}
+                failed_scoring.append({
+                    "cluster": cl,
+                    "reason": fail_reason,
+                    "cluster_id": cached["cluster_id"],
+                    "supply_type": cached["supply_type"],
+                    "drop_off_warehouse_id": _choice.get("wh_id"),
+                    "drop_off_warehouse_name": _choice.get("name"),
+                })
                 continue
             drafts_made.append({
                 "cluster": cl,
@@ -956,7 +1034,14 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
             oz, draft_id, msg, state=state,
         )
         if fail_reason:
-            failed_scoring.append({"cluster": cl, "reason": fail_reason})
+            failed_scoring.append({
+                "cluster": cl,
+                "reason": fail_reason,
+                "cluster_id": cid,
+                "supply_type": supply_type,
+                "drop_off_warehouse_id": drop_off_wh,
+                "drop_off_warehouse_name": drop_off_name,
+            })
             continue
         drafts_made.append({
             "cluster": cl, "cluster_id": cid, "draft_id": draft_id,
@@ -1031,7 +1116,8 @@ async def _show_all_failed_scoring_summary(
 
     lines.append("")
     lines.append("<b>Что делать:</b>")
-    if "NO_TIMESLOTS" in by_reason or "INVALID_ROUTE" in by_reason:
+    transient = "NO_TIMESLOTS" in by_reason or "INVALID_ROUTE" in by_reason
+    if transient:
         lines.append("• Расширь диапазон дат (минимум неделя)")
         lines.append("• Выбери другой drop-off хаб через ⭐ Точки кроссдока в карточке")
     if "OUT_OF_ASSORTMENT" in by_reason:
@@ -1039,12 +1125,63 @@ async def _show_all_failed_scoring_summary(
             "• Проверь карточку товара в Seller Center → «Доступность по кластерам»"
         )
 
-    rows = [
-        [InlineKeyboardButton(
-            text="◀ К карточке заявки",
-            callback_data=f"ship_open:{rid}",
-        )],
-    ]
+    # Для транзиентных причин (NO_TIMESLOTS / INVALID_ROUTE) стартуем auto-poll
+    # на 60 мин — Ozon-логистика иногда добавляет слоты в течение часа, особенно
+    # если даты дальние. Юзер: «почему тут не ставится на час поиск слотов».
+    # Для OUT_OF_ASSORTMENT поллинг бесполезен — нужна правка карточки товара.
+    rows: List[List[InlineKeyboardButton]] = []
+    auto_poll_started = False
+    if transient and rid is not None:
+        existing = _AUTO_POLL_TASKS.get(rid)
+        already_running = bool(existing and not existing.done())
+        if not already_running:
+            draft_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
+            # Маркируем drafts «созданными 30 мин назад» — на первой итерации auto-poll
+            # триггерит `_recreate_draft_for_auto_poll` (recreate_after=28мин), который
+            # пересоздаёт draft свежим. draft_id=0 будет заменён на новый.
+            poll_drafts: List[Dict] = []
+            stale_ts = _time.time() - 30 * 60
+            for fs in failed_scoring:
+                if fs.get("reason") not in ("NO_TIMESLOTS", "INVALID_ROUTE"):
+                    continue
+                if not fs.get("cluster_id"):
+                    continue  # без cluster_id пересоздать draft нельзя
+                poll_drafts.append({
+                    "cluster": fs["cluster"],
+                    "cluster_id": fs["cluster_id"],
+                    "supply_type": fs.get("supply_type", 2),
+                    "draft_id": 0,  # будет пересоздан в первой итерации
+                    "drop_off_warehouse_id": fs.get("drop_off_warehouse_id"),
+                    "drop_off_warehouse_name": fs.get("drop_off_warehouse_name"),
+                    "draft_type": draft_type,
+                    "created_ts": stale_ts,
+                })
+            if poll_drafts:
+                task = asyncio.create_task(_auto_poll_slots(
+                    msg.bot, msg.chat.id, rid, poll_drafts,
+                    data.get("ob_date_from_iso") or f"{data.get('ob_date_from')}T00:00:00Z",
+                    data.get("ob_date_to_iso") or f"{data.get('ob_date_to')}T23:59:59Z",
+                    data.get("ob_date_picks") or [],
+                    data.get("ob_hour_picks") or [],
+                ))
+                _AUTO_POLL_TASKS[rid] = task
+                auto_poll_started = True
+                rows.append([InlineKeyboardButton(
+                    text="✖ Остановить авто-поиск",
+                    callback_data=f"obcancelpoll:{rid}",
+                )])
+
+    if auto_poll_started:
+        lines.append("")
+        lines.append(
+            "♻ <b>Авто-поиск в фоне запущен на 60 мин</b> — пересоздаю drafts каждые "
+            "~28 мин. Если Ozon добавит слоты, придёт сообщение со списком."
+        )
+
+    rows.append([InlineKeyboardButton(
+        text="◀ К карточке заявки",
+        callback_data=f"ship_open:{rid}",
+    )])
     await msg.answer(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -1087,6 +1224,18 @@ async def _show_scored_warehouse_picker(msg: Message, state: FSMContext) -> None
     scored = (data.get("ob_scored") or {}).get(cluster) or []
     available = [w for w in scored if w["available"]]
     unavailable = [w for w in scored if not w["available"]]
+
+    # AUTO MODE: после успешного booking'а предыдущего направления юзер нажал
+    # «🚀 Бронировать следующее» → флаг `ob_auto_walk` пришёл из state. Picker
+    # не показываем, сразу запускаем _run_autowalk. Без этого юзер видел
+    # лишний шаг «выбери склад» каждый раз для каждого направления.
+    if data.get("ob_auto_walk") and available:
+        await progress_add(
+            msg, state,
+            f"🚀 Авто-режим: запускаю Auto-walk для «{cluster}» ({len(available)} складов)."
+        )
+        await _run_autowalk(msg, state, idx)
+        return
 
     if not available:
         # Все scored склады недоступны → показать причины
@@ -1138,37 +1287,48 @@ async def _show_scored_warehouse_picker(msg: Message, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("obautowalk:"))
 async def cb_ob_autowalk(cb: CallbackQuery, state: FSMContext) -> None:
-    """Бот сам пробует склады из списка пока не получит 200 со слотами."""
+    """Юзер тапнул «🚀 Auto-walk» — обёртка над `_run_autowalk`."""
     idx = int(cb.data.split(":", 1)[1])
+    await cb.answer("Запускаю auto-walk…")
+    if not cb.message:
+        return
+    await _run_autowalk(cb.message, state, idx)
+
+
+async def _run_autowalk(msg: Message, state: FSMContext, idx: int) -> None:
+    """Бот сам пробует scored-склады кластера idx пока не получит 200 со слотами.
+
+    Вынесено из `cb_ob_autowalk` — теперь зовётся и при ручном клике юзера, и
+    автоматом из `_show_scored_warehouse_picker` если `ob_auto_walk=True`
+    (например после успешного бронирования предыдущего направления).
+    """
     data = await state.get_data()
     cluster = data["ob_clusters"][idx]
     scored = (data.get("ob_scored") or {}).get(cluster) or []
     available = [w for w in scored if w["available"]]
 
-    await cb.answer("Запускаю auto-walk…")
-    if not cb.message:
-        return
-
     if not available:
-        await cb.message.answer("⚠ Нет складов для перебора.")
+        await msg.answer("⚠ Нет складов для перебора.")
         return
 
     # Готовим draft для текущего кластера
     drafts = data.get("ob_drafts") or []
     draft = next((d for d in drafts if d["cluster"] == cluster), None)
     if not draft:
-        await cb.message.answer("⚠ Draft не найден.")
+        await msg.answer("⚠ Draft не найден.")
         return
 
     date_from_iso = data["ob_date_from_iso"]
     date_to_iso = data["ob_date_to_iso"]
+    # Hour-фильтр (юзер выбрал на time-picker'е). Если пусто — фильтра нет.
+    hour_picks_set = set(int(h) for h in (data.get("ob_hour_picks") or []))
     oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
 
     found_slots: List[Dict] = []
     tried = 0
     summary: List[str] = []  # отчёт по каждому wh для финального лога
-    status_msg = await cb.message.answer(
-        f"🔄 Auto-walk: пробую {len(available)} складов.\n"
+    status_msg = await msg.answer(
+        f"🔄 Auto-walk «{cluster}»: пробую {len(available)} складов.\n"
         f"⏳ Жду 10 сек чтобы Ozon успел рассчитать scoring…"
     )
     await asyncio.sleep(10.0)  # дать scoring-engine время «переварить» draft
@@ -1194,6 +1354,13 @@ async def cb_ob_autowalk(cb: CallbackQuery, state: FSMContext) -> None:
             return ("err", [])
 
         entries = _parse_v2_timeslots(ts, fallback_wh_id=w["wh_id"], fallback_wh_name=w["name"])
+        # Применяем hour-фильтр (если задан в state) — auto-walk должен уважать
+        # выбранные часы как и обычный flow.
+        if hour_picks_set:
+            entries = [
+                e for e in entries
+                if (len(e.get("from", "")) >= 13) and int(e["from"][11:13]) in hour_picks_set
+            ]
         slots: List[Dict] = []
         for e in entries:
             slots.append({
@@ -1686,6 +1853,25 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 )
                 continue
 
+        # Фильтруем по выбранным часам (если указаны). Час старта слота —
+        # `slot.from[11:13]` (формат "YYYY-MM-DDTHH:MM:SS...").
+        hour_picks = data.get("ob_hour_picks") or []
+        if hour_picks:
+            hours_set = {int(h) for h in hour_picks}
+            total_before = len(parsed_slots)
+            parsed_slots = [
+                e for e in parsed_slots
+                if (len(e.get("from", "")) >= 13) and int(e["from"][11:13]) in hours_set
+            ]
+            if total_before and not parsed_slots:
+                from src.bot.helpers import format_picked_hours
+                await progress_add(
+                    msg, state,
+                    f"  🔴 «{d['cluster']}»: слотов в выбранные часы "
+                    f"({format_picked_hours(list(hours_set))}) нет."
+                )
+                continue
+
         # Сортируем по дате-времени, сохраняем ВСЕ слоты этого кластера —
         # picker покажет их со страничной навигацией.
         parsed_slots.sort(key=lambda e: e["from"])
@@ -1704,6 +1890,46 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
     if clusters_with_slots:
         # Имена failed-кластеров — показываем их в обзоре с пометкой «нужен другой drop-off».
         failed_cluster_names = [d["cluster"] for d in failed_drafts]
+
+        # AUTO-BOOK MODE: если юзер на time-picker'е выбрал часы (а не «🎲 любое
+        # время»), это значит «хочу любой слот в этом окне, сам не выбираю».
+        # Берём ПЕРВЫЙ (самый ранний) слот в каждом кластере (они уже отфильтрованы
+        # по hour_picks выше + отсортированы) и сразу bulk-book. Picker не показываем.
+        hour_picks = data.get("ob_hour_picks") or []
+        if hour_picks:
+            auto_choices: Dict[str, Dict] = {}
+            for i, c in enumerate(clusters_with_slots):
+                slots = c.get("slots") or []
+                if not slots:
+                    continue
+                first = slots[0]  # sorted by 'from'
+                auto_choices[str(i)] = {
+                    "cluster": c["cluster"],
+                    "cluster_id": c.get("cluster_id"),
+                    "draft_id": c["draft_id"],
+                    "supply_type": c.get("supply_type", 2),
+                    "drop_off_name": c.get("drop_off_name"),
+                    "warehouse_id": first["warehouse_id"],
+                    "warehouse_name": first["warehouse_name"],
+                    "from": first["from"],
+                    "to": first["to"],
+                }
+            if auto_choices:
+                from src.bot.helpers import format_picked_hours
+                await progress_add(
+                    msg, state,
+                    f"\n🎯 <b>Авто-бронирование</b> по выбранным часам "
+                    f"({format_picked_hours(hour_picks)}) — беру самый ранний слот в окне для каждого кластера."
+                )
+                await state.update_data(
+                    ob_picker_clusters=clusters_with_slots,
+                    ob_picker_choices=auto_choices,
+                    ob_failed_clusters=failed_cluster_names,
+                )
+                await state.set_state(OzonBook.pick_slot)
+                await _run_bulk_book(msg.bot, msg, state)
+                return
+
         await state.update_data(
             ob_picker_clusters=clusters_with_slots,
             ob_picker_idx=0,
@@ -1750,6 +1976,7 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 data["ob_date_from_iso"],
                 data["ob_date_to_iso"],
                 data.get("ob_date_picks") or [],
+                data.get("ob_hour_picks") or [],
             ))
             _AUTO_POLL_TASKS[rid] = task
 
@@ -1848,14 +2075,17 @@ async def _auto_poll_slots(
     date_from_iso: str,
     date_to_iso: str,
     date_picks: Optional[List[str]] = None,
+    hour_picks: Optional[List[int]] = None,
 ) -> None:
     """Раз в 60 сек дёргает timeslot/info. До 60 мин общая длительность.
     Каждые ~28 мин пересоздаёт drafts (Ozon draft живёт 30 мин). Если за час
     слотов нет — пишет финальное «не нашёл, братан» сообщение.
     Изоляция: ключом в _AUTO_POLL_TASKS служит rid — параллельные заявки
     запускают свои независимые auto-poll и не мешают друг другу.
+    `hour_picks` (если задан) — фильтр часов старта слотов.
     """
     import time as _t
+    hour_set = {int(h) for h in (hour_picks or [])}
 
     deadline = _t.time() + 60 * 60   # 60 минут
     interval = 60                     # секунд между попытками
@@ -1872,6 +2102,7 @@ async def _auto_poll_slots(
             attempts += 1
             oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
             # Пересоздаём drafts которым >28 мин — иначе Ozon вернёт 404 expired.
+            recreated_this_iter = 0
             for fd in drafts:
                 if fd.get("created_ts") and _t.time() - fd["created_ts"] > recreate_after:
                     new_id = await _recreate_draft_for_auto_poll(oz, rid, fd)
@@ -1880,6 +2111,14 @@ async def _auto_poll_slots(
                                     fd["cluster"], fd["draft_id"], new_id)
                         fd["draft_id"] = new_id
                         fd["created_ts"] = _t.time()
+                        recreated_this_iter += 1
+            # Если в эту итерацию пересоздали хоть один draft — даём Ozon scoring'у
+            # 30 сек чтобы посчитаться. Без этого timeslot/info на свежий draft
+            # ловит 404 «scoring not found» и (раньше) убивал auto-poll.
+            if recreated_this_iter:
+                logger.info("auto-poll: recreated %d drafts, waiting 30s for scoring",
+                            recreated_this_iter)
+                await asyncio.sleep(30)
             all_slot_entries: List[Dict] = []
             any_429 = False
             any_ok = False
@@ -1905,6 +2144,12 @@ async def _auto_poll_slots(
                     if date_picks:
                         picks_set = set(date_picks)
                         entries = [e for e in entries if e["from"][:10] in picks_set]
+                    if hour_set:
+                        entries = [
+                            e for e in entries
+                            if (len(e.get("from", "")) >= 13)
+                            and int(e["from"][11:13]) in hour_set
+                        ]
                     for e in entries:
                         all_slot_entries.append({
                             "draft_id": d["draft_id"],
@@ -1921,17 +2166,27 @@ async def _auto_poll_slots(
                     if "429" in err_s:
                         any_429 = True
                         continue
-                    # 404 «scoring result not found» = draft/wh связка сломана.
-                    # Ретраить бесполезно (новых scored wh не появится) + каждый
-                    # хит может продлевать anti-abuse. Гасим auto-poll.
+                    # 404 «scoring result not found». Раньше всегда убивало
+                    # auto-poll — но для scoring-fail-restart кейса (юзер тыкнул
+                    # рестарт после NO_TIMESLOTS) draft только что пересоздан и
+                    # scoring ещё не успел посчитаться. Различаем по возрасту:
+                    # < 120 сек — даём шанс, > — связка реально невалидна.
                     if "404" in err_s and "scoring" in err_s.lower():
+                        age = _t.time() - (d.get("created_ts") or 0)
+                        if age < 120:
+                            logger.info(
+                                "auto-poll: 404 scoring on fresh draft %s (age %.0fs) "
+                                "— ретрай в следующей итерации", d.get("draft_id"), age,
+                            )
+                            continue
                         await bot.send_message(
                             chat_id,
-                            f"🛑 Авто-поиск #{rid} остановлен: 404 «scoring not found». "
-                            f"Связка draft+склад невалидна — нужно создать draft заново "
-                            f"(scoring должен успеть посчитаться, не делайте blind-pick склада)."
+                            f"🛑 Авто-поиск #{rid} остановлен: 404 «scoring not found» "
+                            f"даже на старом draft'е ({age:.0f}с). Связка draft+склад "
+                            f"невалидна — пересоздай через карточку заявки."
                         )
-                        logger.info("auto-poll stopped on 404 scoring: rid=%d", rid)
+                        logger.info("auto-poll stopped on 404 scoring: rid=%d age=%.0f",
+                                    rid, age)
                         return
                     logger.warning("auto-poll API error: %s", e)
                 except Exception as e:
@@ -2006,15 +2261,24 @@ async def _auto_poll_slots(
 
 
 async def _post_found_slots(bot, chat_id: int, rid: int, slots: List[Dict]) -> None:
-    """Постит найденные слоты пользователю с inline-кнопками."""
-    # Даты, уже забронированные в других кластерах этой заявки — подсвечиваем ✓
-    booked_dates: set = set()
+    """Постит найденные слоты пользователю с inline-кнопками.
+
+    Уже забронированные слоты других направлений — выносим в текст-подсказку
+    наверху («у тебя уже забронированы Самара 20.05 10:00 …»). На сами кнопки
+    ✓ НЕ ставим: раньше сравнивали только по дате → на странице где 20 слотов
+    одного дня все получали ✓ и юзеру казалось «всё уже занято». Подсказка
+    наверху даёт ту же информацию без шума на кнопках.
+    """
+    booked_info: List[str] = []
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if req:
             for it in req.items:
                 if it.marketplace == "ozon" and it.booked_slot_at:
-                    booked_dates.add(it.booked_slot_at.date().isoformat())
+                    d = it.booked_slot_at
+                    booked_info.append(
+                        f"{it.cluster} <b>{d.day:02d}.{d.month:02d} {d.hour:02d}:{d.minute:02d}</b>"
+                    )
 
     buttons: List[List[InlineKeyboardButton]] = []
     for i, slot in enumerate(slots[:25]):
@@ -2023,15 +2287,18 @@ async def _post_found_slots(bot, chat_id: int, rid: int, slots: List[Dict]) -> N
         date_short = (slot.get("from") or "")[:10]
         t_from = (slot.get("from") or "")[11:16]
         wh_short = (slot.get("warehouse_name") or "")[:14]
-        sync_mark = "✓ " if date_short in booked_dates else ""
-        btn_text = f"📌 {sync_mark}{date_short} {t_from} {wh_short}"
+        btn_text = f"📌 {date_short} {t_from} {wh_short}"
         buttons.append([InlineKeyboardButton(text=btn_text[:40], callback_data=f"obfslot:{token}")])
 
     buttons.append([InlineKeyboardButton(text="◀ К карточке заявки", callback_data=f"ship_open:{rid}")])
 
     hint = ""
-    if booked_dates:
-        hint = f"\n<i>✓ — даты, уже занятые в других кластерах ({', '.join(sorted(booked_dates))})</i>"
+    if booked_info:
+        hint = (
+            "\n\n<i>💡 Уже забронировано в этой заявке: "
+            + ", ".join(booked_info)
+            + ". Подбирай близкое время — один водитель / один рейс.</i>"
+        )
     await bot.send_message(
         chat_id,
         f"🎉 <b>Слоты найдены!</b> Заявка #{rid} — {len(slots)} вариантов.\n"
@@ -2059,18 +2326,113 @@ async def cb_ob_found_slot_pick(cb: CallbackQuery, state: FSMContext) -> None:
     if lock_key in _BOOKING_IN_FLIGHT:
         await cb.answer("Бронирование этого слота уже идёт — подожди ответ.", show_alert=True)
         return
+
+    # Немедленный visual feedback: сообщение со слот-кнопками edit'им в
+    # «⏳ Бронирую слот …» БЕЗ кнопок. Без этого статусы летят только в
+    # сардельку (которая выше в чате) → юзер не видит что клик сработал.
+    slot_date = (slot.get("from") or "")[:10]
+    slot_time = (slot.get("from") or "")[11:16]
+    wh_name = slot.get("warehouse_name") or "—"
+    cluster_name = slot.get("cluster") or "?"
+    if cb.message:
+        try:
+            await cb.message.edit_text(
+                f"⏳ <b>Бронирую слот</b> · {cluster_name}\n"
+                f"📌 {slot_date} {slot_time} · {wh_name}\n\n"
+                f"<i>Жди до 1 мин — Ozon обрабатывает supply/create.</i>",
+                reply_markup=None,
+            )
+        except Exception:
+            pass  # старое сообщение могло быть уже не editable
+
     _BOOKING_IN_FLIGHT.add(lock_key)
     try:
-        await _do_book_slot(cb, slot, rid=rid, state=state)
+        result = await _do_book_slot(cb, slot, rid=rid, state=state)
     finally:
         _BOOKING_IN_FLIGHT.discard(lock_key)
+
+    # Финальный статус — на ту же кнопку-сообщение со слот-пиком, чтобы юзер
+    # видел итог ТАМ где кликал (а не только в сардельке наверху). Сразу
+    # предлагаем «что дальше»: либо следующее непробронированное направление,
+    # либо обратно в карточку. Wizard-lock на rid отпускаем — иначе юзер не
+    # сможет перезапустить мастер для остальных кластеров (30-мин TTL).
+    if rid is not None:
+        _wizard_release(rid)
+
+    if not cb.message:
+        return
+
+    status = result.get("status")
+    if status == "success":
+        order_id = result.get("order_id")
+        # Сколько ещё КЛАСТЕРОВ (направлений) не забронированы — раньше считал items
+        # (с дублями по SKU в одном кластере), показывал «3 осталось» когда реально 1.
+        remaining_clusters_count = 0
+        next_mode = "cross" if slot.get("supply_type") == 1 else "direct"
+        if rid is not None:
+            with db_session() as session:
+                req = get_shipment_request(session, rid)
+                if req:
+                    remaining_clusters = {
+                        it.cluster for it in req.items
+                        if it.marketplace == "ozon" and not it.booked_supply_id
+                    }
+                    remaining_clusters_count = len(remaining_clusters)
+                    # Уважим зафиксированный тип заявки, если он есть.
+                    if req.ozon_supply_type:
+                        next_mode = req.ozon_supply_type
+        rows: List[List[InlineKeyboardButton]] = []
+        if remaining_clusters_count > 0 and rid is not None:
+            # ozon_book_auto — отдельный callback, который сразу запустит Auto-walk
+            # минуя scoring picker (юзер: «не понимаю почему опять смотрит scored»).
+            rows.append([InlineKeyboardButton(
+                text=f"🚀 Бронировать следующее направление ({remaining_clusters_count} осталось)",
+                callback_data=f"ozon_book_auto:{rid}:{next_mode}",
+            )])
+        rows.append([InlineKeyboardButton(
+            text="📋 К карточке заявки",
+            callback_data=f"ship_open:{rid or 0}",
+        )])
+        try:
+            await cb.message.edit_text(
+                f"✅ <b>Слот забронирован!</b>\n"
+                f"📦 {cluster_name}\n"
+                f"📌 {slot_date} {slot_time} · {wh_name}\n"
+                f"🛒 order_id <code>{order_id}</code>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        except Exception:
+            pass
+    else:  # fail | timeout | no_cluster
+        err = (result.get("error") or status or "неизвестная ошибка")[:300]
+        rows = [
+            [InlineKeyboardButton(
+                text="📋 К карточке заявки",
+                callback_data=f"ship_open:{rid or 0}",
+            )],
+        ]
+        try:
+            await cb.message.edit_text(
+                f"❌ <b>Не получилось забронировать</b>\n"
+                f"📦 {cluster_name} · {slot_date} {slot_time}\n\n"
+                f"<code>{err}</code>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        except Exception:
+            pass
 
 
 async def _do_book_slot(
     cb: CallbackQuery, slot: Dict, rid: Optional[int] = None,
     state: Optional[FSMContext] = None,
-) -> None:
+) -> Dict:
     """Полный flow бронирования через v2: supply/create → polling status → запись в БД.
+
+    Возвращает dict с финальным состоянием — caller сам решает что показать юзеру
+    на edit'е сообщения-с-кнопкой (раньше всё шло только в сардельку, юзер не
+    видел финальный статус там где кликал):
+        `{"status": "success"|"fail"|"timeout"|"no_cluster", "order_id": int|None, "error": str|None}`
+
     Если передан state — статусы летят в накопительный progress-message; иначе
     отдельными ответами (legacy)."""
     await cb.answer("Бронирую…")
@@ -2089,7 +2451,8 @@ async def _do_book_slot(
     cluster_id = slot.get("cluster_id")
     if not cluster_id:
         await _say("❌ В слоте нет cluster_id (старый кэш). Жми «🔁 Повторить» в карточке.")
-        return
+        return {"status": "no_cluster", "order_id": None,
+                "error": "В слоте нет cluster_id (старый кэш)"}
     try:
         errors = await oz.draft_supply_create_v2(
             draft_id=slot["draft_id"],
@@ -2100,12 +2463,14 @@ async def _do_book_slot(
             supply_type=slot.get("supply_type", 2),
         )
     except OzonAPIError as e:
-        await _say(f"❌ {str(e)[:400]}")
-        return
+        err_s = str(e)[:400]
+        await _say(f"❌ {err_s}")
+        return {"status": "fail", "order_id": None, "error": err_s}
 
     if errors:
-        await _say(f"❌ Ozon отклонил поставку: <code>{', '.join(errors[:5])}</code>")
-        return
+        err_s = ", ".join(errors[:5])
+        await _say(f"❌ Ozon отклонил поставку: <code>{err_s}</code>")
+        return {"status": "fail", "order_id": None, "error": err_s}
 
     await _say("⏳ supply создаётся, polling status…")
 
@@ -2115,8 +2480,9 @@ async def _do_book_slot(
         try:
             info = await oz.draft_supply_create_status_v2(slot["draft_id"])
         except OzonAPIError as e:
-            await _say(f"⚠ status: <code>{str(e)[:200]}</code>")
-            return
+            err_s = str(e)[:200]
+            await _say(f"⚠ status: <code>{err_s}</code>")
+            return {"status": "fail", "order_id": None, "error": err_s}
         status = str(info.get("status") or "").upper()
         if status in {"SUCCESS", "FAILED"}:
             final = info
@@ -2124,53 +2490,52 @@ async def _do_book_slot(
 
     if not final:
         await _say("⚠ Таймаут на финализации supply (но в ЛК может появиться).")
-        return
+        return {"status": "timeout", "order_id": None,
+                "error": "polling timeout (30 × 2с)"}
 
     status = str(final.get("status") or "?")
     success = status.upper() == "SUCCESS"
     order_id = final.get("order_id")
 
-    if cb.message:
-        if success:
-            # Drop-off: для CROSSDOCK имя хаба из slot['drop_off_name'],
-            # для DIRECT — имя РФЦ из slot['warehouse_name'].
-            drop_off_display = (
-                slot.get("drop_off_name")
-                or (slot.get("warehouse_name") if slot.get("warehouse_name") and slot.get("warehouse_id") else None)
-                or "—"
-            )
-            await _say(
-                f"✅ <b>Поставка создана в Ozon ЛК!</b> order_id <code>{order_id}</code> · "
-                f"Кластер {slot['cluster']} · "
-                f"Drop-off {drop_off_display} · "
-                f"Слот {slot['from'][:16]}–{slot['to'][11:16]}"
-            )
-            if rid:
-                with db_session() as session:
-                    req = get_shipment_request(session, rid)
-                    if req:
-                        if order_id:
-                            for it in req.items:
-                                if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
-                                    it.booked_supply_id = str(order_id)
-                                    it.target_warehouse = slot["warehouse_name"]
-                                    it.booked_slot_at = datetime.fromisoformat(
-                                        slot["from"].replace("Z", "+00:00").split("+")[0]
-                                    )
-                        from src.services.shipment_service import refresh_request_state_after_booking
-                        refresh_request_state_after_booking(req)
-                # Помечаем draft как использованный — в кэше не отдадим повторно.
-                from src.services.draft_cache import mark_draft_used
-                with db_session() as session:
-                    mark_draft_used(session, int(slot["draft_id"]))
-
-            # Кнопку «Забронировать остальные» убрали — основной flow теперь
-            # через picker (bulk-book). Этот код выполняется только для
-            # auto-poll результата (одиночные слоты), где докручивать нечего.
-        else:
-            errs = final.get("error_reasons") or []
-            err_s = ", ".join(str(e) for e in errs[:5])
-            await _say(f"❌ status={status}\nerrors: <code>{err_s}</code>")
+    if success:
+        # Drop-off: для CROSSDOCK имя хаба из slot['drop_off_name'],
+        # для DIRECT — имя РФЦ из slot['warehouse_name'].
+        drop_off_display = (
+            slot.get("drop_off_name")
+            or (slot.get("warehouse_name") if slot.get("warehouse_name") and slot.get("warehouse_id") else None)
+            or "—"
+        )
+        await _say(
+            f"✅ <b>Поставка создана в Ozon ЛК!</b> order_id <code>{order_id}</code> · "
+            f"Кластер {slot['cluster']} · "
+            f"Drop-off {drop_off_display} · "
+            f"Слот {slot['from'][:16]}–{slot['to'][11:16]}"
+        )
+        if rid:
+            with db_session() as session:
+                req = get_shipment_request(session, rid)
+                if req:
+                    if order_id:
+                        for it in req.items:
+                            if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
+                                it.booked_supply_id = str(order_id)
+                                it.target_warehouse = slot["warehouse_name"]
+                                it.booked_slot_at = datetime.fromisoformat(
+                                    slot["from"].replace("Z", "+00:00").split("+")[0]
+                                )
+                    from src.services.shipment_service import refresh_request_state_after_booking
+                    refresh_request_state_after_booking(req)
+            # Помечаем draft как использованный — в кэше не отдадим повторно.
+            from src.services.draft_cache import mark_draft_used
+            with db_session() as session:
+                mark_draft_used(session, int(slot["draft_id"]))
+        return {"status": "success", "order_id": order_id, "error": None}
+    else:
+        errs = final.get("error_reasons") or []
+        err_s = ", ".join(str(e) for e in errs[:5])
+        await _say(f"❌ status={status}\nerrors: <code>{err_s}</code>")
+        return {"status": "fail", "order_id": None,
+                "error": f"status={status}; {err_s}"}
 
 
 @router.callback_query(F.data.startswith("obcancelpoll:"))
@@ -2239,7 +2604,13 @@ async def _render_date_overview(msg: Message, state: FSMContext) -> None:
     """
     data = await state.get_data()
     clusters: List[Dict] = data.get("ob_picker_clusters") or []
-    failed_names: List[str] = data.get("ob_failed_clusters") or []
+    failed_names: List[str] = list(data.get("ob_failed_clusters") or [])
+    # Кластеры, отбитые scoring'ом (мы их потеряли ещё до timeslot/info), тоже
+    # учитываем — иначе total = только живые, и юзер видит «2/2» когда реально 2/5.
+    failed_scoring_names: List[str] = list(data.get("ob_failed_clusters_scoring") or [])
+    for n in failed_scoring_names:
+        if n not in failed_names:
+            failed_names.append(n)
     msg_id = data.get("ob_overview_msg_id")
     rid = data.get("ob_rid")
 
@@ -2256,11 +2627,15 @@ async def _render_date_overview(msg: Message, state: FSMContext) -> None:
         for d in dates:
             date_map.setdefault(d, set()).add(cname)
 
-    total = len(clusters)
+    # total = ВСЕ кластеры в скоупе заявки (включая отбитые scoring'ом и timeslot/info),
+    # чтобы бар честно показывал «2 из 5» а не «2 из 2». Источник — ob_clusters,
+    # выставлен в `_start_ozon_book_wizard`.
+    all_clusters: List[str] = data.get("ob_clusters") or [c["cluster"] for c in clusters]
+    total = len(all_clusters)
     sorted_dates = sorted(date_map.keys())
 
     lines: List[str] = [f"📅 <b>Сводка по датам</b> · заявка #{rid or '?'}", ""]
-    lines.append(f"Кластеров со слотами: <b>{total}</b>")
+    lines.append(f"Кластеров со слотами: <b>{len(clusters)}/{total}</b>")
     if failed_names:
         lines.append(
             f"⚠ Без слотов ({len(failed_names)}): " + ", ".join(failed_names)
@@ -2268,11 +2643,13 @@ async def _render_date_overview(msg: Message, state: FSMContext) -> None:
         lines.append("   <i>смени drop-off через карточку заявки → Ozon CROSSDOCK</i>")
     lines.append("")
 
-    bar_w = 8
+    bar_w = 5  # эмодзи-квадраты шире текстовых — сократили
     for d in sorted_dates:
         avail = len(date_map[d])
         filled = round(bar_w * avail / total)
-        bar = "█" * filled + "░" * (bar_w - filled)
+        # Зелёный/белый квадраты вместо ░/█ — на тёмной теме «░» выглядит как
+        # странный белый прямоугольник, эмодзи читаются однозначно.
+        bar = "🟩" * filled + "⬜" * (bar_w - filled)
         d_short = f"{d[8:10]}.{d[5:7]}"
         # Список кластеров если их немного, иначе только счётчик
         cl_names = sorted(date_map[d])
@@ -2648,37 +3025,49 @@ async def cb_ob_picker_cancel(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(OzonBook.pick_slot, F.data == "obpconfirm")
 async def cb_ob_picker_confirm(cb: CallbackQuery, state: FSMContext) -> None:
-    """Bulk-book всех выбранных слотов."""
+    """Bulk-book всех выбранных слотов — тонкая обёртка над `_run_bulk_book`."""
     await cb.answer("Бронирую все…")
+    if not cb.message:
+        return
+    await _run_bulk_book(cb.bot, cb.message, state)
+
+
+async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
+    """Запускает bulk-booking по `ob_picker_choices` из state. Зовётся:
+    1) Из `cb_ob_picker_confirm` после ручного выбора слотов в picker'е;
+    2) Из auto-book режима (юзер выбрал часы → бот сам подобрал первый слот
+       в окне для каждого кластера и сразу бронирует — без слот-пикера)."""
     data = await state.get_data()
     clusters: List[Dict] = data.get("ob_picker_clusters") or []
     choices: Dict[str, Dict] = data.get("ob_picker_choices") or {}
     rid = data.get("ob_rid")
-    msg_id = data.get("ob_picker_msg_id")
-    if not cb.message:
-        return
+    msg_id = data.get("ob_picker_msg_id") or data.get("ob_progress_msg_id")
     if not choices:
-        await cb.message.answer("⚠ Нечего бронировать — ни одного слота не выбрано.")
+        await msg.answer("⚠ Нечего бронировать — ни одного слота не выбрано.")
         return
 
     # Превращаем picker-panel в running-статус (он же станет «сарделькой» брони).
     header = f"⚙ <b>Bulk-бронирование</b> заявки #{rid or '?'} — {len(choices)} поставок"
     try:
-        await cb.bot.edit_message_text(
-            header,
-            chat_id=cb.message.chat.id,
-            message_id=msg_id or cb.message.message_id,
-        )
-        await state.update_data(
-            ob_progress_msg_id=msg_id, ob_progress_text=header,
-            ob_picker_msg_id=None,
-        )
+        if msg_id:
+            await bot.edit_message_text(
+                header,
+                chat_id=msg.chat.id,
+                message_id=msg_id,
+            )
+            await state.update_data(
+                ob_progress_msg_id=msg_id, ob_progress_text=header,
+                ob_picker_msg_id=None,
+            )
+        else:
+            await progress_start(msg, state, header)
     except Exception as e:
         logger.warning("bulk header edit failed: %s", e)
+        await progress_start(msg, state, header)
 
     ok_count = 0
     fail_count = 0
-    summary: List[str] = []
+    summary: List[Tuple[str, str]] = []
     # Ozon /v2/draft/supply/create — узкий per-second лимит. Если дёргать его
     # подряд без пауз, второй-третий кластер ловит 429. Жёсткая пауза ≥60с
     # между кластерами разжимает окно. После 429 у предыдущего — пауза дольше.
@@ -2691,27 +3080,27 @@ async def cb_ob_picker_confirm(cb: CallbackQuery, state: FSMContext) -> None:
         if idx > 0:
             wait_s = pause_after_429 if last_was_429 else pause_between
             await progress_add(
-                cb.message, state,
+                msg, state,
                 f"\n⏱ Пауза {wait_s}с перед следующим кластером (Ozon per-second лимит)…",
             )
             await asyncio.sleep(wait_s)
         await progress_add(
-            cb.message, state,
+            msg, state,
             f"\n⏳ <b>{slot['cluster']}</b>: draft {slot['draft_id']} → "
             f"{slot['from'][:16]}–{slot['to'][11:16]}",
         )
         lock_key = f"draft_{slot['draft_id']}"
         if lock_key in _BOOKING_IN_FLIGHT:
-            await progress_add(cb.message, state, "  ⚠ Параллельная бронь уже идёт — пропуск.")
+            await progress_add(msg, state, "  ⚠ Параллельная бронь уже идёт — пропуск.")
             summary.append((slot["cluster"], "⚠"))
             last_was_429 = False
             continue
         _BOOKING_IN_FLIGHT.add(lock_key)
         try:
-            ok, was_429 = await _book_one_slot(cb.bot, cb.message, state, slot, rid)
+            ok, was_429 = await _book_one_slot(bot, msg, state, slot, rid)
         except Exception as e:
             logger.exception("bulk book exception: %s", e)
-            await progress_add(cb.message, state, f"  ❌ Exception: <code>{str(e)[:200]}</code>")
+            await progress_add(msg, state, f"  ❌ Exception: <code>{str(e)[:200]}</code>")
             ok = False
             was_429 = False
         finally:
@@ -2726,7 +3115,7 @@ async def cb_ob_picker_confirm(cb: CallbackQuery, state: FSMContext) -> None:
 
     final_lines = "\n".join(f"  {mark} {cl}" for cl, mark in summary)
     await progress_add(
-        cb.message, state,
+        msg, state,
         f"\n🏁 <b>Готово.</b> Успешно: {ok_count}, ошибки: {fail_count}\n{final_lines}",
     )
 
@@ -2747,7 +3136,7 @@ async def cb_ob_picker_confirm(cb: CallbackQuery, state: FSMContext) -> None:
             )],
         ]
         try:
-            await cb.message.answer(
+            await msg.answer(
                 f"Не забронировано: {fail_count}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
@@ -2864,6 +3253,15 @@ async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None
     clusters: List[str] = data.get("ob_clusters") or []
     idx: int = int(data.get("ob_cluster_idx") or 0)
     choices: Dict = data.get("ob_dropoff_choices") or {}
+
+    # Защита от orphan callback'а (state очистился после /start, /cancel или
+    # после завершения предыдущего wizard'а). Юзер тапает старую кнопку drop-off
+    # picker'а → state пустой → раньше попадали в «idx>=len» с пустыми clusters
+    # → шло «Drop-off-точки выбраны для 0 кластеров» + KeyError'ы дальше.
+    if rid is None or not clusters:
+        logger.info("ask_dropoff: stale callback (rid=%s, clusters=%s) — skip",
+                    rid, len(clusters))
+        return
 
     if idx >= len(clusters):
         # Защита от повторного захода — юзер кликает «◀ К выбору» / пагинацию /
