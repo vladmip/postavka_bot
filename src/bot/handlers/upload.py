@@ -58,8 +58,13 @@ async def handle_document(msg: Message, state: FSMContext) -> None:
     doc = msg.document
     fname = doc.file_name or "upload.bin"
 
+    # Zip с xlsx-выгрузками — распаковываем и обрабатываем каждый xlsx по очереди.
+    if fname.lower().endswith(".zip"):
+        await _handle_zip(msg, state, doc, fname)
+        return
+
     if not (fname.lower().endswith(".xls") or fname.lower().endswith(".xlsx")):
-        await msg.answer("Принимаю только .xls / .xlsx.")
+        await msg.answer("Принимаю только .xls / .xlsx или .zip с ними внутри.")
         return
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -240,3 +245,140 @@ def _save_inbox(path: Path, original_name: str, kind: str, supply_id, payload: d
         session.add(inbox)
         session.flush()
         return inbox.id
+
+
+# ── ZIP handling ─────────────────────────────────────────────────────────
+
+
+async def _handle_zip(msg, state: FSMContext, doc, fname: str) -> None:
+    """Принять zip-архив, распаковать и спросить юзера: одна заявка на все
+    или каждый файл — отдельная заявка."""
+    import zipfile
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stored_zip = STORAGE_DIR / f"{ts}_{fname}"
+    file = await msg.bot.get_file(doc.file_id)
+    await msg.bot.download_file(file.file_path, destination=stored_zip)
+
+    extract_dir = STORAGE_DIR / f"{ts}_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with zipfile.ZipFile(stored_zip, "r") as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        await msg.answer(f"⚠ Файл <code>{fname}</code> не валидный zip.")
+        return
+
+    xlsx_files = []
+    for p in extract_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".xls", ".xlsx"):
+            xlsx_files.append(p)
+
+    if not xlsx_files:
+        await msg.answer(f"⚠ В zip {fname} нет .xls/.xlsx файлов.")
+        return
+
+    # Сохраняем пути в state и спрашиваем как обрабатывать
+    await state.update_data(zip_paths=[str(p) for p in xlsx_files], zip_name=fname)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚚 Одна заявка (вместе)", callback_data="zip_mode:together")],
+        [InlineKeyboardButton(text="📤 Раздельно — N заявок", callback_data="zip_mode:separate")],
+        [InlineKeyboardButton(text="✖ Отмена", callback_data="zip_mode:cancel")],
+    ])
+    names = ", ".join(f"<code>{p.name[:35]}</code>" for p in xlsx_files[:8])
+    if len(xlsx_files) > 8:
+        names += f", …и ещё {len(xlsx_files) - 8}"
+    await msg.answer(
+        f"📦 В zip <code>{fname}</code> — {len(xlsx_files)} xlsx:\n{names}\n\n"
+        f"Как обрабатывать?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("zip_mode:"))
+async def cb_zip_mode(cb: CallbackQuery, state: FSMContext) -> None:
+    mode = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    paths = [Path(p) for p in (data.get("zip_paths") or [])]
+    zip_name = data.get("zip_name") or "zip"
+    await state.update_data(zip_paths=None, zip_name=None)
+
+    if mode == "cancel" or not paths:
+        await cb.answer("Отменено")
+        return
+
+    from src.bot.handlers.shipment import looks_like_ship_file, handle_ship_document
+    from src.services.shipment_service import create_shipment_request, attach_ship_file
+    from src.parsers.ship_request import parse_ship_file
+
+    await cb.answer("Обрабатываю…")
+    if not cb.message:
+        return
+
+    logger = __import__("logging").getLogger("bot.upload")
+
+    if mode == "together":
+        # Все xlsx → ОДНА заявка. Progress в одну «сардельку».
+        from src.bot.helpers import progress_start, progress_add, progress_reset
+        await progress_reset(state)
+        with db_session() as session:
+            req = create_shipment_request(session, source_file=zip_name)
+            rid = req.id
+        await progress_start(
+            cb.message, state,
+            f"📋 Создана единая заявка <b>#{rid}</b> на {len(paths)} файлов.",
+        )
+        ok, errs = 0, 0
+        for path in paths:
+            inner_name = path.name
+            if not looks_like_ship_file(inner_name):
+                await progress_add(cb.message, state, f"❔ <code>{inner_name}</code>: пропуск (не ship-выгрузка).")
+                continue
+            try:
+                parsed = parse_ship_file(path)
+                with db_session() as session:
+                    attach_ship_file(session, rid, parsed)
+                ok += 1
+                await progress_add(cb.message, state, f"  ✅ <code>{inner_name}</code>")
+            except Exception as e:
+                errs += 1
+                logger.exception("zip together: failed %s", inner_name)
+                await progress_add(
+                    cb.message, state,
+                    f"  ⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}"
+                )
+        await progress_add(cb.message, state, f"\n📦 Готово: {ok} ок, {errs} с ошибками.")
+        # Показываем карточку заявки с кнопками действий (новое сообщение, нужны кнопки)
+        from src.bot.handlers.shipment import _render_request_card
+        from src.services.shipment_service import get_shipment_request
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if req:
+                text, kb = _render_request_card(req)
+                await cb.message.answer(text, reply_markup=kb)
+
+    elif mode == "separate":
+        # Каждый xlsx → своя заявка (старое поведение)
+        for path in paths:
+            inner_name = path.name
+            if looks_like_ship_file(inner_name):
+                try:
+                    await handle_ship_document(cb.message, state, path, inner_name)
+                except Exception as e:
+                    logger.exception("zip separate: failed %s", inner_name)
+                    await cb.message.answer(
+                        f"⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}"
+                    )
+            else:
+                try:
+                    kind = classify_file(path)
+                    if kind == FileKind.UNKNOWN:
+                        await cb.message.answer(f"❔ <code>{inner_name}</code>: тип не определён.")
+                        continue
+                    parsed_summary, parsed_payload = _parse(path, kind)
+                    _save_inbox(path, inner_name, kind.value, None, parsed_payload)
+                    await cb.message.answer(f"✅ <code>{inner_name}</code>: {kind.value}\n{parsed_summary}")
+                except Exception as e:
+                    await cb.message.answer(f"⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}")

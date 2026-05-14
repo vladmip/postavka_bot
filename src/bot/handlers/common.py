@@ -16,6 +16,10 @@ router = Router()
 # ── Меню ──────────────────────────────────────────────────────────────────
 
 
+# URL гайда «как пользоваться» (Telegraph).
+ONBOARDING_URL = "https://telegra.ph/Postavkinbot-bot-pomoshchnik-dlya-FBOFBW-postavok-05-13"
+
+
 def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
@@ -23,6 +27,8 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⭐ Точки кроссдока", callback_data="menu:favorites")],
         [InlineKeyboardButton(text="🔗 Привязать каталог к МП", callback_data="menu:sku_link")],
         [InlineKeyboardButton(text="🛠 Диагностика", callback_data="menu:diag")],
+        [InlineKeyboardButton(text="📖 Для новичка — как пользоваться",
+                              url=ONBOARDING_URL)],
         [InlineKeyboardButton(text="📚 Справка", callback_data="menu:help")],
     ])
 
@@ -76,6 +82,7 @@ def _sku_link_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟣 Привязать к Wildberries", callback_data="run:sku_link_wb")],
         [InlineKeyboardButton(text="🔵 Привязать к Ozon", callback_data="run:sku_link_ozon")],
+        [InlineKeyboardButton(text="🧹 Почистить мусор из каталога", callback_data="run:sku_clean")],
         [InlineKeyboardButton(text="◀ Назад", callback_data="menu:home")],
     ])
 
@@ -177,6 +184,14 @@ async def cb_run_sku_link_ozon(cb: CallbackQuery) -> None:
     if cb.message:
         from src.bot.handlers.integrations import cmd_sku_link_ozon
         await cmd_sku_link_ozon(cb.message)
+
+
+@router.callback_query(lambda c: c.data == "run:sku_clean")
+async def cb_run_sku_clean(cb: CallbackQuery) -> None:
+    await cb.answer("Ищу мусор…")
+    if cb.message:
+        from src.bot.handlers.integrations import cmd_sku_clean
+        await cmd_sku_clean(cb.message)
 
 
 # ── menu:diag — подменю диагностики ──────────────────────────────────────

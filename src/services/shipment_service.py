@@ -24,34 +24,33 @@ class AttachResult:
 
 
 def _find_sku(session: Session, raw: str) -> Optional[Sku]:
-    """SKU поиск по barcode → article (case-insensitive)."""
-    raw = raw.strip()
-    # 1) точное совпадение barcode (часто 13 цифр)
+    """SKU поиск с устойчивым matching:
+    1) точное равенство barcode
+    2) точное равенство article
+    3) нормализованное сравнение (lowercase + кириллица→латиница) — защита от
+       '3CHOС' (рус. С) vs '3CHOC' (лат. C) и подобных опечаток раскладки.
+    """
+    from src.services.catalog_service import normalize_for_match
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    # 1) Точное по barcode
     sku = session.query(Sku).filter(Sku.barcode == raw).first()
     if sku:
         return sku
-    # 2) точное совпадение article
+    # 2) Точное по article
     sku = session.query(Sku).filter(Sku.article == raw).first()
     if sku:
         return sku
-    # 3) case-insensitive article (на случай '3CHOС' vs '3CHOC' — кириллический С)
-    sku = (
-        session.query(Sku)
-        .filter(Sku.article.ilike(raw))
-        .first()
-    )
-    if sku:
-        return sku
-    # 4) попытка: убрать любые не-ASCII (на случай смешанной кириллицы)
-    ascii_raw = raw.encode("ascii", errors="replace").decode("ascii").replace("?", "")
-    if ascii_raw and ascii_raw != raw:
-        sku = (
-            session.query(Sku)
-            .filter(Sku.article.ilike(ascii_raw))
-            .first()
-        )
-        if sku:
-            return sku
+    # 3) Нормализованное сравнение по article и barcode
+    target = normalize_for_match(raw)
+    if not target:
+        return None
+    for s in session.query(Sku).all():
+        if normalize_for_match(s.article) == target:
+            return s
+        if normalize_for_match(s.barcode) == target:
+            return s
     return None
 
 

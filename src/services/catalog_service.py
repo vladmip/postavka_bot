@@ -1,10 +1,34 @@
 """CRUD каталога SKU + раскрытие наборов."""
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from src.db.models import Sku, SkuKitLink
+
+
+# Мапа кириллических букв → визуально идентичные латинские. Применяется ТОЛЬКО
+# при сравнении (matching), не для сохранения в БД. Так бот устойчив к ошибкам
+# раскладки (когда у продавца в карточке Ozon offer_id напечатан с русской «С»
+# вместо латинской «C» — реальный кейс с товаром 3CHOC у Баковца).
+_CYR_TO_LAT = str.maketrans({
+    "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "К": "K", "М": "M",
+    "О": "O", "Р": "P", "Т": "T", "Х": "X", "У": "Y", "І": "I", "Ј": "J",
+    # Lowercase
+    "а": "a", "в": "b", "с": "c", "е": "e", "н": "h", "к": "k", "м": "m",
+    "о": "o", "р": "p", "т": "t", "х": "x", "у": "y", "і": "i", "ј": "j",
+})
+
+
+def normalize_for_match(s: Optional[str]) -> str:
+    """Привести строку к canonical-форме для сравнения артикулов:
+    - lower-case
+    - кириллические двойники → латинские
+    - strip whitespace
+    Не меняет данные в БД; используется ТОЛЬКО как ключ при поиске."""
+    if not s:
+        return ""
+    return s.strip().translate(_CYR_TO_LAT).lower()
 
 
 def get_sku(session: Session, sku_id: int) -> Optional[Sku]:
@@ -12,11 +36,39 @@ def get_sku(session: Session, sku_id: int) -> Optional[Sku]:
 
 
 def find_sku_by_article(session: Session, article: str) -> Optional[Sku]:
-    return session.scalar(select(Sku).where(Sku.article == article))
+    """Поиск SKU по артикулу с нормализацией (lower + cyrillic→latin).
+    Точное совпадение пробуем первым, потом fuzzy. Это защищает от
+    «3CHOС» (рус. С) vs «3CHOC» (лат. C) и подобного."""
+    if not article:
+        return None
+    exact = session.scalar(select(Sku).where(Sku.article == article))
+    if exact:
+        return exact
+    target = normalize_for_match(article)
+    if not target:
+        return None
+    for s in session.scalars(select(Sku)):
+        if normalize_for_match(s.article) == target:
+            return s
+    return None
 
 
 def find_sku_by_barcode(session: Session, barcode: str) -> Optional[Sku]:
-    return session.scalar(select(Sku).where(Sku.barcode == barcode))
+    """Поиск по штрихкоду. Сначала точное, потом нормализованное.
+    Нормализация безопасна — реальные штрихкоды это цифры (ничего не меняется),
+    но защищает от тех же кириллица/латиница в строковых «псевдо-баркодах» (3CHOC)."""
+    if not barcode:
+        return None
+    exact = session.scalar(select(Sku).where(Sku.barcode == barcode))
+    if exact:
+        return exact
+    target = normalize_for_match(barcode)
+    if not target:
+        return None
+    for s in session.scalars(select(Sku)):
+        if normalize_for_match(s.barcode) == target:
+            return s
+    return None
 
 
 def list_skus(session: Session, limit: int = 50, offset: int = 0) -> List[Sku]:

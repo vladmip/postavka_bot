@@ -87,12 +87,11 @@ async def main() -> None:
     me = await bot.get_me()
     logging.info("Bot started: @%s (id=%s)", me.username, me.id)
 
-    # Регистрируем команды в панели Telegram (левая «menu» кнопка)
+    # Регистрируем команды в панели Telegram (левая «menu» кнопка).
+    # Минимум: /start — главное меню (всё остальное оттуда), /help — справка.
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="ship", description="📋 Мои заявки"),
         BotCommand(command="help", description="📚 Справка"),
-        BotCommand(command="cancel", description="✖ Отменить текущий мастер"),
     ])
 
     await bot.delete_webhook(drop_pending_updates=True)

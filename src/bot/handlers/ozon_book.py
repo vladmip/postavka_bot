@@ -237,23 +237,33 @@ def _build_items_for_cluster(req: ShipmentRequest, cluster: str) -> Tuple[List[D
 
 async def _resolve_ozon_cluster_id(oz: OzonClient, cluster_name_local: str) -> Optional[int]:
     """Найти macrolocal_cluster_id у Ozon API по нашему имени кластера.
-    С 03.2026 новые endpoint draft/*/create требуют именно macrolocal_cluster_id,
-    а не старый cluster.id из cluster_list.
+
+    Ozon API теперь отдаёт кластеры по городам (Саратов, Тюмень, Уфа,
+    Ярославль, Махачкала, Калининград и т.п. — все отдельно). Поэтому
+    матчим напрямую по cluster_list без hardcoded mappings.
     """
-    matched_key = _ozon_cluster_to_name(cluster_name_local)
-    if not matched_key:
+    if not cluster_name_local:
         return None
     try:
         clusters = await oz.cluster_list()
     except OzonAPIError as e:
         logger.warning("cluster_list failed: %s", e)
         return None
-    target_norm = _normalize(matched_key)
-    target_norm_local = _normalize(cluster_name_local)
+    target_norm = _normalize(cluster_name_local)
+    # 1) Точное совпадение нормализованных имён
     for cl in clusters:
-        cname = cl.get("name") or ""
-        n = _normalize(cname)
-        if n == target_norm or n == target_norm_local or target_norm in n or n in target_norm:
+        if _normalize(cl.get("name") or "") == target_norm:
+            mcid = cl.get("macrolocal_cluster_id") or cl.get("id")
+            try:
+                return int(mcid)
+            except (ValueError, TypeError):
+                return None
+    # 2) Подстрочное совпадение («Саратов» ↔ «Саратов и Поволжье», если такие есть)
+    for cl in clusters:
+        cname_norm = _normalize(cl.get("name") or "")
+        if not cname_norm:
+            continue
+        if target_norm in cname_norm or cname_norm in target_norm:
             mcid = cl.get("macrolocal_cluster_id") or cl.get("id")
             try:
                 return int(mcid)
@@ -648,20 +658,20 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
         try:
             cid = await _resolve_ozon_cluster_id(oz, cl)
         except OzonAPIError as e:
-            await msg.answer(f"⚠ cluster_list: <code>{str(e)[:200]}</code>")
+            await progress_add(msg, state, f"⚠ cluster_list: <code>{str(e)[:200]}</code>")
             continue
         if not cid:
-            await msg.answer(f"⚠ Не сматчил «{cl}» с Ozon-кластером. Пропускаю.")
+            await progress_add(msg, state, f"  ⚠ Не сматчил «{cl}» с Ozon-кластером. Пропускаю.")
             continue
 
         with db_session() as session:
             req = get_shipment_request(session, rid)
             if not req:
-                await msg.answer(f"Заявка #{rid} пропала.")
+                await progress_add(msg, state, f"Заявка #{rid} пропала.")
                 return
             items, _ = _build_items_for_cluster(req, cl)
         if not items:
-            await msg.answer(f"⚠ «{cl}»: нет SKU с offer_id — нечего бронировать.")
+            await progress_add(msg, state, f"  ⚠ «{cl}»: нет SKU с offer_id — нечего бронировать.")
             continue
 
         endpoint_label = "/v1/draft/crossdock/create" if supply_type == 1 else "/v1/draft/direct/create"
@@ -722,7 +732,7 @@ async def _create_drafts_and_fetch_scoring(msg: Message, state: FSMContext) -> N
         scored_by_cluster[cl] = wh_list
 
     if not drafts_made:
-        await msg.answer("⚠ Ни один draft не создан.")
+        await progress_add(msg, state, "⚠ Ни один draft не создан.")
         await state.clear()
         return
 
@@ -1157,8 +1167,12 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 for it in items_check:
                     if it["sku"] not in all_skus_to_check:
                         all_skus_to_check.append(it["sku"])
+    # Стартуем накопительный progress (одна «сарделька»)
+    await progress_reset(state)
+    await progress_start(msg, state, "⚙ <b>Создаю поставку Ozon…</b>")
+
     if all_skus_to_check:
-        await msg.answer("🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
+        await progress_add(msg, state, "🔍 Сверяю SKU с актуальным Ozon-кабинетом…")
         missing, _ = await _validate_skus_in_current_account(oz, all_skus_to_check)
         if missing:
             lines: List[str] = []
@@ -1175,57 +1189,50 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 for s in missing:
                     if s not in seen_sku:
                         lines.append(f"  • sku=<code>{s}</code> (нет в нашей БД)")
-            await msg.answer(
-                f"🚫 <b>Стоп — артикулы не из текущего кабинета.</b>\n\n"
-                f"В Ozon (client_id={CLIENT_ID_OZON}) нет таких SKU:\n"
+            await progress_add(
+                msg, state,
+                f"🚫 <b>Стоп — артикулы не из текущего кабинета.</b>\n"
                 + "\n".join(lines[:15])
                 + ("\n  …" if len(lines) > 15 else "")
-                + "\n\nОзон ответил бы <code>OUT_OF_ASSORTMENT</code> и заявка бы не прошла.\n"
-                "<i>Открой меню → 🔗 Привязать каталог → или </i><code>/sku_link_ozon</code><i> "
-                "чтобы пересинхронизировать SKU.</i>"
+                + "\n<i>Открой меню → 🔗 Привязать каталог → /sku_link_ozon</i>"
             )
             await state.clear()
             return
 
-    # Под каждый кластер — отдельный draft с выбранным drop-off складом
     drafts_made: List[Dict] = []
     for cl in clusters:
-        wh_id = wh_choices.get(cl)  # None = «любой» (не передаём в draft)
+        wh_id = wh_choices.get(cl)
         wh_label = ""
         if wh_id:
             wh_list = _get_cluster_ff_warehouses(cl)
             wh_name = next((w["name"] for w in wh_list if w["wh_id"] == wh_id), f"#{wh_id}")
             wh_label = f" → {wh_name}"
-        await msg.answer(f"🔄 Кластер <b>«{cl}»</b>{wh_label}…")
+        await progress_add(msg, state, f"🔄 Кластер <b>«{cl}»</b>{wh_label}…")
 
-        # Резолвим cluster_id
         try:
             cid = await _resolve_ozon_cluster_id(oz, cl)
         except OzonAPIError as e:
-            await msg.answer(f"⚠ cluster_list: <code>{str(e)[:200]}</code>")
+            await progress_add(msg, state, f"  ⚠ cluster_list: <code>{str(e)[:200]}</code>")
             continue
         if not cid:
-            await msg.answer(f"⚠ Не сматчил «{cl}» с Ozon-кластером. Пропускаю.")
+            await progress_add(msg, state, f"  ⚠ Не сматчил «{cl}». Пропускаю.")
             continue
 
-        # Собираем items
         with db_session() as session:
             req = get_shipment_request(session, rid)
             if not req:
-                await msg.answer(f"Заявка #{rid} пропала.")
+                await progress_add(msg, state, f"Заявка #{rid} пропала.")
                 return
             items, missing = _build_items_for_cluster(req, cl)
 
         if not items:
-            await msg.answer(f"⚠ «{cl}»: нет SKU с offer_id — нечего бронировать.")
+            await progress_add(msg, state, f"  ⚠ «{cl}»: нет SKU с offer_id — пропуск.")
             continue
 
-        # Для DIRECT: НЕ передаём wh в draft (это поле — drop_off_point, для CROSSDOCK).
-        # WH будет фильтром в timeslot/info через selected_cluster_warehouses.storage_warehouse_ids
-        wh_log = f", target_wh={wh_id} (для timeslot, не draft)" if wh_id else ""
-        await msg.answer(
-            f"  POST /v1/draft/direct/create: cluster_id={cid}, items={len(items)}{wh_log}… "
-            "(жду 15 сек, лимит 2/min)"
+        wh_log = f", target_wh={wh_id}" if wh_id else ""
+        await progress_add(
+            msg, state,
+            f"  POST /v1/draft/direct/create: cluster_id={cid}, items={len(items)}{wh_log} (жду 15с)"
         )
         await asyncio.sleep(15.0)
         try:
@@ -1233,28 +1240,28 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 items=items,
                 cluster_ids=[cid],
                 draft_type=draft_type,
-                # Не передаём drop_off для DIRECT — Ozon ругается несовместимостью с storage_warehouse_ids
             )
         except OzonAPIError as e:
-            await msg.answer(f"❌ draft_create: <code>{str(e)[:400]}</code>")
+            await progress_add(msg, state, f"  ❌ draft_create: <code>{str(e)[:400]}</code>")
             continue
 
         if op_id.startswith("sync:"):
             draft_id = op_id.split(":", 1)[1]
         else:
-            await msg.answer(f"  ⏳ operation_id={op_id[:24]}…, polling…")
+            await progress_add(msg, state, f"  ⏳ operation_id={op_id[:24]}…, polling…")
             info = await _wait_draft_ready(oz, op_id)
             status = info.get("status", "?")
             if "SUCCESS" not in status.upper() and "DONE" not in status.upper():
                 errs = info.get("errors") or []
                 err_s = "; ".join(str(e)[:120] for e in errs[:3]) if errs else "?"
-                await msg.answer(
-                    f"❌ draft не готов: status={status}\nerrors: <code>{err_s}</code>"
+                await progress_add(
+                    msg, state,
+                    f"  ❌ draft не готов: {status} / {err_s}"
                 )
                 continue
             draft_id = info.get("draft_id") or info.get("calculation_id")
         if not draft_id:
-            await msg.answer("⚠ Нет draft_id в ответе.")
+            await progress_add(msg, state, "  ⚠ Нет draft_id в ответе.")
             continue
 
         supply_type_int = 1 if "CROSSDOCK" in (draft_type or "").upper() else 2
@@ -1264,13 +1271,13 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
             "draft_id": int(draft_id),
             "operation_id": op_id,
             "items_count": len(items),
-            "wh_id": wh_id,  # для фильтра в timeslot/info
+            "wh_id": wh_id,
             "supply_type": supply_type_int,
         })
-        await msg.answer(f"  ✅ draft_id=<code>{draft_id}</code>")
+        await progress_add(msg, state, f"  ✅ draft <code>{draft_id}</code>")
 
     if not drafts_made:
-        await msg.answer("⚠ Ни один draft не создан.")
+        await progress_add(msg, state, "⚠ Ни один draft не создан.")
         await state.clear()
         return
 
@@ -1333,35 +1340,27 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 supply_type=d.get("supply_type", 2),
             )
         except OzonAPIError as e:
-            await msg.answer(f"⚠ timeslot/info для {d['cluster']}: <code>{str(e)[:600]}</code>")
+            await progress_add(msg, state, f"  ⚠ timeslot/info «{d['cluster']}»: <code>{str(e)[:200]}</code>")
             failed_drafts.append(d)
             continue
 
         # Парсим ответ v2: данные под "result.drop_off_warehouse_timeslots"
-        # v2 структура (1 склад через selected_cluster_warehouses):
-        #   {result: {drop_off_warehouse_timeslots: {days: [{date, timeslots: [...]}]}}}
-        # v1 (legacy): массив warehouse-объектов на верхнем уровне.
         parsed_slots = _parse_v2_timeslots(ts, fallback_wh_id=wh_id_filter, fallback_wh_name="")
         if not parsed_slots:
-            import json as _json
-            raw_dump = _json.dumps(ts, ensure_ascii=False)[:1500]
-            await msg.answer(
-                f"🔴 Пустой ответ от timeslot/info для «{d['cluster']}».\n"
-                f"<b>Raw:</b>\n<code>{raw_dump[:800]}</code>"
-            )
+            await progress_add(msg, state, f"  🔴 «{d['cluster']}» — пустой ответ timeslot/info")
             continue
 
-        # Фильтруем по выбранным пользователем датам (Ozon-API принимает только
-        # диапазон date_from..date_to и возвращает все дни между ними).
+        # Фильтруем по выбранным пользователем датам
         date_picks = data.get("ob_date_picks") or []
         if date_picks:
             picks_set = set(date_picks)
             total_before = len(parsed_slots)
             parsed_slots = [e for e in parsed_slots if e["from"][:10] in picks_set]
             if total_before and not parsed_slots:
-                await msg.answer(
-                    f"🔴 Для «{d['cluster']}» слоты есть, но не на выбранные тобой даты "
-                    f"({', '.join(sorted(picks_set))}). Открой «🛠 Изменить даты»."
+                await progress_add(
+                    msg, state,
+                    f"  🔴 «{d['cluster']}»: слотов на выбранные даты "
+                    f"({', '.join(sorted(picks_set))}) нет."
                 )
                 continue
 
@@ -1854,7 +1853,8 @@ async def cb_ob_slot_pick(cb: CallbackQuery, state: FSMContext) -> None:
 
 async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None:
     """Спросить drop-off-точку для текущего ob_cluster_idx кластера.
-    Если все кластеры выбраны — переходим к draft_create."""
+    Если выбран флаг "одна точка для всех" — спросим один раз и заполним
+    choices для всех кластеров. Если все кластеры выбраны — переходим к draft_create."""
     data = await state.get_data()
     clusters: List[str] = data.get("ob_clusters") or []
     idx: int = int(data.get("ob_cluster_idx") or 0)
@@ -1908,13 +1908,41 @@ async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None
     )])
     rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="cancel")])
 
+    # Для multi-cluster заявок предлагаем «одна точка на все» — на первом шаге.
+    apply_all = data.get("ob_dropoff_apply_all", False)
+    apply_all_hint = ""
+    if len(clusters) > 1 and idx == 0 and not apply_all:
+        rows.insert(0, [InlineKeyboardButton(
+            text="🔁 Использовать одну точку для всех кластеров",
+            callback_data="obdo:apply_all_toggle",
+        )])
+        apply_all_hint = (
+            f"\n\n<i>💡 У тебя {len(clusters)} кластеров в заявке. Жми «Использовать "
+            f"одну точку для всех», чтобы выбрать drop-off один раз — применится ко всем.</i>"
+        )
+    elif apply_all and idx == 0:
+        apply_all_hint = (
+            f"\n\n<i>🔁 Режим «одна точка на все {len(clusters)} кластеров» включён. "
+            f"Тапни точку — применится ко всем сразу.</i>"
+        )
+
     text = (
         f"🚛 <b>CROSSDOCK — выбери точку отгрузки</b>\n"
         f"Кластер ({idx + 1}/{len(clusters)}): <b>«{cluster}»</b>\n\n"
         f"Тапни любимую точку или открой полный список хабов / введи имя."
+        f"{apply_all_hint}"
     )
     await state.set_state(OzonBook.pick_dropoff)
-    await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit_or_answer(msg, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "obdo:apply_all_toggle")
+async def cb_obdo_apply_all_toggle(cb: CallbackQuery, state: FSMContext) -> None:
+    """Включить режим «одна точка для всех кластеров»."""
+    await state.update_data(ob_dropoff_apply_all=True)
+    await cb.answer("🔁 Применится ко всем кластерам")
+    if cb.message:
+        await _ask_dropoff_for_next_cluster(cb.message, state)
 
 
 @router.callback_query(F.data.startswith("obdo:fav:"))
@@ -1945,22 +1973,28 @@ async def cb_obdo_fav(cb: CallbackQuery, state: FSMContext) -> None:
 async def _accept_dropoff(
     cb: CallbackQuery, state: FSMContext, *, wh_id: int, name: str,
 ) -> None:
-    """Сохранить выбор для текущего кластера и перейти к следующему."""
+    """Сохранить выбор для текущего кластера. Если включён режим «одна точка
+    на все» — применяет сразу ко всем кластерам и переходит к draft_create."""
     data = await state.get_data()
     clusters: List[str] = data.get("ob_clusters") or []
     idx: int = int(data.get("ob_cluster_idx") or 0)
     choices: Dict = data.get("ob_dropoff_choices") or {}
+    apply_all: bool = bool(data.get("ob_dropoff_apply_all"))
     if idx >= len(clusters):
         await cb.answer("Все кластеры уже выбраны", show_alert=True)
         return
-    cluster = clusters[idx]
-    choices[cluster] = {"wh_id": wh_id, "name": name}
-    await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=idx + 1)
-    await cb.answer(f"✓ {name[:30]}")
+
+    if apply_all:
+        for c in clusters:
+            choices[c] = {"wh_id": wh_id, "name": name}
+        await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=len(clusters))
+        await cb.answer(f"✓ {name[:30]} применено ко всем")
+    else:
+        cluster = clusters[idx]
+        choices[cluster] = {"wh_id": wh_id, "name": name}
+        await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=idx + 1)
+        await cb.answer(f"✓ {name[:30]}")
     if cb.message:
-        await cb.message.answer(
-            f"✅ «{cluster}» → <b>{name}</b>"
-        )
         await _ask_dropoff_for_next_cluster(cb.message, state)
 
 
@@ -2152,11 +2186,16 @@ async def _accept_dropoff_msg(
     clusters: List[str] = data.get("ob_clusters") or []
     idx: int = int(data.get("ob_cluster_idx") or 0)
     choices: Dict = data.get("ob_dropoff_choices") or {}
+    apply_all: bool = bool(data.get("ob_dropoff_apply_all"))
     if idx >= len(clusters):
         await msg.answer("Все кластеры уже выбраны.")
         return
-    cluster = clusters[idx]
-    choices[cluster] = {"wh_id": wh_id, "name": name}
-    await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=idx + 1)
-    await msg.answer(f"✅ «{cluster}» → <b>{name}</b>")
+    if apply_all:
+        for c in clusters:
+            choices[c] = {"wh_id": wh_id, "name": name}
+        await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=len(clusters))
+    else:
+        cluster = clusters[idx]
+        choices[cluster] = {"wh_id": wh_id, "name": name}
+        await state.update_data(ob_dropoff_choices=choices, ob_cluster_idx=idx + 1)
     await _ask_dropoff_for_next_cluster(msg, state)
