@@ -888,6 +888,50 @@ class OzonClient:
         }
         return await self._post("/v1/supply-order/timeslot/update", payload)
 
+    async def supply_order_list(
+        self,
+        *,
+        states: Optional[List[str]] = None,
+        sort_by: str = "ORDER_STATE_UPDATED_AT",
+        sort_dir: str = "DESC",
+        limit: int = 100,
+        max_total: int = 1000,
+    ) -> List[int]:
+        """POST /v3/supply-order/list — список order_id с фильтром по статусу.
+
+        states: ["REPORTS_CONFIRMATION_AWAITING", "REPORT_REJECTED", "COMPLETED",
+        "DATA_FILLING", "READY_TO_SUPPLY", "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+        "IN_TRANSIT", "ACCEPTANCE_AT_STORAGE_WAREHOUSE", "REJECTED_AT_SUPPLY_WAREHOUSE",
+        "CANCELLED", "OVERDUE"]. None/пусто = без фильтра.
+
+        Возвращает [order_id, ...] (числа). Дальше через supply_order_get(order_ids)
+        получить детали.
+        """
+        out: List[int] = []
+        last_id = ""
+        page = min(limit, 100)
+        while True:
+            payload: Dict[str, Any] = {
+                "filter": {},
+                "last_id": last_id,
+                "limit": page,
+                "sort_by": sort_by,
+                "sort_dir": sort_dir,
+            }
+            if states:
+                payload["filter"]["states"] = states
+            data = await self._post("/v3/supply-order/list", payload)
+            chunk = data.get("order_ids") or []
+            for x in chunk:
+                try:
+                    out.append(int(x))
+                except (ValueError, TypeError):
+                    continue
+            last_id = data.get("last_id", "") or ""
+            if not chunk or not last_id or len(out) >= max_total:
+                break
+        return out[:max_total]
+
     async def supply_order_get(self, order_ids: List[int]) -> List[Dict[str, Any]]:
         """POST /v3/supply-order/get — детали по созданным поставкам (до 50 за раз).
 

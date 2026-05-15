@@ -73,11 +73,23 @@ class SkuLine:
 
 
 @dataclass
+class ActAwaitingItem:
+    """Поставка FBO в статусе REPORTS_CONFIRMATION_AWAITING / REPORT_REJECTED —
+    юзер должен зайти в ЛК и подтвердить акт приёмки."""
+    order_id: int
+    order_number: str
+    state: str               # REPORTS_CONFIRMATION_AWAITING / REPORT_REJECTED
+    dropoff_name: str
+    state_updated_at: str    # ISO
+
+
+@dataclass
 class DigestData:
     generated_at: datetime
     returns: ReturnsSummary = field(default_factory=ReturnsSummary)
     urgent: List[SkuLine] = field(default_factory=list)   # отсортирован по days_left ↑
     runout: List[SkuLine] = field(default_factory=list)
+    acts_awaiting: List[ActAwaitingItem] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)        # в чём недотащили API
 
 
@@ -353,6 +365,47 @@ def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLin
     return lines
 
 
+async def collect_acts_awaiting(oz: OzonClient) -> Tuple[List[ActAwaitingItem], List[str]]:
+    """Поставки в состоянии REPORTS_CONFIRMATION_AWAITING / REPORT_REJECTED —
+    юзеру нужно подтвердить акт в Ozon ЛК (иначе через 5 дней автоподтверждение
+    того что заявил Ozon, без шанса оспорить расхождения)."""
+    errors: List[str] = []
+    out: List[ActAwaitingItem] = []
+    try:
+        order_ids = await oz.supply_order_list(
+            states=["REPORTS_CONFIRMATION_AWAITING", "REPORT_REJECTED"],
+            max_total=200,
+        )
+    except OzonAPIError as e:
+        logger.warning("supply_order_list (acts) failed: %s", e)
+        errors.append(f"supply_order_list: {str(e)[:200]}")
+        return out, errors
+    if not order_ids:
+        return out, errors
+    try:
+        # supply_order_get берёт до 50 за раз, бьём пачками.
+        for i in range(0, len(order_ids), 50):
+            chunk = order_ids[i:i + 50]
+            orders = await oz.supply_order_get(chunk)
+            for o in orders:
+                state = str(o.get("state") or "")
+                if state not in ("REPORTS_CONFIRMATION_AWAITING", "REPORT_REJECTED"):
+                    continue
+                drop = o.get("dropoff_warehouse") or {}
+                out.append(ActAwaitingItem(
+                    order_id=int(o.get("order_id") or 0),
+                    order_number=str(o.get("order_number") or ""),
+                    state=state,
+                    dropoff_name=str(drop.get("name") or ""),
+                    state_updated_at=str(o.get("state_updated_date") or ""),
+                ))
+    except OzonAPIError as e:
+        logger.warning("supply_order_get (acts) failed: %s", e)
+        errors.append(f"supply_order_get: {str(e)[:200]}")
+    out.sort(key=lambda a: a.state_updated_at)  # старые наверху (срочнее)
+    return out, errors
+
+
 async def collect_digest(oz: OzonClient) -> DigestData:
     """Главная точка сборки сводки."""
     data = DigestData(generated_at=datetime.now(timezone.utc))
@@ -360,6 +413,10 @@ async def collect_digest(oz: OzonClient) -> DigestData:
     returns, ret_errors = await collect_returns_summary(oz)
     data.returns = returns
     data.errors.extend(ret_errors)
+
+    acts, acts_errors = await collect_acts_awaiting(oz)
+    data.acts_awaiting = acts
+    data.errors.extend(acts_errors)
 
     by_sku, sales_errors = await collect_sales_and_stocks(oz, days_window=28)
     data.errors.extend(sales_errors)
@@ -422,6 +479,34 @@ def build_digest_text(data: DigestData) -> str:
         f"☀ <b>Утренняя сводка</b> · {msk_now.strftime('%d.%m %H:%M')} МСК",
         "",
     ]
+
+    # Акты, ждущие подтверждения (главное сверху — срочные deadline'ы Ozon).
+    if data.acts_awaiting:
+        lines.append("📋 <b>Акты ждут подтверждения</b>")
+        lines.append(
+            "<i>Ozon принял поставки, но без твоего подтверждения через ~5 дней "
+            "цифры замораживаются автоматически. Открой каждую и сверь приход.</i>"
+        )
+        for a in data.acts_awaiting[:10]:
+            state_icon = "🔴" if a.state == "REPORT_REJECTED" else "🟡"
+            state_text = "акт отклонён" if a.state == "REPORT_REJECTED" else "ждёт подтверждения"
+            when = ""
+            if a.state_updated_at:
+                try:
+                    dt = datetime.fromisoformat(a.state_updated_at.replace("Z", "+00:00"))
+                    when = f" · с {dt.strftime('%d.%m')}"
+                except (ValueError, TypeError):
+                    pass
+            lines.append(
+                f"{state_icon} <b>#{a.order_number}</b> · {a.dropoff_name or '?'} · {state_text}{when}"
+            )
+        if len(data.acts_awaiting) > 10:
+            lines.append(f"  …и ещё {len(data.acts_awaiting) - 10}")
+        lines.append(
+            '🔗 <a href="https://seller.ozon.ru/app/supply/orders?filter=ReportsConfirmation">'
+            "Открыть список в Ozon ЛК</a>"
+        )
+        lines.append("")
 
     # Возвраты
     r = data.returns
