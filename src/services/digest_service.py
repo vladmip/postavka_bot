@@ -123,16 +123,17 @@ async def collect_returns_summary(oz: OzonClient) -> Tuple[ReturnsSummary, List[
         logger.info("returns_giveout_list failed (likely not enabled): %s", e)
         # Не пишем в errors — ничего страшного, у некоторых продавцов выключен.
 
-    # PDF этикетки берём ТОЛЬКО если есть готовые партии к вывозу/уже в ПВЗ.
-    # Раньше тащили всегда — но Ozon отдаёт «универсальную этикетку» даже
-    # когда забирать нечего, и юзер получал бессмысленный PDF каждое утро.
-    if summary.giveouts_available > 0 or summary.giveouts_at_pvz > 0:
-        try:
-            pdf = await oz.returns_giveout_get_pdf()
-            if pdf and len(pdf) > 500:
-                summary.pdf_bytes = pdf
-        except OzonAPIError as e:
-            logger.info("returns_giveout_get_pdf failed: %s", e)
+    # PDF этикетки тянем всегда. Ozon отдаёт «универсальную этикетку получения
+    # партии» — актуальна когда есть giveouts/removals в принципе. Раньше
+    # фильтровал «только если есть giveouts», но юзер хотел чтобы PDF приходил
+    # сразу с дайджестом без ручного запроса. Если PDF реально пустой — len<500,
+    # тогда не сохраняем.
+    try:
+        pdf = await oz.returns_giveout_get_pdf()
+        if pdf and len(pdf) > 500:
+            summary.pdf_bytes = pdf
+    except OzonAPIError as e:
+        logger.info("returns_giveout_get_pdf failed: %s", e)
 
     # Вывозы товара продавцу — со стока FBO и с поставки (за 60 дней).
     # Группируем по destination_warehouse + return_state, чтобы юзер видел
