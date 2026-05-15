@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Daily backup of bot.db. Поставить в cron:
-#   0 4 * * * /opt/postavka/deploy/backup.sh >> /var/log/postavka-backup.log 2>&1
+# Daily backup of bot.db. Поставить в cron под юзером postavka:
+#   sudo -u postavka crontab -e
+#   0 4 * * * /opt/postavka-bot/deploy/backup.sh >> /opt/postavka-bot/logs/backup.log 2>&1
 # Хранит бэкапы 14 дней.
 set -euo pipefail
+# cd чтобы не было `find: Failed to restore initial working directory: /root`,
+# когда скрипт стартует не из домашней папки postavka.
+cd "$(dirname "$0")/.."
 
-DATA_DIR="${DATA_DIR:-/opt/postavka/data}"
+DATA_DIR="${DATA_DIR:-/opt/postavka-bot/data}"
 BACKUP_DIR="$DATA_DIR/backups"
 KEEP_DAYS="${KEEP_DAYS:-14}"
 

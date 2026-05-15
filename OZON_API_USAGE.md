@@ -164,7 +164,52 @@
 | **Склады** (FBO/FBS) | ✅ | — | Wizard, drop-off |
 | **FBO Поставки** | ✅ | ✅ | Создание/отмена/перенос |
 
-**Минимальный набор для бота:** Admin-ключ (всё read + write FBO). Без write-FBO юзер сможет видеть digest/возвраты/каталог но не создавать поставки в боте.
+**Минимальный набор для бота — Admin (446 методов).**
+
+Раньше я думал что хватит 5 узких ролей (Product read-only / Posting FBO / Returns / Warehouse / Supply order / Report), но проверка реальной таблицы ролей кабинета 2112912 показала что **критичные endpoint'ы отсутствуют во всех не-Admin ролях**:
+
+- `/v1/draft/timeslot/info` и `/v2/draft/timeslot/info` — поиск свободных слотов
+- `/v1/draft/supply/create` и `/v2/draft/supply/create` — финализация поставки
+- `/v1/draft/supply/create/info` — polling финализации
+- `/v1/supply-order/timeslot/update` — workaround при 429 (переименован в `/v1/supply-order/timeslot/set`?)
+- `/v1/warehouse/list` — список FBS-складов
+
+То есть **без Admin-ключа создание поставок Ozon работать не будет**. Если очень хочется без Admin — придётся реализовывать на стороне Ozon работу через альтернативные endpoint'ы (`supply-order/timeslot/set`?), что выходит за рамки нашей текущей integration.
+
+Roles-табличка раскладывает наши 27 endpoint'ов так (если бы они были все доступны):
+
+| Endpoint | Роль (помимо Admin) |
+|---|---|
+| `/v3/product/list` | Product read-only / Product |
+| `/v3/product/info/list` | Product read-only / Product |
+| `/v4/product/info/stocks` | Product read-only |
+| `/v3/posting/fbo/list` | Posting FBO |
+| `/v1/returns/list` | Returns / Returns read-only |
+| `/v1/return/giveout/list` | Returns / Returns read-only |
+| `/v1/return/giveout/info` | Returns |
+| `/v1/return/giveout/get-pdf` | Returns |
+| `/v1/return/giveout/is-enabled` | Returns |
+| `/v1/removal/from-stock/list` | **Report** ⚠ |
+| `/v1/removal/from-supply/list` | **Report** ⚠ |
+| `/v1/cluster/list` | Supply order / Supply order ReadOnly |
+| `/v1/warehouse/fbo/list` | Supply order / Supply order ReadOnly / Warehouse |
+| `/v1/warehouse/fbs/create/drop-off/list` | Warehouse |
+| `/v1/warehouse/list` | **только Admin** ⚠ |
+| `/v1/draft/direct/create` | Supply order |
+| `/v1/draft/crossdock/create` | Supply order |
+| `/v1/draft/multi-cluster/create` | Supply order |
+| `/v2/draft/create/info` | Supply order / Supply order ReadOnly |
+| `/v2/draft/timeslot/info` | **только Admin** ⚠ |
+| `/v1/draft/supply/create` | **только Admin** ⚠ |
+| `/v2/draft/supply/create` | **только Admin** ⚠ |
+| `/v2/draft/supply/create/status` | Supply order / Supply order ReadOnly |
+| `/v1/draft/supply/create/info` | **только Admin** ⚠ |
+| `/v1/supply-order/timeslot/update` | **только Admin** ⚠ (есть `set` в Supply order — возможно новое название) |
+| `/v1/supply-order/cancel` | (не нашёл явно — Admin) |
+| `/v1/supply-order/cancel/status` | Supply order / Supply order ReadOnly |
+| `/v3/supply-order/get` | Supply order / Supply order ReadOnly |
+
+**Итого:** 7 endpoint'ов — только в Admin. Поэтому ключу нужны полные права.
 
 ---
 

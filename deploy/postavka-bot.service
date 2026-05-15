@@ -7,25 +7,24 @@ Wants=network-online.target
 Type=simple
 User=postavka
 Group=postavka
-WorkingDirectory=/opt/postavka
-EnvironmentFile=/opt/postavka/.env
-ExecStart=/opt/postavka/venv/bin/python -m src.bot.main
+WorkingDirectory=/opt/postavka-bot
+EnvironmentFile=/opt/postavka-bot/.env
+ExecStart=/opt/postavka-bot/.venv/bin/python -m src.bot.main
 Restart=always
 RestartSec=10
 TimeoutStopSec=20
 KillSignal=SIGTERM
 
-# Hardening
+# Hardening (изоляция через отдельного юзера postavka — основная защита).
+# ProtectSystem=strict не используется: pathlib.mkdir(exist_ok=True) всё равно
+# делает syscall и ловит EROFS даже на существующей папке (logs/).
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/postavka/data /opt/postavka/logs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 
-# Logs → journald
+# Logs -> journald
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=postavka-bot
