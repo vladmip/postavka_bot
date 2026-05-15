@@ -117,28 +117,127 @@ async def cmd_api_warmup(msg: Message) -> None:
 
 # ── /api_check ──────────────────────────────────────────────────────────────
 
+# Список тестовых методов для проверки доступа к Ozon Seller API.
+# Группировка соответствует ролям API-ключа Ozon (см. OZON_API_USAGE.md).
+# Каждый метод — read-only / безопасный (limit=1 / небольшое окно дат).
+def _ozon_api_tests(cli: "OzonClient") -> list[tuple[str, str, callable]]:
+    """Возвращает (роль, endpoint, async_callable). callable вызывает
+    минимальный безопасный запрос к endpoint'у."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso_from = (now - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00.000Z")
+    iso_to = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    date_from = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    date_to = now.strftime("%Y-%m-%d")
+    return [
+        ("Product read-only", "/v3/product/list",
+         lambda: cli.product_list(limit=1)),
+        ("Product read-only", "/v4/product/info/stocks",
+         lambda: cli.stocks_fbo(limit=1)),
+        ("Posting FBO", "/v3/posting/fbo/list",
+         lambda: cli.postings_fbo_list(iso_from, iso_to, max_total=1)),
+        ("Returns / Returns read-only", "/v1/returns/list",
+         lambda: cli.returns_list(limit=1)),
+        ("Returns", "/v1/return/giveout/is-enabled",
+         lambda: cli.returns_giveout_is_enabled()),
+        ("Returns / Returns read-only", "/v1/return/giveout/list",
+         lambda: cli.returns_giveout_list(limit=1)),
+        ("Report", "/v1/removal/from-stock/list",
+         lambda: cli.removal_from_stock_list(date_from, date_to, max_total=1)),
+        ("Report", "/v1/removal/from-supply/list",
+         lambda: cli.removal_from_supply_list(date_from, date_to, max_total=1)),
+        ("Supply order / Warehouse", "/v1/cluster/list",
+         lambda: cli.cluster_list()),
+        ("Warehouse", "/v1/warehouse/fbs/create/drop-off/list",
+         lambda: cli.warehouse_fbs_drop_off_list(address_search="Москва")),
+    ]
+
+
+def _classify_ozon_error(e: Exception) -> tuple[str, str]:
+    """Возвращает (icon, hint). Icon: ✅ ⚠ ❌. Hint: короткий комментарий."""
+    s = str(e)
+    low = s.lower()
+    if "401" in s or "unauthorized" in low:
+        return ("❌", "401 — ключ невалиден")
+    if "403" in s or "forbidden" in low or "access_denied" in low:
+        return ("❌", "403 — нет роли в ключе")
+    if "404" in s and "not found" not in low.split("404", 1)[0][-20:]:
+        # 404 на read-list endpoint'ах = метод не существует / не даёт права
+        return ("❌", "404 — метод не доступен")
+    if "429" in s:
+        return ("⚠", "429 — rate-limit, повтори через минуту")
+    if "timeout" in low or "connect" in low:
+        return ("⚠", "сеть/прокси не отвечает")
+    return ("⚠", s[:80])
+
+
 @router.message(Command("api_check"))
 async def cmd_api_check(msg: Message) -> None:
     lines = ["🔑 <b>Проверка API-ключей</b>\n"]
 
-    # Ozon
+    # ── Ozon ─────────────────────────────────────────────────────────────
     lines.append("<b>Ozon Seller API:</b>")
     lines.append(f"  CLIENT_ID: {'✅ ' + CLIENT_ID_OZON if CLIENT_ID_OZON else '❌ не задан (CLIEN_TID в .env)'}")
     lines.append(f"  API_KEY:   {'✅ ' + ('•' * min(len(APIKEY_OZON), 8)) + f' (len={len(APIKEY_OZON)})' if APIKEY_OZON else '❌ не задан (APIKEY_OZON)'}")
+    lines.append("")
 
     if CLIENT_ID_OZON and APIKEY_OZON:
-        try:
-            cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
-            clusters = await cli.cluster_list()
-            lines.append(f"  ✅ /v1/cluster/list → {len(clusters)} кластеров")
-        except OzonAPIError as e:
-            lines.append(f"  ⚠ <code>{str(e)[:200]}</code>")
-        except Exception as e:
-            lines.append(f"  ❌ {type(e).__name__}: <code>{str(e)[:200]}</code>")
+        await msg.answer("🔍 Тестирую Ozon endpoint'ы (10 вызовов)…")
+        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        tests = _ozon_api_tests(cli)
+        results: list[tuple[str, str, str, str]] = []  # (icon, role, endpoint, hint)
+        for role, endpoint, call in tests:
+            try:
+                await call()
+                results.append(("✅", role, endpoint, "OK"))
+            except OzonAPIError as e:
+                icon, hint = _classify_ozon_error(e)
+                results.append((icon, role, endpoint, hint))
+            except Exception as e:
+                results.append(("❌", role, endpoint, f"{type(e).__name__}: {str(e)[:60]}"))
+
+        # Группируем по ролям для красивого вывода.
+        from collections import defaultdict
+        by_role: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        for icon, role, endpoint, hint in results:
+            by_role[role].append((icon, endpoint, hint))
+
+        ok_count = sum(1 for r in results if r[0] == "✅")
+        fail_count = sum(1 for r in results if r[0] == "❌")
+        warn_count = len(results) - ok_count - fail_count
+
+        lines.append(f"<b>Доступ к методам:</b> ✅ {ok_count} · ❌ {fail_count} · ⚠ {warn_count}\n")
+        for role, items in by_role.items():
+            lines.append(f"<b>{role}</b>")
+            for icon, endpoint, hint in items:
+                tail = f" — <i>{hint}</i>" if hint and hint != "OK" else ""
+                lines.append(f"  {icon} <code>{endpoint}</code>{tail}")
+            lines.append("")
+
+        # Эндпоинты, которые не тестируем (нужны для создания поставок,
+        # требуют draft_id / order_ids и rate-limited глобально). Только
+        # информативно.
+        lines.append("<b>Не проверяются (нужны для создания поставок):</b>")
+        for ep in (
+            "/v1/draft/{direct,crossdock,multi-cluster}/create",
+            "/v2/draft/create/info",
+            "/v2/draft/timeslot/info  ⚠ только в роли Admin",
+            "/v2/draft/supply/create  ⚠ только в роли Admin",
+            "/v3/supply-order/get",
+            "/v1/supply-order/cancel",
+        ):
+            lines.append(f"  ℹ <code>{ep}</code>")
+        lines.append("")
+        if fail_count:
+            lines.append(
+                "💡 Если есть ❌ — пересоздай ключ в Ozon ЛК с нужными ролями. "
+                "Минимум для бота: <b>Admin</b> (или Product read-only + Posting FBO + "
+                "Returns + Warehouse + Supply order + Report). См. OZON_API_USAGE.md."
+            )
 
     lines.append("")
 
-    # WB
+    # ── WB ───────────────────────────────────────────────────────────────
     lines.append("<b>Wildberries API:</b>")
     lines.append(f"  API_KEY: {'✅ ' + ('•' * 8) + f' (len={len(APIKEY_WB)})' if APIKEY_WB else '❌ не задан (APIKEY_WB)'}")
 
@@ -152,7 +251,7 @@ async def cmd_api_check(msg: Message) -> None:
         except Exception as e:
             lines.append(f"  ❌ {type(e).__name__}: <code>{str(e)[:200]}</code>")
 
-    await msg.answer("\n".join(lines))
+    await send_long(msg, "\n".join(lines))
 
 
 # ── WB ──────────────────────────────────────────────────────────────────────
