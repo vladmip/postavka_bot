@@ -194,6 +194,24 @@ def _get_digest_recipients() -> list[int]:
     return sorted(out)
 
 
+async def _retry_telegram(call, name: str, max_attempts: int = 5):
+    """Retry для startup-вызовов Telegram-API. Если api.telegram.org
+    неотзывчив — ждём и пробуем снова, не валим процесс."""
+    from aiogram.exceptions import TelegramNetworkError
+    for i in range(max_attempts):
+        try:
+            return await call()
+        except TelegramNetworkError as e:
+            wait = 2 ** i
+            logging.warning(
+                "Telegram %s: %s (попытка %d/%d, повтор через %dс)",
+                name, str(e)[:100], i + 1, max_attempts, wait,
+            )
+            await asyncio.sleep(wait)
+    logging.error("Telegram %s: исчерпаны %d попыток", name, max_attempts)
+    return None
+
+
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
@@ -220,18 +238,28 @@ async def main() -> None:
         r.callback_query.filter(user_filter)
         dp.include_router(r)
 
-    me = await bot.get_me()
-    logging.info("Bot started: @%s (id=%s)", me.username, me.id)
+    # bot.get_me() и set_my_commands ретраим — иначе кратковременные перебои
+    # с api.telegram.org крашат процесс, systemd рестартит, опять крашится →
+    # restart-loop пока Telegram не очнётся.
+    me = await _retry_telegram(bot.get_me, "get_me")
+    if me:
+        logging.info("Bot started: @%s (id=%s)", me.username, me.id)
 
     # Регистрируем команды в панели Telegram (левая «menu» кнопка).
     # Минимум: /start — главное меню (всё остальное оттуда), /help — справка.
-    await bot.set_my_commands([
-        BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="digest", description="☀ Утренняя сводка"),
-        BotCommand(command="help", description="📚 Справка"),
-    ])
+    await _retry_telegram(
+        lambda: bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Главное меню"),
+            BotCommand(command="digest", description="☀ Утренняя сводка"),
+            BotCommand(command="help", description="📚 Справка"),
+        ]),
+        "set_my_commands",
+    )
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    await _retry_telegram(
+        lambda: bot.delete_webhook(drop_pending_updates=True),
+        "delete_webhook",
+    )
 
     scheduler_task = asyncio.create_task(_digest_scheduler(bot))
     try:
