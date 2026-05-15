@@ -499,8 +499,10 @@ def build_digest_text(data: DigestData) -> str:
                     when = f" · с {dt.strftime('%d.%m')}"
                 except (ValueError, TypeError):
                     pass
+            order_url = f"https://seller.ozon.ru/app/supply/orders/{a.order_id}"
             lines.append(
-                f"{state_icon} <b>#{a.order_number}</b> · {a.dropoff_name or '?'} · {state_text}{when}"
+                f'{state_icon} <a href="{order_url}"><b>#{a.order_number}</b></a> · '
+                f"{a.dropoff_name or '?'} · {state_text}{when}"
             )
         if len(data.acts_awaiting) > 10:
             lines.append(f"  …и ещё {len(data.acts_awaiting) - 10}")

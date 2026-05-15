@@ -144,16 +144,99 @@ async def cmd_ship(msg: Message) -> None:
     await _render_ship_list(msg, edit=False)
 
 
-async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
-    """Список заявок с инлайн-кнопками. Группировка: WB / Ozon / Смешанные.
-    edit=True пытается отредактировать сообщение target вместо answer."""
+@router.callback_query(F.data.startswith("ships_ext:"))
+async def cb_ships_toggle_external(cb: CallbackQuery) -> None:
+    """Toggle: показать/скрыть Ozon-поставки созданные не в боте."""
+    await cb.answer()
+    if not cb.message:
+        return
+    show = cb.data.split(":", 1)[1] == "on"
+    await _render_ship_list(cb.message, edit=True, show_external=show)
+
+
+async def _collect_external_supplies(
+    tg_id: int, own_ids: set,
+) -> tuple[list, list[str]]:
+    """Тянет supply_orders из Ozon ЛК которые НЕ создавались ботом.
+    Возвращает (kb_rows, text_lines). Каждая строка — кнопка-ссылка
+    на конкретную поставку в Ozon ЛК."""
+    from src.db.session import db_session
+    from src.services.user_service import get_ozon_client_for
+    from src.integrations.ozon_api import OzonAPIError
+    rows: list = []
+    lines: list[str] = []
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id)
+    if oz is None:
+        return rows, ["", "<i>🌐 Ozon-ключи не подключены — список из ЛК недоступен.</i>"]
+    try:
+        # Все актуальные поставки (исключая cancelled/completed — это шумно).
+        ext_ids = await oz.supply_order_list(
+            states=[
+                "DATA_FILLING", "READY_TO_SUPPLY", "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+                "IN_TRANSIT", "ACCEPTANCE_AT_STORAGE_WAREHOUSE",
+                "REPORTS_CONFIRMATION_AWAITING", "REPORT_REJECTED",
+            ],
+            max_total=50,
+        )
+    except OzonAPIError as e:
+        return rows, ["", f"<i>🌐 Ozon API: <code>{str(e)[:120]}</code></i>"]
+    # Оставляем только те что НЕ из бота.
+    foreign = [oid for oid in ext_ids if oid not in own_ids]
+    if not foreign:
+        return rows, ["", "🌐 <i>В Ozon ЛК нет других активных поставок.</i>"]
+    try:
+        orders = await oz.supply_order_get(foreign[:30])
+    except OzonAPIError as e:
+        return rows, ["", f"<i>🌐 Ozon supply_order_get: <code>{str(e)[:120]}</code></i>"]
+    state_emoji = {
+        "DATA_FILLING": "📝", "READY_TO_SUPPLY": "📦",
+        "ACCEPTED_AT_SUPPLY_WAREHOUSE": "🏭", "IN_TRANSIT": "🚚",
+        "ACCEPTANCE_AT_STORAGE_WAREHOUSE": "🏬",
+        "REPORTS_CONFIRMATION_AWAITING": "📋", "REPORT_REJECTED": "🔴",
+    }
+    lines.append("")
+    lines.append(f"🌐 <b>В Ozon ЛК</b> ({len(orders)} поставок не из бота)")
+    for o in orders:
+        order_id = int(o.get("order_id") or 0)
+        order_number = str(o.get("order_number") or "?")
+        state = str(o.get("state") or "")
+        drop = o.get("drop_off_warehouse") or {}
+        wh_name = (drop.get("name") or "")[:25]
+        emoji = state_emoji.get(state, "🔵")
+        # Кнопка-ссылка прямо на поставку в Ozon ЛК.
+        url = f"https://seller.ozon.ru/app/supply/orders/{order_id}"
+        rows.append([InlineKeyboardButton(
+            text=f"{emoji} #{order_number} · {wh_name}"[:55],
+            url=url,
+        )])
+    return rows, lines
+
+
+async def _render_ship_list(
+    target: Message,
+    *,
+    edit: bool = False,
+    show_external: bool = False,
+) -> None:
+    """Список поставок с инлайн-кнопками. Группировка: WB / Ozon / Смешанные.
+    edit=True пытается отредактировать сообщение target вместо answer.
+    show_external=True — добавляем секцию «Поставки из Ozon ЛК (не из бота)».
+    """
     wb_rows: List[InlineKeyboardButton] = []
     oz_rows: List[InlineKeyboardButton] = []
     mix_rows: List[InlineKeyboardButton] = []
     total = 0
+    own_order_ids: set = set()  # supply_id'ы созданные ботом (для исключения из external)
     with db_session() as session:
         reqs = list_shipment_requests(session, limit=30)
         for r in reqs:
+            for it in r.items:
+                if it.booked_supply_id:
+                    try:
+                        own_order_ids.add(int(it.booked_supply_id))
+                    except (ValueError, TypeError):
+                        pass
             # Прячем только окончательно закрытые/отменённые. supplies_created и
             # дальнейшие статусы (tz_sent / picked / shipped / accepted) должны
             # быть видны — там как раз отслеживаются статусы Ozon-поставок.
@@ -182,15 +265,20 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
 
     new_btn = InlineKeyboardButton(text="➕ Новая поставка (шаблон xlsx)",
                                    callback_data="ship_new_template")
+
+    # Toggle-кнопка для внешних поставок (созданных не в боте, в Ozon ЛК).
+    ext_toggle = InlineKeyboardButton(
+        text=("🌐 Скрыть поставки из Ozon ЛК" if show_external
+              else "🌐 Показать поставки из Ozon ЛК"),
+        callback_data=f"ships_ext:{'off' if show_external else 'on'}",
+    )
+
     if not total:
-        text = "🚚 <b>Заявки на отгрузку</b>\n\nОткрытых заявок нет.\n\n📎 Кинь .xlsx-выгрузку или скачай шаблон ниже."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [new_btn],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
-        ])
+        lines = ["🚚 <b>Поставки</b>\n\nИз бота — пусто.\n\n📎 Кинь .xlsx-выгрузку или скачай шаблон ниже."]
+        rows = [[new_btn], [ext_toggle]]
     else:
-        lines = ["🚚 <b>Заявки на отгрузку</b>\n"]
-        rows: List[List[InlineKeyboardButton]] = [[new_btn]]
+        lines = ["🚚 <b>Поставки</b>\n"]
+        rows = [[new_btn]]
         if wb_rows:
             lines.append(f"🟣 <b>WB</b> ({len(wb_rows)})")
             rows.extend([[b] for b in wb_rows])
@@ -201,11 +289,22 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
             lines.append(f"🟡 <b>Смешанные</b> ({len(mix_rows)})")
             rows.extend([[b] for b in mix_rows])
         lines.append("\n📎 Кинь .xlsx — добавить ещё")
+        rows.append([ext_toggle])
         rows.append([InlineKeyboardButton(text="🗑 Удалить поставки",
                                           callback_data="ships_delete_picker")])
-        rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")])
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        text = "\n".join(lines)
+
+    # Внешние поставки из Ozon ЛК (не наши). Только если юзер попросил —
+    # это +2-3 секунды на API-вызовы.
+    if show_external:
+        external_rows, ext_text_lines = await _collect_external_supplies(
+            target.chat.id, own_order_ids,
+        )
+        lines.extend(ext_text_lines)
+        rows.extend(external_rows)
+
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "\n".join(lines)
 
     if edit:
         try:
