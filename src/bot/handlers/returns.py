@@ -12,10 +12,12 @@ from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 
 from src.bot.helpers import safe_edit_or_answer, send_long
-from src.config import APIKEY_OZON, CLIENT_ID_OZON, APIKEY_WB, OZON_PROXY_URL
+from src.config import APIKEY_WB
+from src.db.session import db_session
 from src.integrations import OzonClient, WBClient
 from src.integrations.ozon_api import OzonAPIError
 from src.integrations.wb_api import WBAPIError
+from src.services.user_service import get_ozon_client_for
 
 router = Router()
 logger = logging.getLogger("bot.returns")
@@ -35,11 +37,16 @@ async def cb_ret_ozon(cb: CallbackQuery) -> None:
     await cb.answer("Запрашиваю Ozon…")
     if not cb.message:
         return
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await safe_edit_or_answer(cb.message, "⚠ Ozon-ключи не заданы.", reply_markup=_back_kb())
+    tg_id = cb.from_user.id if cb.from_user else None
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id) if tg_id else None
+    if oz is None:
+        await safe_edit_or_answer(
+            cb.message,
+            "⚠ Ozon-ключи не подключены — пройди /start.",
+            reply_markup=_back_kb(),
+        )
         return
-
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
     await safe_edit_or_answer(cb.message, "🔍 Тяну возвраты из Ozon (FBO + FBS)…")
 
     # 1. Общий список возвратов

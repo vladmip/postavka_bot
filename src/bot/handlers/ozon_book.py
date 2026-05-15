@@ -1893,8 +1893,9 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
 
         # AUTO-BOOK MODE: если юзер на time-picker'е выбрал часы (а не «🎲 любое
         # время»), это значит «хочу любой слот в этом окне, сам не выбираю».
-        # Берём ПЕРВЫЙ (самый ранний) слот в каждом кластере (они уже отфильтрованы
-        # по hour_picks выше + отсортированы) и сразу bulk-book. Picker не показываем.
+        # Стратегия выбора: БЛИЖАЙШАЯ дата + ПОСЛЕДНИЙ слот этого дня.
+        # Логика «последний слот»: даём максимум времени на упаковку до отгрузки.
+        # Логика «ближайшая дата»: чем раньше отгрузим — тем быстрее товар на склад.
         hour_picks = data.get("ob_hour_picks") or []
         if hour_picks:
             auto_choices: Dict[str, Dict] = {}
@@ -1902,24 +1903,28 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 slots = c.get("slots") or []
                 if not slots:
                     continue
-                first = slots[0]  # sorted by 'from'
+                # slots уже sorted by 'from' выше. Берём дату первого = ближайшая
+                # с доступными слотами (и попавшая в hour_picks).
+                earliest_date = slots[0]["from"][:10]
+                same_day = [s for s in slots if s["from"][:10] == earliest_date]
+                chosen = same_day[-1]  # последний — самый поздний час в окне дня
                 auto_choices[str(i)] = {
                     "cluster": c["cluster"],
                     "cluster_id": c.get("cluster_id"),
                     "draft_id": c["draft_id"],
                     "supply_type": c.get("supply_type", 2),
                     "drop_off_name": c.get("drop_off_name"),
-                    "warehouse_id": first["warehouse_id"],
-                    "warehouse_name": first["warehouse_name"],
-                    "from": first["from"],
-                    "to": first["to"],
+                    "warehouse_id": chosen["warehouse_id"],
+                    "warehouse_name": chosen["warehouse_name"],
+                    "from": chosen["from"],
+                    "to": chosen["to"],
                 }
             if auto_choices:
                 from src.bot.helpers import format_picked_hours
                 await progress_add(
                     msg, state,
                     f"\n🎯 <b>Авто-бронирование</b> по выбранным часам "
-                    f"({format_picked_hours(hour_picks)}) — беру самый ранний слот в окне для каждого кластера."
+                    f"({format_picked_hours(hour_picks)}) — беру ПОСЛЕДНИЙ слот в окне на ближайшую доступную дату."
                 )
                 await state.update_data(
                     ob_picker_clusters=clusters_with_slots,
@@ -2516,10 +2521,12 @@ async def _do_book_slot(
                 req = get_shipment_request(session, rid)
                 if req:
                     if order_id:
+                        is_crossdock = _is_crossdock_wh(slot.get("warehouse_name"), slot.get("warehouse_id"))
+                        wh_to_save = None if is_crossdock else slot.get("warehouse_name")
                         for it in req.items:
                             if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
                                 it.booked_supply_id = str(order_id)
-                                it.target_warehouse = slot["warehouse_name"]
+                                it.target_warehouse = wh_to_save
                                 it.booked_slot_at = datetime.fromisoformat(
                                     slot["from"].replace("Z", "+00:00").split("+")[0]
                                 )
@@ -2660,7 +2667,7 @@ async def _render_date_overview(msg: Message, state: FSMContext) -> None:
         lines.append(f"<code>{d_short}</code> {bar} {avail}/{total}{tail}")
 
     lines.append("")
-    lines.append("Выбери дату → бот возьмёт самый ранний слот в этот день для каждого кластера.")
+    lines.append("Выбери дату → бот возьмёт <b>последний</b> слот этого дня для каждого кластера (запас времени на упаковку).")
     lines.append("Или жми «🎯 Выбрать слоты вручную» — откроется детальный picker.")
 
     text = "\n".join(lines)
@@ -2862,8 +2869,9 @@ async def cb_ob_overview_manual(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(OzonBook.pick_slot, F.data.startswith("obauto:"))
 async def cb_ob_overview_auto(cb: CallbackQuery, state: FSMContext) -> None:
-    """Авто-подбор на дату: для каждого кластера берём самый ранний слот в эту
-    дату; кластеры без слотов в этот день пропускаем. Затем сразу confirm-panel."""
+    """Авто-подбор на дату: для каждого кластера берём ПОСЛЕДНИЙ слот в эту
+    дату (даём максимум времени на упаковку); кластеры без слотов в этот
+    день пропускаем. Затем сразу confirm-panel."""
     parts = cb.data.split(":", 1)
     if len(parts) != 2 or not cb.message:
         await cb.answer("Битый callback", show_alert=True)
@@ -2880,7 +2888,7 @@ async def cb_ob_overview_auto(cb: CallbackQuery, state: FSMContext) -> None:
             skipped.append(c["cluster"])
             continue
         same_day.sort(key=lambda s: s["from"])
-        chosen = same_day[0]
+        chosen = same_day[-1]  # последний — самый поздний час дня (запас на упаковку)
         choices[str(i)] = {
             "cluster": c["cluster"],
             "cluster_id": c.get("cluster_id"),
@@ -3119,30 +3127,35 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
         f"\n🏁 <b>Готово.</b> Успешно: {ok_count}, ошибки: {fail_count}\n{final_lines}",
     )
 
-    if rid and fail_count > 0:
-        ob_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
-        resume_mode = "cross" if "CROSSDOCK" in ob_type else "direct"
-        rows: List[List[InlineKeyboardButton]] = [
-            [InlineKeyboardButton(
+    if rid:
+        rows: List[List[InlineKeyboardButton]] = []
+        if fail_count > 0:
+            ob_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
+            resume_mode = "cross" if "CROSSDOCK" in ob_type else "direct"
+            rows.append([InlineKeyboardButton(
                 text=f"🔁 Продолжить с оставшимися ({fail_count})",
                 callback_data=f"ozon_book_card:{rid}:{resume_mode}",
-            )],
-            [InlineKeyboardButton(
-                text="◀ К карточке заявки", callback_data=f"ship_open:{rid}",
-            )],
-            [InlineKeyboardButton(
-                text="🌐 Ozon ЛК → Поставки",
-                url="https://seller.ozon.ru/app/supply-orders",
-            )],
-        ]
+            )])
+        rows.append([InlineKeyboardButton(
+            text="📋 К карточке заявки", callback_data=f"ship_open:{rid}",
+        )])
+        if ok_count > 0:
+            rows.append([InlineKeyboardButton(
+                text="📤 Скачать ТЗ Отгрузки", callback_data=f"ship_tz:{rid}",
+            )])
+        rows.append([InlineKeyboardButton(
+            text="🌐 Ozon ЛК → Поставки",
+            url="https://seller.ozon.ru/app/supply-orders",
+        )])
+        header = (
+            f"✅ Все {ok_count} забронированы. Что дальше?"
+            if fail_count == 0
+            else f"⚠ Забронировано {ok_count}, не получилось: {fail_count}."
+        )
         try:
-            await msg.answer(
-                f"Не забронировано: {fail_count}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            )
+            await msg.answer(header, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         except Exception:
             pass
-    if rid:
         _wizard_release(int(rid))
     await state.clear()
 
@@ -3226,10 +3239,12 @@ async def _book_one_slot(bot, msg, state, slot: Dict, rid: Optional[int]) -> Tup
         with db_session() as session:
             req = get_shipment_request(session, rid)
             if req and order_id:
+                is_crossdock = _is_crossdock_wh(slot.get("warehouse_name"), slot.get("warehouse_id"))
+                wh_to_save = None if is_crossdock else slot.get("warehouse_name")
                 for it in req.items:
                     if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
                         it.booked_supply_id = str(order_id)
-                        it.target_warehouse = slot["warehouse_name"]
+                        it.target_warehouse = wh_to_save
                         it.booked_slot_at = datetime.fromisoformat(
                             slot["from"].replace("Z", "+00:00").split("+")[0]
                         )

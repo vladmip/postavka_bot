@@ -29,3 +29,15 @@ class SupplyAddItem(StatesGroup):
 
 class UploadBind(StatesGroup):
     pick_supply = State()
+
+
+class ProductHints(StatesGroup):
+    awaiting_file = State()
+    confirm_strategy = State()
+
+
+class Onboarding(StatesGroup):
+    """Wizard первого подключения: Ozon-токен → API key → загрузка каталога."""
+    ozon_client_id = State()
+    ozon_api_key = State()
+    catalog_offer = State()

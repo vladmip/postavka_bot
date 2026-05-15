@@ -39,15 +39,71 @@ logger = logging.getLogger("bot.shipment")
 # Перевод служебных state-значений в человекочитаемые подписи (для UI).
 # DB-значения сохраняются как есть — переводим только при отображении.
 _STATE_LABELS = {
-    "draft": "✏ Черновик",
-    "planning": "✏ Черновик",
+    "draft": "📥 Подбор файлов",
+    "planning": "📅 Планирование",
     "slot_searching": "🔍 Поиск слотов",
+    "slots_booked": "✅ Забронировано",
     "supplies_created": "✅ Забронировано",
+    "tz_sent": "📤 ТЗ отправлено",
+    "picked": "📦 Собрано",
+    "shipped": "🚛 Отгружено",
+    "accepted": "🏁 Принято",
 }
 
 
 def _state_label(state: str) -> str:
     return _STATE_LABELS.get(state, state)
+
+
+def _compute_display_label(req) -> str:
+    """Отображаемый статус заявки. Считается по реальному состоянию items,
+    а не по устаревшему полю req.state. Логика:
+
+    - Нет items → «📥 Подбор файлов»
+    - 0 направлений забронировано → «📝 Черновик»
+    - Не все направления забронированы → «📦 Частично сформировано»
+    - Все забронированы + один Ozon-статус у всех → берём его (📝 Заполнение
+      данных / 📦 Готово к отгрузке / 🚛 В пути / 📥 Приёмка / ✅ Завершено …)
+    - Все забронированы, но статусы разные или не подтянулись → «✅ Забронировано»
+    """
+    if not req.items:
+        return _STATE_LABELS["draft"]
+    clusters = {(it.marketplace, it.cluster) for it in req.items}
+    booked_clusters = {
+        (it.marketplace, it.cluster) for it in req.items if it.booked_supply_id
+    }
+    if not booked_clusters:
+        return "📝 Черновик"
+    if booked_clusters != clusters:
+        return "📦 Частично сформировано"
+    # Все забронированы — смотрим Ozon-статусы.
+    statuses = {
+        (it.ozon_supply_status or "").upper()
+        for it in req.items
+        if it.marketplace == "ozon" and it.booked_supply_id
+    }
+    statuses.discard("")
+    if len(statuses) == 1:
+        from src.services.ozon_supply_status_service import status_info
+        si = status_info(next(iter(statuses)))
+        return f"{si.emoji} {si.label}"
+    if len(statuses) > 1:
+        return "🚛 В работе"
+    return "✅ Забронировано"
+
+
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    """Русский plural: 1, 21 → one; 2-4, 22-24 → few; 5-20, 0, 11-14 → many."""
+    n = abs(n)
+    n100 = n % 100
+    n10 = n % 10
+    if 11 <= n100 <= 14:
+        return many
+    if n10 == 1:
+        return one
+    if 2 <= n10 <= 4:
+        return few
+    return many
 
 
 class ShipPick(StatesGroup):
@@ -71,8 +127,8 @@ class ShipPlan(StatesGroup):
 # Кросс-док только для Ozon (через WB API поставку всё равно не создать)
 CROSSDOCK_OPTIONS = [
     "Прямая поставка (без кросс-дока)",
-    "ЛЕБЕР Домодедово → Внуково (Ozon)",
-    "ЛЕБЕР Домодедово → Хоругвино (Ozon)",
+    "Через хаб → Внуково (Ozon)",
+    "Через хаб → Хоругвино (Ozon)",
     "Любой подходящий",
 ]
 
@@ -98,11 +154,15 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
     with db_session() as session:
         reqs = list_shipment_requests(session, limit=30)
         for r in reqs:
-            if r.state not in {"draft", "planning", "slot_searching"}:
+            # Прячем только окончательно закрытые/отменённые. supplies_created и
+            # дальнейшие статусы (tz_sent / picked / shipped / accepted) должны
+            # быть видны — там как раз отслеживаются статусы Ozon-поставок.
+            if r.state in {"closed", "cancelled"}:
                 continue
             total += 1
             mps = {it.marketplace for it in r.items}
-            n_items = len(r.items)
+            cluster_set = {(it.marketplace, it.cluster) for it in r.items}
+            n_clusters = len(cluster_set)
             date_s = r.created_at.strftime("%d.%m")
             if mps == {"wb"}:
                 emoji = "🟣"; bucket = wb_rows
@@ -110,17 +170,27 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
                 emoji = "🔵"; bucket = oz_rows
             else:
                 emoji = "🟡"; bucket = mix_rows
-            label = f"{emoji} #{r.id} [{_state_label(r.state)}] · {n_items} строк · {date_s}"
+            if n_clusters == 1:
+                # Одно направление — показываем его имя вместо счётчика.
+                cl_name = next(iter(cluster_set))[1]
+                cluster_part = cl_name
+            else:
+                cl_word = _ru_plural(n_clusters, "направление", "направления", "направлений")
+                cluster_part = f"{n_clusters} {cl_word}"
+            label = f"{emoji} #{r.id} [{_compute_display_label(r)}] · {cluster_part} · {date_s}"
             bucket.append(InlineKeyboardButton(text=label[:55], callback_data=f"ship_open:{r.id}"))
 
+    new_btn = InlineKeyboardButton(text="➕ Новая заявка (шаблон xlsx)",
+                                   callback_data="ship_new_template")
     if not total:
-        text = "🚚 <b>Заявки на отгрузку</b>\n\nОткрытых заявок нет.\n\n📎 Кинь .xlsx-выгрузку чтобы создать."
+        text = "🚚 <b>Заявки на отгрузку</b>\n\nОткрытых заявок нет.\n\n📎 Кинь .xlsx-выгрузку или скачай шаблон ниже."
         kb = InlineKeyboardMarkup(inline_keyboard=[
+            [new_btn],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
         ])
     else:
         lines = ["🚚 <b>Заявки на отгрузку</b>\n"]
-        rows: List[List[InlineKeyboardButton]] = []
+        rows: List[List[InlineKeyboardButton]] = [[new_btn]]
         if wb_rows:
             lines.append(f"🟣 <b>WB</b> ({len(wb_rows)})")
             rows.extend([[b] for b in wb_rows])
@@ -131,6 +201,8 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
             lines.append(f"🟡 <b>Смешанные</b> ({len(mix_rows)})")
             rows.extend([[b] for b in mix_rows])
         lines.append("\n📎 Кинь .xlsx — добавить ещё")
+        rows.append([InlineKeyboardButton(text="🗑 Удалить заявки",
+                                          callback_data="ships_delete_picker")])
         rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         text = "\n".join(lines)
@@ -162,6 +234,10 @@ async def cmd_ship_show(msg: Message, command: CommandObject) -> None:
 
 def _render_request_card(req) -> tuple:
     """Внутри сессии собрать текст карточки + клавиатуру."""
+    # Идемпотентный пересчёт state — закрывает баг когда заявка осталась в planning
+    # хотя все items забронированы (refresh_request_state_after_booking не сработал).
+    from src.services.shipment_service import refresh_request_state_after_booking
+    refresh_request_state_after_booking(req)
     summary = shipment_summary(req)
     files = req.source_files_json or []
     crossdock = req.crossdock_warehouses_json or {}
@@ -169,7 +245,7 @@ def _render_request_card(req) -> tuple:
     has_wb = any(it.marketplace == "wb" for it in req.items)
 
     text = (
-        f"📦 <b>Заявка #{req.id}</b> [{_state_label(req.state)}]\n"
+        f"📦 <b>Заявка #{req.id}</b> [{_compute_display_label(req)}]\n"
         f"Создана: {req.created_at:%Y-%m-%d %H:%M}\n"
         f"Файлов: {len(files)}\n\n"
         f"<b>Распределение:</b>\n{summary}"
@@ -196,21 +272,53 @@ def _render_request_card(req) -> tuple:
     if has_ozon and req.ozon_supply_type:
         otype_label = "🚚 Прямая" if req.ozon_supply_type == "direct" else "🔀 Кросс-докинг"
         text += f"\n\n<b>Тип Ozon-поставки:</b> {otype_label}"
+    if has_ozon and req.cargo_format:
+        fmt_label = "📦 Коробами" if req.cargo_format == "BOX" else "🏗 Паллетами"
+        text += f"\n<b>Формат:</b> {fmt_label}"
+
+    # Статусы Ozon supply-orders — для каждого направления с booked_supply_id.
+    booked_ozon = [it for it in req.items if it.marketplace == "ozon" and it.booked_supply_id]
+    if booked_ozon:
+        from src.services.ozon_supply_status_service import status_info
+        # Группируем по cluster+booked_supply_id (одно направление = много items).
+        by_supply: Dict[str, ShipmentItem] = {}
+        for it in booked_ozon:
+            by_supply.setdefault(it.booked_supply_id, it)
+        text += "\n\n<b>Ozon поставки:</b>"
+        for bsid, it in by_supply.items():
+            si = status_info(it.ozon_supply_status, it.ozon_order_number)
+            num = f" · ЛК <code>{si.order_number}</code>" if si.order_number else ""
+            status_part = f"{si.emoji} {si.label}" if si.state else "⏳ статус не запрашивался"
+            text += f"\n  {it.cluster}: {status_part}{num}"
 
     rows = []
+    # Есть ли вообще что бронировать ещё (хотя бы один item без booked_supply_id).
+    has_unbooked_ozon = any(
+        it.marketplace == "ozon" and not it.booked_supply_id for it in req.items
+    )
+    has_unbooked_wb = any(
+        it.marketplace == "wb" and not it.booked_supply_id for it in req.items
+    )
     # Этап 1: даты ещё не выбраны
     if req.state == "draft":
         rows.append([InlineKeyboardButton(text="🛠 Спланировать даты",
                                          callback_data=f"ship_plan:{req.id}")])
     else:
         # Этап 2: даты есть → разные кнопки в зависимости от MP
-        if has_wb:
+        if has_wb and has_unbooked_wb:
             rows.append([InlineKeyboardButton(text="🔍 Подобрать склад WB",
                                              callback_data=f"ship_hunt:{req.id}")])
-        if has_ozon:
+        if has_ozon and has_unbooked_ozon:
             # Тип Ozon-поставки фиксируется при создании. NULL = legacy-заявка
             # до миграции — даём юзеру выбрать тип однократно прямо здесь.
-            if req.ozon_supply_type == "direct":
+            # cargo_format (BOX/PALLET) — спрашиваем тоже, перед запуском wizard'а.
+            if req.ozon_supply_type and not req.cargo_format:
+                # Тип уже задан, осталось спросить формат
+                rows.append([InlineKeyboardButton(
+                    text="🚀 Создать поставку Ozon (выбрать формат)",
+                    callback_data=f"ship_pick_fmt:{req.id}",
+                )])
+            elif req.ozon_supply_type == "direct":
                 rows.append([InlineKeyboardButton(
                     text="🚀 Создать поставку Ozon → Прямая",
                     callback_data=f"ozon_book_card:{req.id}:direct",
@@ -229,24 +337,33 @@ def _render_request_card(req) -> tuple:
                     text="🔀 Ozon — Кросс-докинг",
                     callback_data=f"ship_set_otype:{req.id}:c",
                 )])
-        rows.append([InlineKeyboardButton(text="🛠 Изменить даты",
-                                         callback_data=f"ship_plan:{req.id}")])
+        # «Изменить даты» имеет смысл пока не всё забронировано.
+        if has_unbooked_ozon or has_unbooked_wb:
+            rows.append([InlineKeyboardButton(text="🛠 Изменить даты",
+                                             callback_data=f"ship_plan:{req.id}")])
     if has_wb:
         rows.append([InlineKeyboardButton(text="🌐 WB ЛК → Поставки",
                                          url="https://seller.wildberries.ru/supplies-management/all-supplies")])
     if has_ozon:
         rows.append([InlineKeyboardButton(text="🌐 Ozon ЛК → Поставки",
                                          url="https://seller.ozon.ru/app/supply-orders")])
+    if booked_ozon:
+        rows.append([InlineKeyboardButton(
+            text="🔄 Обновить статусы Ozon",
+            callback_data=f"ship_refresh_oz:{req.id}",
+        )])
+        rows.append([InlineKeyboardButton(
+            text="🗑 Отменить все Ozon-поставки заявки",
+            callback_data=f"ship_cancel_oz:{req.id}",
+        )])
     rows.append([
         InlineKeyboardButton(text="🛒 Состав по кластерам", callback_data=f"ship_items:{req.id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="📤 ТЗ xlsx", callback_data=f"ship_tz:{req.id}"),
-        InlineKeyboardButton(text="📎 + Файл", callback_data="ship_more"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="menu:ships"),
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ship_del:{req.id}"),
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
@@ -439,6 +556,19 @@ async def _send_attach_result(
 @router.callback_query(F.data.startswith("ship_open:"))
 async def cb_ship_open(cb: CallbackQuery) -> None:
     rid = int(cb.data.split(":", 1)[1])
+    # При первом открытии карточки тянем статусы Ozon мягко: если кэш свежий —
+    # ничего не дёргаем, иначе один вызов API. Не блокируем UI на ошибках.
+    try:
+        from src.services.ozon_supply_status_service import refresh_supply_status, is_cache_fresh
+        if not is_cache_fresh(rid):
+            from src.integrations.ozon_api import OzonClient
+            from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+            cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+            with db_session() as session:
+                await refresh_supply_status(session, cli, rid, force=False)
+    except Exception as e:
+        logger.warning("ship_open: status refresh failed rid=%s: %s", rid, e)
+
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
@@ -446,6 +576,275 @@ async def cb_ship_open(cb: CallbackQuery) -> None:
             return
         text, kb = _render_request_card(req)
     await cb.answer()
+    if cb.message:
+        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "ship_new_template")
+async def cb_ship_new_template(cb: CallbackQuery) -> None:
+    await cb.answer("Готовлю шаблон…")
+    if not cb.message:
+        return
+    try:
+        from src.generators.new_request_template import generate_template
+        from src.integrations.ozon_api import OzonClient
+        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        clusters = await cli.cluster_list()
+        cluster_names = [c.get("name") or c.get("cluster_name") or "" for c in clusters]
+        cluster_names = [n for n in cluster_names if n]
+        if not cluster_names:
+            await cb.message.answer(
+                "⚠ Не удалось получить список кластеров Ozon. Попробуй ещё раз через минуту."
+            )
+            return
+        user_id = cb.from_user.id if cb.from_user else 0
+        with db_session() as session:
+            data = generate_template(session, user_id, cluster_names)
+            from src.db.models import OzonProduct
+            n_products = session.query(OzonProduct).filter(
+                OzonProduct.user_id == user_id
+            ).count()
+        from aiogram.types import BufferedInputFile
+        await cb.message.answer_document(
+            BufferedInputFile(data, filename="Новая_заявка_шаблон.xlsx"),
+            caption=(
+                f"📋 <b>Шаблон новой заявки</b>\n\n"
+                f"Артикулов: <b>{n_products}</b>, кластеров: <b>{len(cluster_names)}</b>.\n"
+                "Заполни количество в нужных кластерах и пришли файл обратно — "
+                "бот создаст одну заявку со всеми направлениями.\n\n"
+                "<i>Пустые ячейки и нули игнорируются.</i>"
+            ),
+        )
+    except Exception as e:
+        logger.exception("ship_new_template failed: %s", e)
+        await cb.message.answer(f"⚠ Ошибка: <code>{type(e).__name__}: {e}</code>")
+
+
+@router.message(Command("clear_drafts"))
+async def cmd_clear_drafts(msg: Message) -> None:
+    """Массовая чистка: отменить в Ozon все supply orders в статусе DATA_FILLING +
+    удалить из БД все заявки, у которых нет активных booked items.
+
+    Не трогает поставки в более продвинутых статусах (READY_TO_SUPPLY и далее).
+    Только для ALLOWED_USER_ID (защита от случайного нажатия чужими)."""
+    from src.config import ALLOWED_USER_ID
+    if msg.from_user and msg.from_user.id != ALLOWED_USER_ID:
+        await msg.answer("⛔ Команда доступна только владельцу.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="⚠ Да, чистить все черновики",
+            callback_data="clear_drafts:yes",
+        )],
+        [InlineKeyboardButton(text="✖ Отмена", callback_data="menu:home")],
+    ])
+    await msg.answer(
+        "🧹 <b>Массовая чистка черновиков</b>\n\n"
+        "Будет сделано:\n"
+        "1. В Ozon ЛК — отменены все поставки в статусе <b>📝 Заполнение данных</b>.\n"
+        "2. В боте — удалены все заявки без активных поставок "
+        "(черновики + те у кого всё было в DATA_FILLING и отменилось).\n\n"
+        "Поставки в продвинутых статусах (Готово к отгрузке, В пути, Принято) "
+        "<b>НЕ трогаются</b>.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "clear_drafts:yes")
+async def cb_clear_drafts(cb: CallbackQuery) -> None:
+    from src.config import ALLOWED_USER_ID, CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+    if cb.from_user.id != ALLOWED_USER_ID:
+        await cb.answer("⛔ Только владельцу", show_alert=True)
+        return
+    await cb.answer("Чищу…")
+    if not cb.message:
+        return
+
+    from src.services.ozon_supply_status_service import (
+        cancel_supply_orders, refresh_supply_status,
+    )
+    from src.integrations.ozon_api import OzonClient
+    cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+
+    # Шаг 1: освежить статусы по всем заявкам с booked items.
+    progress = await cb.message.answer("⏳ Освежаю статусы Ozon…")
+    with db_session() as session:
+        from src.db.models import ShipmentRequest
+        all_reqs = session.query(ShipmentRequest).filter(
+            ShipmentRequest.user_id == ALLOWED_USER_ID
+        ).all()
+        rids_with_booked = [
+            r.id for r in all_reqs
+            if any(it.marketplace == "ozon" and it.booked_supply_id for it in r.items)
+        ]
+    for rid in rids_with_booked:
+        try:
+            with db_session() as s:
+                await refresh_supply_status(s, cli, rid, force=True)
+        except Exception as e:
+            logger.warning("clear_drafts: refresh failed rid=%s: %s", rid, e)
+
+    # Шаг 2: собираем order_ids в DATA_FILLING — отменяем через API.
+    with db_session() as session:
+        oids_to_cancel: List[int] = []
+        for r in session.query(ShipmentRequest).filter(
+            ShipmentRequest.user_id == ALLOWED_USER_ID
+        ).all():
+            for it in r.items:
+                if (
+                    it.marketplace == "ozon"
+                    and it.booked_supply_id
+                    and (it.ozon_supply_status or "").upper() == "DATA_FILLING"
+                ):
+                    try:
+                        oids_to_cancel.append(int(it.booked_supply_id))
+                    except (TypeError, ValueError):
+                        pass
+        oids_to_cancel = list(set(oids_to_cancel))
+
+    cancel_results = []
+    if oids_to_cancel:
+        try:
+            await progress.edit_text(
+                f"⏳ Отменяю {len(oids_to_cancel)} поставок в Ozon…"
+            )
+        except Exception:
+            pass
+        cancel_results = await cancel_supply_orders(None, cli, oids_to_cancel)
+        # После отмены — refresh, чтобы обнулить booked_* в БД.
+        for rid in rids_with_booked:
+            try:
+                with db_session() as s:
+                    await refresh_supply_status(s, cli, rid, force=True)
+            except Exception:
+                pass
+
+    # Шаг 3: удаляем из БД все заявки без активных booked items.
+    deleted_rids: List[int] = []
+    with db_session() as session:
+        for r in session.query(ShipmentRequest).filter(
+            ShipmentRequest.user_id == ALLOWED_USER_ID
+        ).all():
+            has_active = any(
+                it.booked_supply_id for it in r.items
+            )
+            if not has_active:
+                deleted_rids.append(r.id)
+                session.delete(r)
+
+    cancelled_ok = sum(1 for r in cancel_results if r["cancelled"])
+    cancelled_fail = len(cancel_results) - cancelled_ok
+    summary = [
+        "🧹 <b>Очистка завершена</b>",
+        f"📝 Отменено в Ozon: <b>{cancelled_ok}</b>",
+    ]
+    if cancelled_fail:
+        summary.append(f"⚠ Не удалось отменить: {cancelled_fail}")
+    summary.append(f"🗑 Удалено заявок из БД: <b>{len(deleted_rids)}</b>")
+    if deleted_rids:
+        summary.append(f"   #{', #'.join(str(x) for x in deleted_rids[:30])}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+    ])
+    try:
+        await progress.edit_text("\n".join(summary), reply_markup=kb)
+    except Exception:
+        await cb.message.answer("\n".join(summary), reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("ship_cancel_oz:"))
+async def cb_ship_cancel_oz(cb: CallbackQuery) -> None:
+    parts = cb.data.split(":")
+    rid = int(parts[1])
+    confirm = len(parts) > 2 and parts[2] == "yes"
+    if not confirm:
+        await cb.answer()
+        if cb.message:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="⚠ Да, отменить все Ozon-поставки",
+                    callback_data=f"ship_cancel_oz:{rid}:yes",
+                )],
+                [InlineKeyboardButton(text="◀ Назад", callback_data=f"ship_open:{rid}")],
+            ])
+            await safe_edit_or_answer(
+                cb.message,
+                f"⚠ Отменить ВСЕ Ozon-поставки заявки #{rid}?\n\n"
+                "Они исчезнут из Ozon ЛК (статус CANCELLED) и в боте отвяжутся "
+                "от направлений — сможешь пробронировать заново.",
+                reply_markup=kb,
+            )
+        return
+
+    await cb.answer("Отменяю…")
+    try:
+        from src.services.ozon_supply_status_service import cancel_supply_orders, refresh_supply_status
+        from src.integrations.ozon_api import OzonClient
+        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if not req:
+                return
+            oids = []
+            for it in req.items:
+                if it.marketplace == "ozon" and it.booked_supply_id:
+                    try:
+                        oids.append(int(it.booked_supply_id))
+                    except (TypeError, ValueError):
+                        pass
+            oids = list(set(oids))
+        if not oids:
+            if cb.message:
+                await cb.message.answer("Нет забронированных Ozon-поставок.")
+            return
+        results = await cancel_supply_orders(None, cli, oids)
+        # Перезагрузим статусы — обнулит CANCELLED items.
+        with db_session() as session:
+            await refresh_supply_status(session, cli, rid, force=True)
+            req = get_shipment_request(session, rid)
+            text, kb = _render_request_card(req)
+        ok = sum(1 for r in results if r["cancelled"])
+        fails = [(r["order_id"], r["error"]) for r in results if not r["cancelled"]]
+        summary = f"🗑 Отменено: {ok}/{len(results)}"
+        if fails:
+            summary += "\n" + "\n".join(
+                f"  ❌ {oid}: {err or 'не подтвердилось'}" for oid, err in fails[:5]
+            )
+        if cb.message:
+            await cb.message.answer(summary)
+            await safe_edit_or_answer(cb.message, text, reply_markup=kb)
+    except Exception as e:
+        logger.exception("ship_cancel_oz failed rid=%s: %s", rid, e)
+        if cb.message:
+            await cb.message.answer(f"⚠ Ошибка: <code>{type(e).__name__}: {e}</code>")
+
+
+@router.callback_query(F.data.startswith("ship_refresh_oz:"))
+async def cb_ship_refresh_oz(cb: CallbackQuery) -> None:
+    rid = int(cb.data.split(":", 1)[1])
+    await cb.answer("Обновляю…")
+    try:
+        from src.services.ozon_supply_status_service import refresh_supply_status
+        from src.integrations.ozon_api import OzonClient
+        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        with db_session() as session:
+            n = await refresh_supply_status(session, cli, rid, force=True)
+    except Exception as e:
+        logger.exception("ship_refresh_oz failed rid=%s: %s", rid, e)
+        if cb.message:
+            await cb.message.answer(f"⚠ Не получилось обновить: <code>{type(e).__name__}: {e}</code>")
+        return
+
+    with db_session() as session:
+        req = get_shipment_request(session, rid)
+        if not req:
+            return
+        text, kb = _render_request_card(req)
     if cb.message:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
@@ -565,6 +964,74 @@ async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
 
+@router.callback_query(F.data.startswith("ship_pick_fmt:"))
+async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
+    """Экран выбора формата (коробами/паллетами) перед запуском wizard'а."""
+    parts = cb.data.split(":")
+    rid = int(parts[1])
+    # ship_pick_fmt:rid:box / :pallet — финальный выбор
+    if len(parts) == 3:
+        chosen = parts[2]
+        if chosen not in ("box", "pallet"):
+            await cb.answer("Битый callback", show_alert=True)
+            return
+        fmt = "BOX" if chosen == "box" else "PALLET"
+        with db_session() as session:
+            req = get_shipment_request(session, rid)
+            if not req:
+                await cb.answer("Не найдена", show_alert=True)
+                return
+            req.cargo_format = fmt
+            otype = req.ozon_supply_type
+        mode = "cross" if otype == "cross" else "direct"
+        await cb.answer(f"Формат: {'коробами' if fmt == 'BOX' else 'паллетами'}")
+        # Запускаем стандартный wizard как при тапе «🚀 Создать поставку Ozon»
+        from src.bot.handlers.ozon_book import _start_ozon_book_wizard, _wizard_acquire, _wizard_release
+        if not _wizard_acquire(rid):
+            if cb.message:
+                await cb.message.answer(
+                    f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения."
+                )
+            return
+        if cb.message:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+            except Exception:
+                _wizard_release(rid)
+                raise
+            if not launched:
+                _wizard_release(rid)
+        else:
+            _wizard_release(rid)
+        return
+
+    # Первый тап — показываем выбор.
+    await cb.answer()
+    if not cb.message:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Коробами",
+                              callback_data=f"ship_pick_fmt:{rid}:box")],
+        [InlineKeyboardButton(text="🏗 Паллетами",
+                              callback_data=f"ship_pick_fmt:{rid}:pallet")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data=f"ship_open:{rid}")],
+    ])
+    await safe_edit_or_answer(
+        cb.message,
+        f"📦 <b>Заявка #{rid}</b>\n\n"
+        "Как будешь грузить эту поставку?\n\n"
+        "<b>📦 Коробами</b> — каждый короб опишется отдельно (короб № → SKU → qty).\n"
+        "<b>🏗 Паллетами</b> — палеты с описью (палет № → SKU → qty).\n\n"
+        "<i>Эта пометка нужна для генерации правильной описи. "
+        "В Ozon API она пока не отправляется — только для бота.</i>",
+        reply_markup=kb,
+    )
+
+
 @router.callback_query(F.data.startswith("ship_set_otype:"))
 async def cb_ship_set_otype(cb: CallbackQuery) -> None:
     """Один раз зафиксировать тип Ozon-поставки (direct/cross) и перерисовать карточку."""
@@ -594,18 +1061,132 @@ async def cb_ship_set_otype(cb: CallbackQuery) -> None:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("ship_del:"))
-async def cb_ship_del(cb: CallbackQuery) -> None:
-    rid = int(cb.data.split(":", 1)[1])
+async def _render_ship_delete_picker(target: Message, state: FSMContext, *, edit: bool) -> None:
+    """Экран multi-select удаления заявок. Состояние выбора — в state[delpicks]."""
+    data = await state.get_data()
+    picks = set(data.get("delpicks") or [])
     with db_session() as session:
-        req = get_shipment_request(session, rid)
-        if not req:
-            await cb.answer("Не найдена", show_alert=True)
-            return
-        session.delete(req)
-    await cb.answer("Удалено")
+        reqs = list_shipment_requests(session, limit=50)
+        items_visible = [r for r in reqs if r.state not in {"closed", "cancelled"}]
+        # Кэшируем display для UI.
+        items_data = [
+            (r.id, _compute_display_label(r),
+             next(iter({(it.marketplace, it.cluster) for it in r.items}))[1]
+                if len({(it.marketplace, it.cluster) for it in r.items}) == 1
+                else f"{len({(it.marketplace, it.cluster) for it in r.items})} напр.",
+             r.created_at.strftime("%d.%m"))
+            for r in items_visible
+        ]
+
+    if not items_data:
+        text = "🚚 Нет заявок для удаления."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀ К списку", callback_data="menu:ships")],
+        ])
+        if edit:
+            await safe_edit_or_answer(target, text, reply_markup=kb)
+        else:
+            await target.answer(text, reply_markup=kb)
+        return
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for rid, label_state, cluster_part, date_s in items_data:
+        mark = "✅" if rid in picks else "▫"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} #{rid} · {cluster_part} · {date_s}"[:55],
+            callback_data=f"delpick:{rid}",
+        )])
+    if picks:
+        rows.append([InlineKeyboardButton(
+            text=f"🗑 Удалить выбранные ({len(picks)})",
+            callback_data="delconfirm",
+        )])
+    rows.append([InlineKeyboardButton(text="◀ К списку", callback_data="delcancel")])
+    text = (
+        "🗑 <b>Удаление заявок</b>\n\n"
+        f"Тапни на заявку чтобы отметить её. Выбрано: <b>{len(picks)}</b>.\n\n"
+        "При удалении: связанные Ozon-поставки <b>отменяются в ЛК через API</b>, "
+        "потом заявка стирается из бота. Поставки в продвинутых статусах "
+        "(в пути, принято) бот трогать не будет."
+    )
+    if edit:
+        await safe_edit_or_answer(target, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    else:
+        await target.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "ships_delete_picker")
+async def cb_ships_delete_picker(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    await state.update_data(delpicks=[])
     if cb.message:
-        # Возвращаемся к списку заявок
+        await _render_ship_delete_picker(cb.message, state, edit=True)
+
+
+@router.callback_query(F.data.startswith("delpick:"))
+async def cb_delpick(cb: CallbackQuery, state: FSMContext) -> None:
+    rid = int(cb.data.split(":", 1)[1])
+    data = await state.get_data()
+    picks = set(data.get("delpicks") or [])
+    if rid in picks:
+        picks.discard(rid)
+    else:
+        picks.add(rid)
+    await state.update_data(delpicks=list(picks))
+    await cb.answer()
+    if cb.message:
+        await _render_ship_delete_picker(cb.message, state, edit=True)
+
+
+@router.callback_query(F.data == "delconfirm")
+async def cb_delconfirm(cb: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    picks = list(data.get("delpicks") or [])
+    if not picks:
+        await cb.answer("Ничего не выбрано", show_alert=True)
+        return
+    await cb.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"⚠ Да, удалить {len(picks)} заявок",
+            callback_data="delconfirm:yes",
+        )],
+        [InlineKeyboardButton(text="◀ Назад к выбору", callback_data="ships_delete_picker")],
+    ])
+    if cb.message:
+        sample = ", ".join(f"#{r}" for r in sorted(picks)[:20])
+        more = f" … и ещё {len(picks) - 20}" if len(picks) > 20 else ""
+        await safe_edit_or_answer(
+            cb.message,
+            f"⚠ <b>Удалить безвозвратно?</b>\n\n"
+            f"Заявки: {sample}{more}\n\n"
+            "Связанные Ozon-поставки в ЛК <b>останутся как есть</b>.",
+            reply_markup=kb,
+        )
+
+
+@router.callback_query(F.data == "delconfirm:yes")
+async def cb_delconfirm_yes(cb: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    picks = list(data.get("delpicks") or [])
+    deleted = 0
+    with db_session() as session:
+        for rid in picks:
+            r = get_shipment_request(session, rid)
+            if r:
+                session.delete(r)
+                deleted += 1
+    await state.update_data(delpicks=[])
+    await cb.answer(f"Удалено: {deleted}")
+    if cb.message:
+        await _render_ship_list(cb.message, edit=True)
+
+
+@router.callback_query(F.data == "delcancel")
+async def cb_delcancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(delpicks=[])
+    await cb.answer()
+    if cb.message:
         await _render_ship_list(cb.message, edit=True)
 
 
@@ -1390,6 +1971,20 @@ async def cb_ship_tz(cb: CallbackQuery) -> None:
 async def _send_ship_tz(msg: Message, rid: int) -> None:
     from aiogram.types import BufferedInputFile
     from src.generators import generate_ship_tz
+
+    # Перед генерацией подтягиваем актуальные ozon_order_number — иначе если
+    # юзер сразу после bulk-book жмёт «ТЗ», под шапками будут числовые order_id
+    # вместо красивого номера ЛК. Не блокируем на ошибках.
+    try:
+        from src.services.ozon_supply_status_service import refresh_supply_status, is_cache_fresh
+        if not is_cache_fresh(rid):
+            from src.integrations.ozon_api import OzonClient
+            from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+            cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+            with db_session() as session:
+                await refresh_supply_status(session, cli, rid, force=False)
+    except Exception as e:
+        logger.warning("ship_tz: status refresh failed rid=%s: %s", rid, e)
 
     with db_session() as session:
         req = get_shipment_request(session, rid)

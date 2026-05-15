@@ -18,6 +18,12 @@ APIKEY_CLAUDE = os.getenv("APIKEY_CLAUDE", "")
 # Если пусто — без прокси, прямое соединение.
 OZON_PROXY_URL = os.getenv("OZON_PROXY_URL", "").strip() or None
 
+# Fernet master-key для шифрования ozon_api_key / wb_api_key в БД.
+# Генерация: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Если пусто — на проде fail-fast (см. src/security/crypto.py).
+# В dev-режиме допустимо отсутствие — тогда токены пишутся как plain text.
+TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "").strip()
+
 DATA_DIR = PROJECT_ROOT / "data"
 STORAGE_DIR = DATA_DIR / "storage"
 DB_PATH = DATA_DIR / "bot.db"

@@ -13,6 +13,188 @@
 
 ---
 
+## 2026-05-15 (14:00) — Multi-tenant MVP + production hardening (E1-E6)
+
+### Зачем
+Юзер хочет публичный запуск с максимальным заделом по защите перед деплоем на VPS. План — `C:\Users\vladi\.claude\plans\mighty-squishing-dream.md` (одобрен).
+
+### Что готово (по этапам плана)
+
+**E1: Изоляция БД**
+- Модели: `OzonProduct.offer_id` / `WbProduct.nm_id` сняты с глобального `unique=True`, переведены в composite `UNIQUE(user_id, offer_id)` / `UNIQUE(user_id, nm_id)`. `FavoriteCrossdockPoint` получил `UNIQUE(user_id, warehouse_id)`.
+- Миграция `b8d2e7a91f02_composite_unique_user_data.py` (batch_alter_table под SQLite).
+- `src/services/user_service.py`: добавлены `current_user_id_from(event)`, `get_owned(session, model, id, user_id)` (cross-tenant safe get), `get_ozon_client_for(session, tg_id)` (helper для handlers).
+- `src/services/shipment_service.py`: все функции (`_find_ozon_product`, `_find_wb_product`, `create_shipment_request`, `attach_ship_file`, `list_shipment_requests`, `get_shipment_request`) принимают `user_id: Optional[int] = None`. Backward-compat: если None — fallback на `ALLOWED_USER_ID`. Все queries обёрнуты в `_user_filter(query, model, user_id)` который добавляет `(Model.user_id == uid) | (Model.user_id.is_(None))` для legacy-записей при uid==ALLOWED_USER_ID.
+- `src/services/product_hint_service.py`: то же — `user_id` опциональный, фильтрация через `_owned_product_filter` JOIN на OzonProduct.
+- **Важно**: handlers ВСЕ ЕЩЁ вызывают сервисы без `user_id` → fallback на ALLOWED_USER_ID. Для текущего single-tenant работает. Для multi-tenant **handlers надо мигрировать** (TODO ниже).
+
+**E2: Fernet шифрование токенов**
+- `src/security/crypto.py` — `encrypt`/`decrypt`/`is_encrypted`. Master-key из env `TOKEN_ENCRYPTION_KEY`. Без ключа — plain mode + WARN в лог (dev-режим). Идемпотентно: повторный encrypt не двойным кодом (детект префикса `gAAAAAB`).
+- `src/services/user_service.save_ozon_creds` / `save_wb_creds` оборачивают токен в `encrypt()` перед записью. `get_ozon_creds` / `get_wb_api_key` — `decrypt()` при чтении. На decryption error — лог + None (юзер заново вводит).
+- Миграция `c4f2e9b1a3d8_encrypt_user_tokens.py` — идемпотентно encrypt-ит существующие plain-токены если ключ задан в env. No-op без ключа.
+- `src/config.py`: добавлена `TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")`.
+
+**E3: Открытый доступ + rate-limit + abuse-protection**
+- `OnlyAllowedUser` фильтр в `main.py` — превращён в no-op (`return True`). Бот теперь публичный.
+- `src/bot/middleware.py`:
+  - `EnsureUserMiddleware` — на каждое event делает `get_or_create_user(s, tg_id)` чтобы запись в `users` всегда была.
+  - `RateLimitMiddleware(max_per_min=30, max_per_hour=200)` — in-memory, deque per tg_id. Превышение → ответ «Слишком часто» + drop.
+  - `LogAndCatchMiddleware._looks_like_secret(text)` — маскирует длинные hex/uuid строки в логах (защита от утечки токенов в `bot.log` при onboarding).
+- `_digest_scheduler` итерируется по `_get_digest_recipients()` — все юзеры с `onboarded_at != None` + ALLOWED_USER_ID. Между юзерами `sleep(2)` для Telegram rate-limit.
+- `src/bot/handlers/common.py`:
+  - `/forget_me` — двухшаговое подтверждение → каскадно удаляет User (FK CASCADE прибивает заявки/каталог/favorites/hints).
+  - Inline-кнопка «🗑 Удалить мои данные» в `_settings_menu_kb`.
+  - `/admin_stats` — только для ALLOWED_USER_ID. Показывает total users / onboarded / заявок 7д / заявок всего.
+- `main.py`: middleware'ы зарегистрированы в `dp.update.outer_middleware` (порядок: log → ensure_user → rate_limit).
+
+**E4: Handlers → user_service.get_ozon_client_for** (частично)
+- Helper `get_ozon_client_for(session, tg_id)` создан, возвращает готовый OzonClient или None.
+- Мигрированы: `digest.py`, `returns.py` (Ozon-блок).
+- **НЕ мигрированы** (~17 callsite, отложено на следующую сессию): `ozon_book.py` (10 мест), `integrations.py` (5), `shipment.py` (5 локальных импортов), `favorites.py` (2). Backward-compat работает через `user_service.get_ozon_creds` fallback на .env для ALLOWED_USER_ID. **Дыра для multi-tenant**: новый юзер, который введёт свои Ozon-ключи, не сможет создать поставку через ozon_book — оно будет лазить в .env-кабинет ALLOWED_USER_ID. Нужно завершить.
+
+**E5: Скрыть WB из UI**
+- `keyboards.py:kb_marketplace()` — без WB-кнопки.
+- `common.py:_settings_menu_kb` — без «📊 WB коэффициенты». Sku_link меню (`_sku_link_kb`) — только Ozon.
+- `cb_menu_returns` — без «🟣 Wildberries» кнопки.
+- `_MAIN_TEXT` / `_HELP_TEXT` — без упоминания WB как активной фичи. Внизу Help — пометка «WB пока в разработке».
+- WB-handlers (`cb_ret_wb`, WB sku_link) НЕ удалены — просто скрыты из меню.
+
+**E6: Production hardening**
+- `src/bot/handlers/upload.py` — лимит размера файла 20 МБ (защита от accidental DoS).
+- `src/bot/main.py:run()` — try/except KeyboardInterrupt+SystemExit для graceful shutdown.
+- `deploy/postavka-bot.service` — systemd unit с hardening (NoNewPrivileges, ProtectSystem=strict, PrivateTmp). User=postavka, Restart=always, SIGTERM, journald.
+- `deploy/backup.sh` — daily SQLite-safe бэкап через `sqlite3 .backup`, ротация 14 дней.
+- `deploy/README.md` — пошаговая инструкция деплоя на чистую Ubuntu (useradd, venv, alembic upgrade, systemd, cron).
+- `.env.example` — все актуальные переменные с комментариями (TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, TOKEN_ENCRYPTION_KEY, legacy fallback'и).
+
+### Файлы (новые/изменённые)
+
+**Новые:**
+- `src/security/__init__.py`, `src/security/crypto.py`
+- `alembic/versions/b8d2e7a91f02_composite_unique_user_data.py`
+- `alembic/versions/c4f2e9b1a3d8_encrypt_user_tokens.py`
+- `deploy/postavka-bot.service`, `deploy/backup.sh`, `deploy/README.md`
+- `.env.example`
+
+**Изменённые:**
+- `src/db/models.py` — composite UNIQUE
+- `src/services/user_service.py` — Fernet, helpers, get_ozon_client_for
+- `src/services/shipment_service.py` — multi-tenant filter
+- `src/services/product_hint_service.py` — multi-tenant filter
+- `src/bot/middleware.py` — EnsureUserMiddleware, RateLimitMiddleware, секрет-маскирование
+- `src/bot/main.py` — middleware'ы, scheduler по всем юзерам, run() shutdown
+- `src/bot/keyboards.py` — без WB
+- `src/bot/handlers/common.py` — _MAIN_TEXT/_HELP_TEXT, _settings_menu_kb, /forget_me, /admin_stats
+- `src/bot/handlers/digest.py` — get_ozon_client_for
+- `src/bot/handlers/returns.py` — get_ozon_client_for
+- `src/bot/handlers/upload.py` — лимит 20 МБ
+- `src/config.py` — TOKEN_ENCRYPTION_KEY
+
+### Статус
+Бот рестартован, работает (`Bot started`, `DIGEST scheduler: sleep 67925 сек до 16.05 09:00 МСК`). Миграции накатаны (head: `c4f2e9b1a3d8`).
+
+### TODO для следующей сессии
+1. **E4 завершить**: мигрировать `ozon_book.py` (10 мест), `integrations.py`, `shipment.py`, `favorites.py` на `get_ozon_client_for(s, tg_id)`. Это критично для multi-tenant — без этого новые юзеры будут писать в кабинет ALLOWED_USER_ID.
+2. Сгенерировать TOKEN_ENCRYPTION_KEY в .env перед первым деплоем + `alembic upgrade` чтобы зашифровать существующие токены.
+3. (опционально) Добавить in-БД bad_creds_count + creds_blocked_until для API abuse-protection (был в плане E3.5, отложил).
+4. (опционально) HTTP `/healthz` endpoint для systemd/k8s healthcheck.
+5. End-to-end тест: создать второго Telegram-аккаунта, пройти /start → onboarding → попытаться создать заявку. Должно: 1) видеть только свой каталог 2) не видеть заявки ALLOWED_USER_ID 3) после `/forget_me` всё стереть.
+
+---
+
+## 2026-05-15 (13:25) — Утренняя сводка + /digest (возвраты, urgent, runout)
+
+### Зачем
+Юзер хочет каждое утро видеть короткий one-glance-отчёт по кабинету Ozon без клика в ЛК. По интервью с Маргаритой (см. memory `project_interview_margarita_2026_05_15`) это закрывает три топ-боли: уведомления о возвратах, «срочно отгрузить», «когда кончится». Триггер двойной — расписание 09:00 МСК и команда `/digest` на ручной вызов / для отладки.
+
+### Что добавлено
+
+- **Метод API**: `OzonClient.postings_fbo_list(date_from, date_to, status="", limit_per_page=1000, max_total=20000)` — заказы FBO за период с пагинацией через offset, endpoint `/v2/posting/fbo/list` (deprecated с 1.06.2026, до тех пор живой). Без `analytics_data`/`financial_data` для скорости — нужен только `products[{sku, qty}]` и `status` для отсеки cancelled.
+- **`src/services/digest_service.py`** — sole логика сборки:
+  - `collect_returns_summary(oz)` → total + actionable_at_pvz + giveouts_available/at_pvz + pdf_bytes (None если нет).
+  - `collect_sales_and_stocks(oz, days_window=28)` → `{sku: {stock, sold_7d, sold_28d, name, offer_id}}`. Источник `name`/`offer_id` — сначала stocks_fbo, потом fallback из products в постингах. Cancelled posting'и пропускаем. Sold_7d считаем по `in_process_at >= now-7d`.
+  - `_build_lines(by_sku, mode='urgent'|'runout')` считает rate и days_left, фильтрует по color-порогам:
+    - urgent: rate=sold_7d/7, 🔴 <7д, 🟡 7–14д, остальное скрываем
+    - runout: rate=sold_28d/28, 🔴 <15д, 🟡 15–30д, 🟢 >30д
+  - `build_digest_text(data)` собирает HTML: возвраты → 🔥 срочно → ⏳ runout → ⚠ ошибки API (если были).
+- **Handler** `src/bot/handlers/digest.py`:
+  - `send_digest_to_user(bot, chat_id)` — reusable, шлёт PDF (если есть) отдельным document'ом, потом текст с кнопкой «🔄 Обновить».
+  - `/digest` команда — ручной триггер с placeholder-сообщением.
+  - `digest:refresh` callback — пересборка по кнопке.
+- **Scheduler** в `main.py`: `_digest_scheduler(bot)` — asyncio loop, спит до ближайшего 09:00 МСК (UTC+3), потом шлёт. APScheduler не тащил — single-tenant, asyncio.sleep справляется. На исключении лог + sleep час, чтобы не ушло в tight-loop. Запускается через `asyncio.create_task` параллельно с `start_polling`, отменяется в finally.
+- **Меню команд**: добавлен `BotCommand("digest", "☀ Утренняя сводка")`.
+
+### Файлы
+- `src/integrations/ozon_api.py` — добавлен `postings_fbo_list` (перед `supply_order_*`).
+- `src/services/digest_service.py` — новый.
+- `src/bot/handlers/digest.py` — новый.
+- `src/bot/main.py` — импорт digest, регистрация router'а, `_digest_scheduler` корутина, `set_my_commands`, оборачивание `start_polling` в try/finally для cancel scheduler'а.
+
+### Статус
+Импорт-смоук ОК, бот рестартован (`Bot started: @my_postavka_bot`, scheduler залогировал «sleep 70571 сек до 16.05 09:00 МСК»). Реальный `/digest` юзер ещё не дёргал — следующий шаг. Если postings_fbo_list упрётся в 429 — увидим в `data.errors` блоке сводки.
+
+### Дефолты, которые поправим если юзер скажет
+- Время 09:00 МСК — константы `DIGEST_HOUR_MSK`/`DIGEST_MINUTE_MSK` в `main.py`.
+- Пороги urgent/runout — `URGENT_RED_DAYS=7`, `URGENT_YELLOW_DAYS=14`, `RUNOUT_RED_DAYS=15`, `RUNOUT_GREEN_DAYS=30` в `digest_service.py`.
+- TOP_LIST_LIMIT=12 — после которого пишем «…и ещё N».
+
+### Будущее
+- **Следующая задача (юзер уже описал)**: фикс поиска слотов Ozon — искать на ближайшую дату, но **последний слот этого дня**. Локация: `ozon_book.py` + возможно `slot_hunter.py`. Не начинать пока юзер не скажет.
+- Кнопка «☀ Сводка сейчас» в главное меню (если юзер захочет — пока только команда + /digest).
+- Тренд: сравнение с прошлой неделей (нужна история заказов в БД, сейчас live).
+- Алерты на новые слоты Ozon FBO в утренней сводке (юзер упомянул как боль #1).
+
+---
+
+## 2026-05-15 (07:30) — ProductHint: загрузка упаковки/примечаний через xlsx → в ТЗ Отгрузка
+
+### Зачем
+Юзер хочет один раз залить таблицу с упаковкой/примечаниями на каждый артикул, и чтобы при генерации ТЗ Отгрузка эти поля автоматически попадали в xlsx-выпуск. В `ship_tz.py` колонки «Упаковка для товара» / «примечание» уже есть в шапке (`:201-208`), но всегда писались `None` (`:263-264`).
+
+### Архитектурный выбор: хранение по product_id, а не offer_id
+`offer_id` (артикул на Ozon) изменяемый — юзер может его поменять в ЛК. Стабильный ключ — числовой `sku`. Поэтому в `ProductHint` храним `ozon_product_id` (FK на `ozon_products.id`, который в свою очередь привязан к sku через `/refresh_ozon_catalog`). Юзер заливает по offer_id (что у него в xlsx), резолвим в product_id один раз → даже если артикул сменится, hint останется привязан к товару.
+
+### Что добавлено
+
+- **Модель** `ProductHint` (`src/db/models.py`): `ozon_product_id` FK UNIQUE, `packaging`, `notes`, `created_at`, `updated_at`. Миграция `e799858ae69c`.
+- **Парсер** `src/parsers/product_hints.py`: читает xlsx, ищет колонки артикул/упаковка/примечание (case-insensitive, по подстроке: `артикул`/`offer`/`article`, `упаков`, `примеч`/`коммент`/`note`). Возвращает `list[HintRow]`. Без колонки артикула → ValueError.
+- **Сервис** `src/services/product_hint_service.py`: `get_catalog_stats()` (total/with_hint/without_hint), `resolve_rows(rows)` (через существующий `_find_ozon_product` → matched + unmatched_articles), `apply_upsert(matched)` (обновляет только эти product_id), `apply_replace(matched)` (чистит таблицу и заливает заново). Дополнительно `get_hints_by_product_ids` для бэтча.
+- **Handler** `src/bot/handlers/product_hints.py` + state `ProductHints` (awaiting_file, confirm_strategy):
+  - `menu:product_hints` → pre-upload экран со счётчиками «всего N / с упаковкой K / без M». Если каталог пуст → подсказка «прогони /refresh_ozon_catalog», кнопка загрузки скрыта.
+  - `phints:upload` → state.awaiting_file, юзер кидает xlsx.
+  - `@router.message(ProductHints.awaiting_file, F.document)` — приём файла. Сохранение в `STORAGE_DIR/hints_*`. Парсинг → резолв → state.confirm_strategy.
+  - Сводка: «✅ N распознано / ⚠ M не нашлись: ART-1, ART-2 …». Кнопки **🔄 Upsert (рекомендую)** / **🚮 Заменить всё** / **✖ Отмена**.
+  - После применения — финальный экран с обновлёнными счётчиками и кнопками «📤 Залить ещё файл» / «◀ В меню».
+- **Меню**: в `_main_menu_kb` добавлен пункт «📦 Упаковка / примечания» (`common.py`).
+- **Регистрация роутера** в `main.py`: `product_hints.router` идёт **перед** `upload.router` — чтобы state-handler перехватил xlsx до катч-олла в `upload.py`.
+
+### Подцеп к ТЗ Отгрузка
+`src/generators/ship_tz.py`:
+- В `generate_ship_tz` через `object_session(req)` берём активную SQLAlchemy сессию (caller вызывает внутри `db_session()`), одним запросом тянем `ProductHint` для всех `ozon_product_id` заявки.
+- В `_product_key_and_meta` к Ozon-meta добавлены поля `hint_packaging` / `hint_notes`.
+- В `_fill_sheet` (`:263-275`): для Ozon-листа в колонки `right_start` (Упаковка) и `right_start+1` (примечание) пишутся реальные значения, для WB — упаковка пока пустая (только Ozon в текущей итерации).
+
+### Файлы
+- `src/db/models.py` — модель ProductHint в конце.
+- `alembic/versions/e799858ae69c_add_product_hints.py` — миграция.
+- `src/parsers/product_hints.py` — новый файл.
+- `src/services/product_hint_service.py` — новый файл.
+- `src/bot/handlers/product_hints.py` — новый файл.
+- `src/bot/states.py` — добавлен `ProductHints(StatesGroup)`.
+- `src/bot/handlers/common.py` — кнопка в главном меню.
+- `src/bot/main.py` — импорт + регистрация роутера.
+- `src/generators/ship_tz.py` — загрузка hints + подстановка в колонки.
+
+### Статус
+Миграция накатана (`alembic upgrade head` → `e799858ae69c`). Бот рестартован, поллит. Импорт-смоук OK. Реальный xlsx ещё не лили — ждём end-to-end проверки.
+
+### Будущее (открыто, не катать сейчас)
+- WB: симметричная фича. Сейчас колонки «упаковка» / «состав набора» на WB-листе пустые.
+- Скачать шаблон со всеми артикулами Ozon (чтобы юзер не вспоминал какие у него артикулы).
+- Редактирование одного товара inline-кнопками через `/sku_list`.
+
+---
+
 ## 2026-05-14 (13:30) — Time-picker, auto-poll на scoring-fail, auto-book mode, фиксы state-orphan
 
 ### Auto-poll теперь работает на scoring=FAILED (NO_TIMESLOTS / INVALID_ROUTE)

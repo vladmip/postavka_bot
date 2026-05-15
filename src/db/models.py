@@ -15,6 +15,29 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+class User(Base):
+    """Пользователь бота. Привязан к Telegram tg_id, хранит credentials под
+    маркетплейсы. На MVP credentials в plain text — позже добавим шифрование
+    через Fernet master-key (см. [[reference-wb-tokens-policy]]).
+
+    Multi-tenant: каждый user изолирован. Все основные таблицы имеют user_id FK.
+    """
+    __tablename__ = "users"
+
+    tg_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Имя поставщика для подстановки в xlsx ТЗ (поле «Поставщик»).
+    # Раньше было хардкодом DEFAULT_SUPPLIER = "ИП Баковец".
+    supplier_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Ozon Seller credentials. Юзер вводит в onboarding wizard.
+    ozon_client_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ozon_api_key: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    # WB credentials (опционально — пока WB-сторона ещё не развёрнута).
+    wb_api_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # Когда юзер прошёл onboarding (ввёл хотя бы Ozon-credentials).
+    onboarded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class Sku(Base):
     __tablename__ = "skus"
 
@@ -62,13 +85,22 @@ class OzonProduct(Base):
     __tablename__ = "ozon_products"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    offer_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    # Multi-tenant: offer_id уникален в пределах user_id (юзер B может иметь
+    # тот же offer_id что у юзера A — это разные кабинеты Ozon).
+    offer_id: Mapped[str] = mapped_column(String(128), index=True)
     sku: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # числовой Ozon SKU
     name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     barcode_primary: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     raw_barcodes_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "offer_id", name="uq_ozon_user_offer"),
+    )
 
     def __repr__(self) -> str:
         return f"<OzonProduct {self.offer_id} sku={self.sku}>"
@@ -79,13 +111,21 @@ class WbProduct(Base):
     __tablename__ = "wb_products"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    nm_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    # Multi-tenant: nm_id уникален в пределах user_id.
+    nm_id: Mapped[int] = mapped_column(Integer, index=True)
     article: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     barcode_primary: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     raw_barcodes_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "nm_id", name="uq_wb_user_nm"),
+    )
 
     def __repr__(self) -> str:
         return f"<WbProduct nm={self.nm_id} {self.article}>"
@@ -203,6 +243,11 @@ class ShipmentRequest(Base):
     __tablename__ = "shipment_requests"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Multi-tenant: владелец заявки. NULL = legacy (до миграции), такие записи
+    # видны старому single-tenant flow. После миграции все записи имеют user_id.
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=True, index=True,
+    )
     state: Mapped[str] = mapped_column(String(32), default="draft", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -226,6 +271,11 @@ class ShipmentRequest(Base):
     # под капотом это разные draft API и разные warehouse_id, смешивать нельзя.
     # NULL = legacy-заявки до миграции, юзер выбирает тип при первом открытии карточки.
     ozon_supply_type: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
+    # Формат физической упаковки: BOX (коробами) или PALLET (паллетами). Пока
+    # это только пометка для отображения в карточке + будущей выгрузки в /v1/cargoes/create.
+    # NULL = не выбрано (юзер выберет перед бронированием).
+    cargo_format: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
     source_files_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     comments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -259,6 +309,19 @@ class ShipmentItem(Base):
     target_warehouse: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     booked_supply_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     booked_slot_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Статус Ozon supply order'а из /v3/supply-order/get. Обновляется по запросу
+    # юзера (кнопка «🔄 Обновить»). Enum-строкой: DATA_FILLING / READY_TO_SUPPLY /
+    # ACCEPTED_AT_SUPPLY_WAREHOUSE / IN_TRANSIT / ACCEPTANCE_AT_STORAGE_WAREHOUSE /
+    # REPORTS_CONFIRMATION_AWAITING / COMPLETED / CANCELLED / OVERDUE / REJECTED_*.
+    ozon_supply_status: Mapped[Optional[str]] = mapped_column(String(48), nullable=True)
+    ozon_supply_status_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # «Номер заявки» как он отображается в Ozon ЛК (например '2111140905880').
+    # Отличается от booked_supply_id (это order_id, числовой).
+    ozon_order_number: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # Финальная точка отгрузки (drop-off) из ответа Ozon /v3/supply-order/get.
+    # Для CROSSDOCK — имя хаба ('СОФЬИНО_РФЦ_КРОССДОКИНГ'), для DIRECT — РФЦ.
+    ozon_dropoff_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     request: Mapped["ShipmentRequest"] = relationship("ShipmentRequest", back_populates="items")
     sku: Mapped[Optional["Sku"]] = relationship("Sku", foreign_keys=[sku_id])
@@ -294,6 +357,9 @@ class FavoriteCrossdockPoint(Base):
     __tablename__ = "favorite_crossdock_points"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.tg_id", ondelete="CASCADE"), nullable=True, index=True,
+    )
     name: Mapped[str] = mapped_column(String(128))           # display name
     warehouse_id: Mapped[int] = mapped_column(Integer)
     point_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
@@ -301,3 +367,25 @@ class FavoriteCrossdockPoint(Base):
     use_count: Mapped[int] = mapped_column(Integer, default=0)
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "warehouse_id", name="uq_fav_user_wh"),
+    )
+
+
+class ProductHint(Base):
+    """Подсказки к товару для ТЗ Отгрузка: упаковка и примечание.
+    Привязка по ozon_product_id (стабильный PK), а не по offer_id — чтобы пережить
+    смену артикула продавцом. Юзер заливает xlsx с offer_id; резолвим в product_id."""
+    __tablename__ = "product_hints"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ozon_product_id: Mapped[int] = mapped_column(
+        ForeignKey("ozon_products.id", ondelete="CASCADE"), unique=True, index=True,
+    )
+    packaging: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    ozon_product: Mapped["OzonProduct"] = relationship("OzonProduct")

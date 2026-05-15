@@ -53,10 +53,24 @@ async def handle_photo(msg: Message) -> None:
     )
 
 
+# Защита: не пытаемся обрабатывать файлы > 20 МБ. Telegram сам ограничивает
+# upload до 50 МБ для ботов, но xlsx больше 20 — это либо что-то экзотическое,
+# либо кто-то пытается положить процесс. Обычные выгрузки Ozon/WB < 5 МБ.
+_MAX_DOC_SIZE_MB = 20
+
+
 @router.message(F.document)
 async def handle_document(msg: Message, state: FSMContext) -> None:
     doc = msg.document
     fname = doc.file_name or "upload.bin"
+
+    # Защита от больших файлов (DoS / accidental упор в RAM на parsing).
+    if doc.file_size and doc.file_size > _MAX_DOC_SIZE_MB * 1024 * 1024:
+        await msg.answer(
+            f"⚠ Файл слишком большой ({doc.file_size // (1024*1024)} МБ). "
+            f"Лимит: {_MAX_DOC_SIZE_MB} МБ. Обычные xlsx-выгрузки сильно меньше — проверь файл."
+        )
+        return
 
     # Zip с xlsx-выгрузками — распаковываем и обрабатываем каждый xlsx по очереди.
     if fname.lower().endswith(".zip"):
@@ -72,6 +86,21 @@ async def handle_document(msg: Message, state: FSMContext) -> None:
 
     file = await msg.bot.get_file(doc.file_id)
     await msg.bot.download_file(file.file_path, destination=stored_path)
+
+    # Перед стандартным sheep_handler — попробуем широкий формат «артикул × кластеры».
+    # Это шаблон «➕ Новая заявка» — заполненный xlsx с количеством per cluster.
+    try:
+        from openpyxl import load_workbook
+        from src.parsers.wide_ship_request import is_wide_format, parse_wide_ship_file
+        wb = load_workbook(stored_path, data_only=True, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        first_row = next(ws.iter_rows(values_only=True), None) or []
+        wb.close()
+        if is_wide_format(list(first_row)):
+            await _handle_wide_ship_file(msg, state, stored_path, fname)
+            return
+    except Exception as e:
+        logger.warning("wide format probe failed for %s: %s", fname, e)
 
     # Если имя файла похоже на ship-выгрузку → отдаём shipment handler
     from src.bot.handlers.shipment import looks_like_ship_file, handle_ship_document
@@ -247,6 +276,92 @@ def _save_inbox(path: Path, original_name: str, kind: str, supply_id, payload: d
         return inbox.id
 
 
+# ── Широкий xlsx (новая заявка одной таблицей) ───────────────────────────
+
+
+async def _handle_wide_ship_file(msg, state: FSMContext, path: Path, fname: str) -> None:
+    """Принять xlsx с широкой структурой «артикул × кластеры» — это шаблон
+    «Новая заявка». Создаёт одну ShipmentRequest, приатачивает items per cluster."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from src.parsers.wide_ship_request import parse_wide_ship_file
+    from src.services.shipment_service import create_shipment_request, attach_ship_file
+    logger = __import__("logging").getLogger("bot.upload")
+
+    try:
+        parsed_list = parse_wide_ship_file(path, original_name=fname)
+    except ValueError as e:
+        # Валидационные ошибки (неизвестные кластеры, нет артикулов) — показываем
+        # как понятную ошибку без раскрытия трейса.
+        await msg.answer(
+            f"❌ <b>Файл не принят</b>\n\n{e}\n\n"
+            "Поправь файл и пришли заново."
+        )
+        return
+    except Exception as e:
+        logger.exception("wide parse failed: %s", e)
+        await msg.answer(
+            f"❌ <b>Не распарсил xlsx</b>\n<code>{type(e).__name__}: {e}</code>"
+        )
+        return
+
+    # Pre-validation: суммируем артикулы, проверяем их наличие в каталоге ДО создания.
+    from src.services.shipment_service import _find_ozon_product
+    all_articles = {it.article_or_barcode for p in parsed_list for it in p.items}
+    with db_session() as session:
+        unmatched_articles = sorted(
+            art for art in all_articles
+            if _find_ozon_product(session, art) is None
+        )
+    if unmatched_articles:
+        # Жёсткая остановка: половина и больше — отбиваем.
+        sample = ", ".join(f"<code>{a}</code>" for a in unmatched_articles[:10])
+        more = (
+            f" … и ещё {len(unmatched_articles) - 10}"
+            if len(unmatched_articles) > 10 else ""
+        )
+        if len(unmatched_articles) >= max(1, len(all_articles) // 2):
+            await msg.answer(
+                f"❌ <b>Слишком много неизвестных артикулов</b>\n\n"
+                f"Не нашлось в Ozon-каталоге: <b>{len(unmatched_articles)}</b> из <b>{len(all_articles)}</b>:\n"
+                f"  {sample}{more}\n\n"
+                "Сначала обнови каталог: ⚙ Настройки → 🔗 Привязать каталог к МП."
+            )
+            return
+        # Иначе — предупреждаем, но создаём заявку (matched попадут, unmatched в reject-список).
+        await msg.answer(
+            f"⚠ <b>Часть артикулов не найдена в каталоге ({len(unmatched_articles)} шт):</b>\n"
+            f"  {sample}{more}\n\n"
+            "Они попадут в «без SKU» и не будут отправлены в Ozon. Создаю заявку."
+        )
+
+    total_items = sum(len(p.items) for p in parsed_list)
+    total_qty = sum(sum(it.qty for it in p.items) for p in parsed_list)
+    clusters = [p.cluster_name for p in parsed_list]
+
+    with db_session() as session:
+        req = create_shipment_request(session, source_file=fname)
+        rid = req.id
+        per_cluster = []
+        for parsed in parsed_list:
+            result = attach_ship_file(session, rid, parsed)
+            per_cluster.append((parsed.cluster_name, result))
+
+    lines = [
+        f"📦 <b>Создана заявка #{rid}</b>",
+        f"Кластеров: <b>{len(clusters)}</b> · Позиций: <b>{total_items}</b> · Количество: <b>{total_qty}</b>",
+        "",
+        "<b>По кластерам:</b>",
+    ]
+    for cl, result in per_cluster:
+        unm = f" ⚠ {len(result.unmatched_articles)} без SKU" if result.unmatched_articles else ""
+        lines.append(f"  • {cl}: {result.matched} SKU{unm}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"ship_open:{rid}")],
+        [InlineKeyboardButton(text="📋 Все заявки", callback_data="menu:ships")],
+    ])
+    await msg.answer("\n".join(lines), reply_markup=kb)
+
+
 # ── ZIP handling ─────────────────────────────────────────────────────────
 
 
@@ -349,13 +464,27 @@ async def cb_zip_mode(cb: CallbackQuery, state: FSMContext) -> None:
         await _create_zip_together_request(cb.message, state, paths, zip_name, otype=None)
 
     elif mode == "separate":
-        # Каждый xlsx → своя заявка (старое поведение)
+        # Каждый xlsx → своя заявка. БЕЗ вопросов про тип Ozon — юзер выберет
+        # потом в карточке. Цель: моментальная пакетная нарезка.
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        from src.services.shipment_service import create_shipment_request, attach_ship_file
+        from src.db.session import db_session
+
+        ok, errs = 0, 0
+        created_rids: list = []
         for path in paths:
             inner_name = path.name
             if looks_like_ship_file(inner_name):
                 try:
-                    await handle_ship_document(cb.message, state, path, inner_name)
+                    parsed = parse_ship_file(path, original_name=inner_name)
+                    with db_session() as session:
+                        req = create_shipment_request(session, source_file=inner_name)
+                        attach_ship_file(session, req.id, parsed)
+                        rid = req.id
+                    ok += 1
+                    created_rids.append((rid, parsed.marketplace, parsed.cluster_name, len(parsed.items)))
                 except Exception as e:
+                    errs += 1
                     logger.exception("zip separate: failed %s", inner_name)
                     await cb.message.answer(
                         f"⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}"
@@ -371,3 +500,22 @@ async def cb_zip_mode(cb: CallbackQuery, state: FSMContext) -> None:
                     await cb.message.answer(f"✅ <code>{inner_name}</code>: {kind.value}\n{parsed_summary}")
                 except Exception as e:
                     await cb.message.answer(f"⚠ <code>{inner_name}</code>: {type(e).__name__}: {str(e)[:200]}")
+
+        if created_rids:
+            mp_emoji = {"wb": "🟣", "ozon": "🔵"}
+            lines = [f"📦 <b>Создано заявок: {ok}</b>"]
+            kb_rows = []
+            for rid, mp, cluster, n in created_rids:
+                emoji = mp_emoji.get(mp, "•")
+                lines.append(f"  {emoji} #{rid} — {cluster} ({n} SKU)")
+                kb_rows.append([InlineKeyboardButton(
+                    text=f"📋 Заявка #{rid} — {cluster[:30]}",
+                    callback_data=f"ship_open:{rid}",
+                )])
+            kb_rows.append([InlineKeyboardButton(text="📋 Все заявки", callback_data="menu:ships")])
+            if errs:
+                lines.append(f"\n⚠ Ошибок: {errs}")
+            await cb.message.answer(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+            )

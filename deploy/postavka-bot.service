@@ -1,0 +1,34 @@
+[Unit]
+Description=Postavka Assistant Bot (Telegram, FBO Ozon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postavka
+Group=postavka
+WorkingDirectory=/opt/postavka
+EnvironmentFile=/opt/postavka/.env
+ExecStart=/opt/postavka/venv/bin/python -m src.bot.main
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/postavka/data /opt/postavka/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Logs → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=postavka-bot
+
+[Install]
+WantedBy=multi-user.target

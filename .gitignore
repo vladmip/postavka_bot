@@ -31,4 +31,8 @@ ozon_api_docs.txt
 # Claude Code локальные настройки и плагины — у каждого свои
 .claude/settings.local.json
 .claude/plugins/
+.claude/skills/
+
+# WB-документация (дампы, регенерятся, тяжёлые)
+wb_docs__*.txt
 

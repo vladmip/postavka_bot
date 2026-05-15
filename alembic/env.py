@@ -2,6 +2,10 @@ from logging.config import fileConfig
 from pathlib import Path
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+from dotenv import load_dotenv
+
+# Загружаем .env, чтобы миграции могли читать ALLOWED_USER_ID, APIKEY_OZON и т.д.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from src.db.models import Base
 

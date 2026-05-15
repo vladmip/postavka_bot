@@ -89,7 +89,7 @@ def _render_list_kb() -> tuple:
                 text=f"🗑 {f.name[:30]}", callback_data=f"fav:del:{f.id}",
             )])
     rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="fav:add")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")])
+    rows.append([InlineKeyboardButton(text="◀ В настройки", callback_data="menu:settings")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 

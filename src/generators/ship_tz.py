@@ -33,8 +33,9 @@ from typing import Dict, List, Optional, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from sqlalchemy.orm import object_session
 
-from src.db.models import ShipmentRequest
+from src.db.models import ShipmentRequest, ProductHint
 
 logger = logging.getLogger("generators.ship_tz")
 
@@ -71,6 +72,20 @@ ColKey = Tuple[str, Optional[str], Optional[str], Optional[str]]
 # (cluster, target_warehouse_or_None, supply_id_or_None, slot_str_or_None)
 
 
+def _clean_warehouse_name(wh: Optional[str]) -> Optional[str]:
+    """Отфильтровать «псевдо-имена» типа '#0' / '#123' для CROSSDOCK-поставок,
+    где Ozon не возвращает реального РФЦ. На таких item'ах в ТЗ Отгрузка
+    колонкой должен быть кластер, а не '#0'."""
+    if not wh:
+        return None
+    s = wh.strip()
+    if not s:
+        return None
+    if s.startswith("#") and s[1:].isdigit():
+        return None
+    return s
+
+
 def _build_columns(req: ShipmentRequest, marketplace: str) -> List[ColKey]:
     """Список уникальных колонок для листа, в порядке появления."""
     seen: List[ColKey] = []
@@ -80,7 +95,7 @@ def _build_columns(req: ShipmentRequest, marketplace: str) -> List[ColKey]:
         slot = _fmt_slot(it.booked_slot_at) if it.booked_slot_at else None
         key: ColKey = (
             it.cluster,
-            it.target_warehouse or None,
+            _clean_warehouse_name(it.target_warehouse),
             it.booked_supply_id or None,
             slot,
         )
@@ -101,20 +116,36 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
     Источник данных: ozon_products / wb_products (через item.ozon_product / item.wb_product).
     Ключ группировки SKU — внутренний id маркет-каталога (ozon_product.id или wb_product.id),
     одинаковый сквозной для уникальной товарной строки.
+
+    Упаковка/примечание для Ozon-строк подтягиваются из ProductHint по ozon_product_id.
     """
     by_col_sku: Dict[Tuple[ColKey, int], int] = {}
-    skus_meta: Dict[int, Dict] = {}  # product_id → {barcode, name, article}
+    skus_meta: Dict[int, Dict] = {}  # product_id → {barcode, name, article, hint_packaging, hint_notes}
     unmatched: List[Dict] = []
+
+    # Hints для Ozon-товаров заявки.
+    ozon_hints: Dict[int, ProductHint] = {}
+    session = object_session(req)
+    if session is not None:
+        oz_pids = [it.ozon_product_id for it in req.items if it.ozon_product_id]
+        if oz_pids:
+            rows = session.query(ProductHint).filter(
+                ProductHint.ozon_product_id.in_(set(oz_pids))
+            ).all()
+            ozon_hints = {h.ozon_product_id: h for h in rows}
 
     def _product_key_and_meta(it):
         """Вернуть (key_id, meta_dict) для item или None если не привязан."""
         mp = (it.marketplace or "").lower()
         if mp == "ozon" and it.ozon_product:
             p = it.ozon_product
+            h = ozon_hints.get(p.id)
             return p.id, {
                 "barcode": p.barcode_primary or "",
                 "name": p.name or "",
                 "article": p.offer_id,
+                "hint_packaging": (h.packaging if h else None) or "",
+                "hint_notes": (h.notes if h else None) or "",
             }
         if mp == "wb" and it.wb_product:
             p = it.wb_product
@@ -122,6 +153,8 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
                 "barcode": p.barcode_primary or "",
                 "name": p.name or "",
                 "article": p.article or str(p.nm_id),
+                "hint_packaging": "",
+                "hint_notes": "",
             }
         return None
 
@@ -139,7 +172,7 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
         slot = _fmt_slot(it.booked_slot_at) if it.booked_slot_at else None
         col_key: ColKey = (
             it.cluster,
-            it.target_warehouse or None,
+            _clean_warehouse_name(it.target_warehouse),
             it.booked_supply_id or None,
             slot,
         )
@@ -150,6 +183,26 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
 
     wb_cols = _build_columns(req, "wb")
     oz_cols = _build_columns(req, "ozon")
+
+    # Маппинг booked_supply_id (Ozon order_id, числовой) → метаданные поставки:
+    # - order_number: номер заявки как в ЛК Ozon ('2000052363018'). fallback на supply_id.
+    # - dropoff: финальная точка отгрузки (хаб для CROSSDOCK, РФЦ для DIRECT).
+    # - slot: «17.05 13:00–14:00» из booked_slot_at.
+    order_numbers: Dict[str, str] = {}
+    dropoffs: Dict[str, str] = {}
+    slots_full: Dict[str, str] = {}
+    for it in req.items:
+        if it.marketplace != "ozon" or not it.booked_supply_id:
+            continue
+        bsid = it.booked_supply_id
+        if it.ozon_order_number:
+            order_numbers[bsid] = it.ozon_order_number
+        if it.ozon_dropoff_name:
+            dropoffs[bsid] = it.ozon_dropoff_name
+        if it.booked_slot_at:
+            dt = it.booked_slot_at
+            hh = dt.hour
+            slots_full[bsid] = f"{dt.day:02d}.{dt.month:02d} {hh:02d}:00–{(hh + 1) % 24:02d}:00"
 
     def skus_for(mp: str) -> List[int]:
         seen: List[int] = []
@@ -169,11 +222,13 @@ def generate_ship_tz(req: ShipmentRequest) -> bytes:
 
     if wb_skus:
         ws = wb.create_sheet("вб")
-        _fill_sheet(ws, "вб", wb_cols, wb_skus, skus_meta, by_col_sku)
+        _fill_sheet(ws, "вб", wb_cols, wb_skus, skus_meta, by_col_sku,
+                    order_numbers, dropoffs, slots_full)
 
     if oz_skus:
         ws = wb.create_sheet("озон")
-        _fill_sheet(ws, "озон", oz_cols, oz_skus, skus_meta, by_col_sku)
+        _fill_sheet(ws, "озон", oz_cols, oz_skus, skus_meta, by_col_sku,
+                    order_numbers, dropoffs, slots_full)
 
     _fill_operations_sheet(wb.create_sheet("операции"), req, unmatched)
 
@@ -189,6 +244,9 @@ def _fill_sheet(
     sku_ids: List[int],
     skus_meta: Dict[int, Dict],
     by_col_sku: Dict[Tuple[ColKey, int], int],
+    order_numbers: Optional[Dict[str, str]] = None,
+    dropoffs: Optional[Dict[str, str]] = None,
+    slots_full: Optional[Dict[str, str]] = None,
 ) -> None:
     header_fill = _header_fill()
     border = _thin_border()
@@ -198,13 +256,16 @@ def _fill_sheet(
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
     is_oz = kind == "озон"
-    fixed_left = ["ШК", "Название товара", "Поставщик"]
+    # Ozon: «Артикул Поставщика» вынесен в самое начало (колонка A) — так удобнее
+    # ФФ-сотруднику, артикул всегда виден первым. После него ШК / Название / Поставщик.
     if is_oz:
+        fixed_left = ["Артикул Поставщика", "ШК", "Название товара", "Поставщик"]
         fixed_right = [
             "Упаковка для товара", "примечание",
-            "Артикул Поставщика", "Полный адрес Озон склада и таймслот",
+            "Полный адрес Озон склада и таймслот",
         ]
     else:
+        fixed_left = ["ШК", "Название товара", "Поставщик"]
         fixed_right = ["упаковка", "состав набора", "Артикул Поставщика"]
 
     headers = fixed_left + [_col_label(c) for c in cols] + fixed_right
@@ -219,10 +280,37 @@ def _fill_sheet(
         cell.border = border
     ws.row_dimensions[1].height = 32
 
-    # R2 + R3 для WB: supply_id и дата+таймслот per warehouse column.
-    # Для ОЗОН ту же информацию пишем не в R2/R3, а в правую K-колонку per row
-    # (как в эталоне).
-    if not is_oz:
+    # Шапка под R1:
+    #   WB: R2 = supply_id, R3 = слот.
+    #   Ozon: R2 = № заявки ЛК (под каждой колонкой-кластером).
+    #         Drop-off + дата+таймслот вписываются в правую колонку «Полный адрес»
+    #         per-row, рядом с данными — так юзеру удобнее видеть всё в одной точке.
+    order_numbers = order_numbers or {}
+    dropoffs = dropoffs or {}
+    slots_full = slots_full or {}
+
+    if is_oz:
+        any_oz_book = any(c[2] for c in cols)
+        if any_oz_book:
+            first_dyn = len(fixed_left) + 1
+            for i, col in enumerate(cols):
+                col_idx = first_dyn + i
+                _cluster, _wh, supply_id, _slot = col
+                bsid = supply_id or ""
+                num = order_numbers.get(bsid, bsid)
+                cell = ws.cell(row=2, column=col_idx, value=num)
+                cell.font = normal
+                cell.alignment = center
+                cell.border = border
+            # Заполнить остальные клетки строки 2 рамкой и пустотой.
+            for c in range(1, n_cols + 1):
+                cell = ws.cell(row=2, column=c)
+                cell.border = border
+                if cell.value is None:
+                    cell.value = ""
+                if not cell.font or cell.font.name != "Arial":
+                    cell.font = normal
+    else:
         first_dyn = len(fixed_left) + 1
         for i, col in enumerate(cols):
             col_idx = first_dyn + i
@@ -242,14 +330,27 @@ def _fill_sheet(
                 if not cell.font or cell.font.name != "Arial":
                     cell.font = normal
 
-    # Данные
-    data_row_start = 2 if is_oz else 4
+    # Данные. Для Ozon: если есть бронирования — данные с R3, иначе с R2.
+    if is_oz:
+        any_oz_book = any(c[2] for c in cols)
+        data_row_start = 3 if any_oz_book else 2
+    else:
+        data_row_start = 4
     row = data_row_start
     for sku_id in sku_ids:
         meta = skus_meta[sku_id]
-        ws.cell(row=row, column=1, value=meta["barcode"]).alignment = left
-        ws.cell(row=row, column=2, value=meta["name"]).alignment = left
-        ws.cell(row=row, column=3, value=DEFAULT_SUPPLIER).alignment = left
+        if is_oz:
+            # Ozon: A=артикул, B=ШК, C=название, D=поставщик.
+            ws.cell(row=row, column=1, value=meta["article"]).alignment = left
+            ws.cell(row=row, column=2, value=meta["barcode"]).alignment = left
+            ws.cell(row=row, column=3, value=meta["name"]).alignment = left
+            ws.cell(row=row, column=4, value=DEFAULT_SUPPLIER).alignment = left
+        else:
+            # WB: A=ШК, B=название, C=поставщик (старый порядок).
+            ws.cell(row=row, column=1, value=meta["barcode"]).alignment = left
+            ws.cell(row=row, column=2, value=meta["name"]).alignment = left
+            ws.cell(row=row, column=3, value=DEFAULT_SUPPLIER).alignment = left
+
         # qty per колонка
         first_dyn = len(fixed_left) + 1
         for i, col in enumerate(cols):
@@ -257,26 +358,38 @@ def _fill_sheet(
             if qty:
                 cell = ws.cell(row=row, column=first_dyn + i, value=qty)
                 cell.alignment = center
+
         right_start = len(fixed_left) + len(cols) + 1
-        # right block для WB: упаковка | состав набора | Артикул
-        # для ОЗОН: Упаковка | примечание | Артикул | Полный адрес+таймслот
-        ws.cell(row=row, column=right_start, value=None)
-        ws.cell(row=row, column=right_start + 1, value=None)
-        ws.cell(row=row, column=right_start + 2, value=meta["article"]).alignment = left
+        # right block для WB: упаковка | состав набора | Артикул Поставщика
+        # для Ozon: Упаковка | примечание | Полный адрес Озон + таймслот
+        hint_pack = meta.get("hint_packaging") or None
+        hint_notes = meta.get("hint_notes") or None
+        c_pack = ws.cell(row=row, column=right_start, value=hint_pack)
+        if hint_pack:
+            c_pack.alignment = left
+        c_notes = ws.cell(row=row, column=right_start + 1, value=hint_notes)
+        if hint_notes:
+            c_notes.alignment = left
         if is_oz:
-            # Полный адрес+таймслот: собираем из ВСЕХ колонок этой строки, где
-            # есть qty И известен warehouse — обычно одна штука. Если ничего
-            # не забронировано — пусто.
-            slot_parts = []
+            # Полный адрес + таймслот: для каждого supply_id, в который у строки
+            # есть qty, формируем «<drop-off> · <дата+таймслот>».
+            parts = []
             for col in cols:
                 qty = by_col_sku.get((col, sku_id))
                 if not qty:
                     continue
-                _cluster, wh, _supply, slot = col
-                if wh and slot:
-                    slot_parts.append(f"{wh}. {slot}")
-            if slot_parts:
-                ws.cell(row=row, column=right_start + 3, value="; ".join(slot_parts)).alignment = left
+                _cluster, _wh, supply_id, _slot = col
+                bsid = supply_id or ""
+                drop = dropoffs.get(bsid, "")
+                slot_s = slots_full.get(bsid, "")
+                if drop or slot_s:
+                    parts.append(" · ".join(p for p in (drop, slot_s) if p))
+            if parts:
+                ws.cell(row=row, column=right_start + 2,
+                        value="; ".join(parts)).alignment = left
+        else:
+            # WB: 3-я колонка справа = Артикул Поставщика (как было).
+            ws.cell(row=row, column=right_start + 2, value=meta["article"]).alignment = left
 
         for c in range(1, n_cols + 1):
             cell = ws.cell(row=row, column=c)
@@ -305,15 +418,17 @@ def _apply_widths(ws, kind: str, n_cols: int, n_dyn: int) -> None:
         for i, w in enumerate(widths_right):
             ws.column_dimensions[get_column_letter(right_start + i)].width = w
     else:
-        # A=26, B=32, C=14, dynamic=17, упаковка=24, примечание=29, артикул=32, адрес=52
-        ws.column_dimensions["A"].width = 26
-        ws.column_dimensions["B"].width = 32
-        ws.column_dimensions["C"].width = 14
-        dyn_start = 4
+        # Ozon (новый порядок): A=Артикул(32), B=ШК(22), C=Название(32), D=Поставщик(14),
+        # E…=кластеры(17), затем упаковка(24), примечание(29), Полный адрес(52).
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 22
+        ws.column_dimensions["C"].width = 32
+        ws.column_dimensions["D"].width = 14
+        dyn_start = 5
         for i in range(n_dyn):
             ws.column_dimensions[get_column_letter(dyn_start + i)].width = 17
         right_start = dyn_start + n_dyn
-        widths_right = [24, 29, 32, 52]
+        widths_right = [24, 29, 52]
         for i, w in enumerate(widths_right):
             ws.column_dimensions[get_column_letter(right_start + i)].width = w
 

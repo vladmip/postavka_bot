@@ -742,6 +742,132 @@ class OzonClient:
         logger.info("Ozon PDF raw: head=%r", r.content[:8])
         return r.content
 
+    # ── FBO заказы (для аналитики rate of sale) ────────────────────────────
+
+    async def postings_fbo_list(
+        self,
+        date_from: str,
+        date_to: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        max_total: int = 20000,
+    ) -> List[Dict[str, Any]]:
+        """POST /v3/posting/fbo/list — заказы FBO за период (cursor-based).
+
+        v2 deprecated 01.06.2026. v3 отличия:
+          - пагинация через `cursor` (не offset)
+          - `status` теперь массив `["awaiting_packaging", "delivered", ...]`
+          - `limit` 1..100 (раньше до 1000) — больше страниц на тех же данных
+          - response поля: `postings[]` + `cursor` + `has_next` (вместо `result[]`)
+
+        date_from/date_to: ISO 'YYYY-MM-DDTHH:MM:SS.000Z' (с миллисекундами и Z).
+        statuses: список фильтров; None/пусто = все.
+        Возвращает posting'и: order_id, posting_number, status, in_process_at,
+        products[{sku, offer_id, name, price, quantity}], analytics_data, financial_data.
+        """
+        out: List[Dict[str, Any]] = []
+        cursor = ""
+        page_size = 100  # v3 лимит — больше нельзя
+        while True:
+            payload: Dict[str, Any] = {
+                "cursor": cursor,
+                "filter": {
+                    "since": date_from,
+                    "to": date_to,
+                },
+                "limit": page_size,
+                "sort_dir": "asc",
+                "translit": True,
+                "with": {
+                    "analytics_data": False,
+                    "financial_data": False,
+                    "legal_info": False,
+                },
+            }
+            if statuses:
+                payload["filter"]["status"] = statuses
+            data = await self._post("/v3/posting/fbo/list", payload)
+            chunk = data.get("postings") or []
+            if not isinstance(chunk, list):
+                break
+            out.extend(chunk)
+            cursor = data.get("cursor", "") or ""
+            if not data.get("has_next") or not cursor or len(out) >= max_total:
+                break
+        return out[:max_total]
+
+    # ── Вывозы (Removal) — товар возвращается продавцу ────────────────────
+
+    async def removal_from_stock_list(
+        self,
+        date_from: str,
+        date_to: str,
+        *,
+        max_total: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """POST /v1/removal/from-stock/list — вывозы СО СТОКА FBO.
+
+        Это товары которые продавец заказал вывезти со склада Ozon (или которые
+        Ozon сам решил вывезти из-за длительного хранения). В ЛК — раздел
+        seller.ozon.ru/app/fbo-operations/returns?tab=Stock.
+
+        date_from/date_to: YYYY-MM-DD.
+        Возвращает rows: {name, offer_id, sku, barcode, quantity_for_return,
+        box_id, return_id, return_state, return_created_at, delivery_type,
+        destination_warehouse_name, destination_warehouse_address, delivery_date,
+        given_out_date (когда выдан в ПВЗ), utilization_date}.
+        """
+        out: List[Dict[str, Any]] = []
+        last_id = ""
+        page = min(max_total, 500)
+        while True:
+            payload = {
+                "date_from": date_from,
+                "date_to": date_to,
+                "last_id": last_id,
+                "limit": page,
+            }
+            data = await self._post("/v1/removal/from-stock/list", payload)
+            chunk = data.get("returns_summary_report_rows") or []
+            out.extend(chunk)
+            last_id = data.get("last_id", "") or ""
+            if not chunk or not last_id or len(out) >= max_total:
+                break
+        return out[:max_total]
+
+    async def removal_from_supply_list(
+        self,
+        date_from: str,
+        date_to: str,
+        *,
+        max_total: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """POST /v1/removal/from-supply/list — вывозы С ПОСТАВКИ.
+
+        Товары которые Ozon отбраковал на приёмке поставки (битые, неправильно
+        промаркированные и т.п.) и возвращает продавцу. В ЛК — раздел
+        seller.ozon.ru/app/fbo-operations/returns?tab=Supply.
+
+        Поля ответа идентичны removal_from_stock_list.
+        """
+        out: List[Dict[str, Any]] = []
+        last_id = ""
+        page = min(max_total, 500)
+        while True:
+            payload = {
+                "date_from": date_from,
+                "date_to": date_to,
+                "last_id": last_id,
+                "limit": page,
+            }
+            data = await self._post("/v1/removal/from-supply/list", payload)
+            chunk = data.get("returns_summary_report_rows") or []
+            out.extend(chunk)
+            last_id = data.get("last_id", "") or ""
+            if not chunk or not last_id or len(out) >= max_total:
+                break
+        return out[:max_total]
+
     async def supply_order_timeslot_update(
         self,
         supply_order_id: int,
@@ -761,3 +887,31 @@ class OzonClient:
             },
         }
         return await self._post("/v1/supply-order/timeslot/update", payload)
+
+    async def supply_order_get(self, order_ids: List[int]) -> List[Dict[str, Any]]:
+        """POST /v3/supply-order/get — детали по созданным поставкам (до 50 за раз).
+
+        Возвращает список orders[] с полями: order_id, order_number, state,
+        state_updated_date, timeslot, dropoff_warehouse, supplies, ...
+        Если order_ids пуст — возвращает [].
+        """
+        if not order_ids:
+            return []
+        # Ozon принимает строки, не числа.
+        payload = {"order_ids": [str(x) for x in order_ids[:50]]}
+        resp = await self._post("/v3/supply-order/get", payload)
+        return resp.get("orders") or []
+
+    async def supply_order_cancel(self, order_id: int) -> str:
+        """POST /v1/supply-order/cancel — асинхронная отмена supply order.
+        Возвращает operation_id для последующего poll'а через cancel/status."""
+        resp = await self._post("/v1/supply-order/cancel", {"order_id": int(order_id)})
+        return resp.get("operation_id") or ""
+
+    async def supply_order_cancel_status(self, operation_id: str) -> Dict[str, Any]:
+        """POST /v1/supply-order/cancel/status — проверить статус отмены.
+        Возвращает {error_reasons, result: {is_order_cancelled, supplies: [...]}}.
+        error_reasons enum: INVALID_ORDER_STATE | ORDER_IS_VIRTUAL |
+        ORDER_DOES_NOT_BELONG_TO_CONTRACTOR | ORDER_DOES_NOT_BELONG_TO_COMPANY |
+        OTHER_ASYNCHRONOUS_OPERATION_IN_PROGRESS."""
+        return await self._post("/v1/supply-order/cancel/status", {"operation_id": operation_id})

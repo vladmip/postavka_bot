@@ -12,8 +12,8 @@ from src.warehouses import (
 
 
 def kb_marketplace() -> InlineKeyboardMarkup:
+    # MVP: только Ozon. WB-кнопка временно скрыта (write-API закрыт у WB).
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🟦 Wildberries", callback_data="mp:wb"),
         InlineKeyboardButton(text="🟧 Ozon", callback_data="mp:ozon"),
     ]])
 
