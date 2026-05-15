@@ -22,7 +22,7 @@ ONBOARDING_URL = "https://telegra.ph/Postavkinbot-bot-pomoshchnik-dlya-FBOFBW-po
 
 def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
+        [InlineKeyboardButton(text="📋 Мои поставки", callback_data="menu:ships")],
         [InlineKeyboardButton(text="☀ Утренняя сводка", callback_data="menu:digest")],
         [InlineKeyboardButton(text="📥 Возвраты", callback_data="menu:returns")],
         [InlineKeyboardButton(text="⚙ Настройки", callback_data="menu:settings")],
@@ -71,7 +71,7 @@ async def cb_forget_me_start(cb: CallbackQuery) -> None:
             n_fav = s.query(FavoriteCrossdockPoint).filter_by(user_id=tg_id).count()
         text = (
             "🗑 <b>Удалить твои данные?</b>\n\n"
-            f"• Заявки: {n_ships}\n• Ozon-каталог: {n_oz}\n"
+            f"• Поставки: {n_ships}\n• Ozon-каталог: {n_oz}\n"
             f"• WB-каталог: {n_wb}\n• Точки кроссдока: {n_fav}\n"
             f"• API-ключи и подсказки\n\n<b>Это необратимо.</b>"
         )
@@ -85,9 +85,9 @@ async def cb_forget_me_start(cb: CallbackQuery) -> None:
 _MAIN_TEXT = (
     "👋 <b>Бот-помощник по поставкам Ozon FBO</b>\n\n"
     "<b>Как пользоваться:</b>\n"
-    "1. Кидаешь .xlsx-выгрузку по кластеру → бот создаёт <b>заявку</b>\n"
-    "2. Тапаешь по заявке → планируешь даты\n"
-    "3. Бот ищет слоты и сам бронирует поставки в ЛК Ozon\n\n"
+    "1. Кидаешь .xlsx-выгрузку по кластеру → бот создаёт <b>поставку</b>\n"
+    "2. Тапаешь по поставке → планируешь даты\n"
+    "3. Бот ищет слоты и сам бронирует в ЛК Ozon\n\n"
     "👇 Выбери действие:"
 )
 
@@ -95,11 +95,11 @@ _MAIN_TEXT = (
 _HELP_TEXT = (
     "📚 <b>Справка</b>\n\n"
     "🚀 <b>Основной flow:</b>\n"
-    "1. Кидаешь .xlsx с Ozon → бот парсит и создаёт заявку.\n"
-    "2. Открываешь заявку через «📋 Мои заявки».\n"
+    "1. Кидаешь .xlsx с Ozon → бот парсит и создаёт поставку.\n"
+    "2. Открываешь поставку через «📋 Мои поставки».\n"
     "3. Планируешь даты и часы отгрузки.\n"
-    "4. «Создать поставку» → бот через API бронирует слоты в Ozon ЛК.\n"
-    "5. Кнопка «📤 ТЗ xlsx» в карточке заявки — генерирует ТЗ Отгрузки для ФФ.\n\n"
+    "4. «Забронировать слоты» → бот через API бронирует в Ozon ЛК.\n"
+    "5. Кнопка «📤 ТЗ xlsx» в карточке поставки — генерирует ТЗ Отгрузки для ФФ.\n\n"
     "⚙ <b>Настройки</b>:\n"
     "  📑 Данные о товарах — упаковка/примечание, попадает в ТЗ.\n"
     "  ⭐ Точки кроссдока — избранные drop-off хабы.\n"
@@ -326,7 +326,7 @@ async def cmd_forget_me(msg: Message) -> None:
     text = (
         "🗑 <b>Удалить твои данные?</b>\n\n"
         f"Будет стёрто:\n"
-        f"• Заявки: {n_ships}\n"
+        f"• Поставки: {n_ships}\n"
         f"• Ozon-каталог: {n_oz}\n"
         f"• WB-каталог: {n_wb}\n"
         f"• Любимые точки кроссдока: {n_fav}\n"
@@ -387,7 +387,7 @@ async def cmd_admin_stats(msg: Message) -> None:
         "👤 <b>Админ-статистика</b>\n\n"
         f"Всего юзеров: <b>{total_users}</b>\n"
         f"Onboarded (есть Ozon-ключи): <b>{onboarded}</b>\n"
-        f"Заявок всего: <b>{ships_total}</b>\n"
-        f"Заявок за 7д: <b>{active_7d}</b>\n"
+        f"Поставок всего: <b>{ships_total}</b>\n"
+        f"Поставок за 7д: <b>{active_7d}</b>\n"
     )
     await msg.answer(text)

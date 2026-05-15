@@ -391,7 +391,9 @@ async def collect_acts_awaiting(oz: OzonClient) -> Tuple[List[ActAwaitingItem], 
                 state = str(o.get("state") or "")
                 if state not in ("REPORTS_CONFIRMATION_AWAITING", "REPORT_REJECTED"):
                     continue
-                drop = o.get("dropoff_warehouse") or {}
+                # API использует drop_off_warehouse (с подчёркиваниями),
+                # не dropoff_warehouse — раньше был баг, имя склада → "?".
+                drop = o.get("drop_off_warehouse") or o.get("dropoff_warehouse") or {}
                 out.append(ActAwaitingItem(
                     order_id=int(o.get("order_id") or 0),
                     order_number=str(o.get("order_number") or ""),

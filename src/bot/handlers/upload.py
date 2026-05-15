@@ -356,7 +356,7 @@ async def _handle_wide_ship_file(msg, state: FSMContext, path: Path, fname: str)
         unm = f" ⚠ {len(result.unmatched_articles)} без SKU" if result.unmatched_articles else ""
         lines.append(f"  • {cl}: {result.matched} SKU{unm}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"ship_open:{rid}")],
+        [InlineKeyboardButton(text="📋 Открыть поставку", callback_data=f"ship_open:{rid}")],
         [InlineKeyboardButton(text="📋 Все заявки", callback_data="menu:ships")],
     ])
     await msg.answer("\n".join(lines), reply_markup=kb)

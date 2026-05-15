@@ -380,7 +380,7 @@ async def cb_ozon_book_from_card(cb: CallbackQuery, state: FSMContext) -> None:
     mode = parts[2] if len(parts) >= 3 else "direct"
     if not _wizard_acquire(rid):
         await cb.answer(
-            f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения.",
+            f"⏳ Ozon-мастер для поставки #{rid} уже запущен. Подожди завершения.",
             show_alert=True,
         )
         return
@@ -416,7 +416,7 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
     mode = parts[2] if len(parts) >= 3 else "direct"
     if not _wizard_acquire(rid):
         await cb.answer(
-            f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения.",
+            f"⏳ Ozon-мастер для поставки #{rid} уже запущен. Подожди завершения.",
             show_alert=True,
         )
         return
@@ -454,7 +454,7 @@ async def _start_ozon_book_wizard(
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await msg.answer(f"Заявка #{rid} не найдена.")
+            await msg.answer(f"Поставка #{rid} не найдена.")
             return False
         if not req.target_date_from:
             # Не команда «Сначала /ship_plan» — а сразу инлайн-кнопка

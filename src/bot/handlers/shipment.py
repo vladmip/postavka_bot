@@ -180,7 +180,7 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
             label = f"{emoji} #{r.id} [{_compute_display_label(r)}] · {cluster_part} · {date_s}"
             bucket.append(InlineKeyboardButton(text=label[:55], callback_data=f"ship_open:{r.id}"))
 
-    new_btn = InlineKeyboardButton(text="➕ Новая заявка (шаблон xlsx)",
+    new_btn = InlineKeyboardButton(text="➕ Новая поставка (шаблон xlsx)",
                                    callback_data="ship_new_template")
     if not total:
         text = "🚚 <b>Заявки на отгрузку</b>\n\nОткрытых заявок нет.\n\n📎 Кинь .xlsx-выгрузку или скачай шаблон ниже."
@@ -201,7 +201,7 @@ async def _render_ship_list(target: Message, *, edit: bool = False) -> None:
             lines.append(f"🟡 <b>Смешанные</b> ({len(mix_rows)})")
             rows.extend([[b] for b in mix_rows])
         lines.append("\n📎 Кинь .xlsx — добавить ещё")
-        rows.append([InlineKeyboardButton(text="🗑 Удалить заявки",
+        rows.append([InlineKeyboardButton(text="🗑 Удалить поставки",
                                           callback_data="ships_delete_picker")])
         rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -226,7 +226,7 @@ async def cmd_ship_show(msg: Message, command: CommandObject) -> None:
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await msg.answer(f"Заявка #{rid} не найдена.")
+            await msg.answer(f"Поставка #{rid} не найдена.")
             return
         text, kb = _render_request_card(req)
     await msg.answer(text, reply_markup=kb)
@@ -245,7 +245,7 @@ def _render_request_card(req) -> tuple:
     has_wb = any(it.marketplace == "wb" for it in req.items)
 
     text = (
-        f"📦 <b>Заявка #{req.id}</b> [{_compute_display_label(req)}]\n"
+        f"📦 <b>Поставка #{req.id}</b> [{_compute_display_label(req)}]\n"
         f"Создана: {req.created_at:%Y-%m-%d %H:%M}\n"
         f"Файлов: {len(files)}\n\n"
         f"<b>Распределение:</b>\n{summary}"
@@ -441,7 +441,7 @@ async def handle_ship_document(msg: Message, state: FSMContext, stored_path: Pat
         return
 
     # Спросим: новую или к существующей?
-    rows = [[InlineKeyboardButton(text="➕ Новая заявка", callback_data="ship_new")]]
+    rows = [[InlineKeyboardButton(text="➕ Новая поставка", callback_data="ship_new")]]
     for rid, rstate, n_items in open_summaries:
         rows.append([InlineKeyboardButton(
             text=f"➤ #{rid} ({n_items} строк, {rstate})",
@@ -450,7 +450,7 @@ async def handle_ship_document(msg: Message, state: FSMContext, stored_path: Pat
     rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="cancel")])
     await state.set_state(ShipPick.pick_request)
     await msg.answer(
-        "К какой заявке привязать?",
+        "К какой поставке привязать?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -489,7 +489,7 @@ async def cb_ship_new(cb: CallbackQuery, state: FSMContext) -> None:
     if cb.message:
         await _send_attach_result(
             cb.message, rid, result,
-            header=f"✅ Создана новая заявка #{rid}",
+            header=f"✅ Создана новая поставка #{rid}",
         )
 
 
@@ -514,7 +514,7 @@ async def cb_ship_attach(cb: CallbackQuery, state: FSMContext) -> None:
     if cb.message:
         await _send_attach_result(
             cb.message, rid, result,
-            header=f"✅ Привязано к заявке #{rid}",
+            header=f"✅ Привязано к поставке #{rid}",
         )
 
 
@@ -533,7 +533,7 @@ async def _send_attach_result(
         lines.append(header)
         lines.append("")
     lines.append(
-        f"📦 Заявка #{rid} — добавлено <b>{result.items_added}</b> строк "
+        f"📦 Поставка #{rid} — добавлено <b>{result.items_added}</b> строк "
         f"({result.cluster} / {result.marketplace.upper()})"
     )
     lines.append(f"✅ В каталоге: {result.matched}")
@@ -545,7 +545,7 @@ async def _send_attach_result(
             lines.append(f"  …ещё {len(result.unmatched_articles) - 15}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"ship_open:{rid}")],
+        [InlineKeyboardButton(text="📋 Открыть поставку", callback_data=f"ship_open:{rid}")],
         [InlineKeyboardButton(text="📎 Привязать ещё файл", callback_data="ship_more")],
     ])
     # До ~15 unmatched-строк × ~30 симв ≈ <1000 символов — гарантированно влезает.
@@ -607,12 +607,12 @@ async def cb_ship_new_template(cb: CallbackQuery) -> None:
             ).count()
         from aiogram.types import BufferedInputFile
         await cb.message.answer_document(
-            BufferedInputFile(data, filename="Новая_заявка_шаблон.xlsx"),
+            BufferedInputFile(data, filename="Новая_поставка_шаблон.xlsx"),
             caption=(
-                f"📋 <b>Шаблон новой заявки</b>\n\n"
+                f"📋 <b>Шаблон новой поставки</b>\n\n"
                 f"Артикулов: <b>{n_products}</b>, кластеров: <b>{len(cluster_names)}</b>.\n"
                 "Заполни количество в нужных кластерах и пришли файл обратно — "
-                "бот создаст одну заявку со всеми направлениями.\n\n"
+                "бот создаст одну поставку со всеми направлениями.\n\n"
                 "<i>Пустые ячейки и нули игнорируются.</i>"
             ),
         )
@@ -746,7 +746,7 @@ async def cb_clear_drafts(cb: CallbackQuery) -> None:
     if deleted_rids:
         summary.append(f"   #{', #'.join(str(x) for x in deleted_rids[:30])}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Мои заявки", callback_data="menu:ships")],
+        [InlineKeyboardButton(text="📋 Мои поставки", callback_data="menu:ships")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
     ])
     try:
@@ -868,7 +868,7 @@ async def _create_zip_together_request(
         header_extra = f" · {label}"
     await progress_start(
         msg, state,
-        f"📋 Создана единая заявка <b>#{rid}</b>{header_extra} на {len(paths)} файлов.",
+        f"📋 Создана единая поставка <b>#{rid}</b>{header_extra} на {len(paths)} файлов.",
     )
     ok, errs = 0, 0
     for path in paths:
@@ -910,7 +910,7 @@ async def _ask_ozon_type_for_new(msg: Message, state: FSMContext, *, header: str
     ]
     await state.set_state(ShipNewType.pick_otype)
     await msg.answer(
-        f"{header}\n\n<b>Тип поставки Ozon?</b>\nЗафиксируется навсегда для этой заявки.",
+        f"{header}\n\n<b>Тип поставки Ozon?</b>\nЗафиксируется навсегда для этой поставки.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -926,7 +926,7 @@ async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
     if code == "x":
         await cb.answer("Отменено")
         if cb.message:
-            await safe_edit_or_answer(cb.message, "✖ Создание заявки отменено.")
+            await safe_edit_or_answer(cb.message, "✖ Создание поставки отменено.")
         return
 
     otype = "direct" if code == "d" else "cross"
@@ -950,7 +950,7 @@ async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
             rid = req.id
         await _send_attach_result(
             cb.message, rid, result,
-            header=f"✅ Создана заявка <b>#{rid}</b> · {label}",
+            header=f"✅ Создана поставка <b>#{rid}</b> · {label}",
         )
         return
 
@@ -990,7 +990,7 @@ async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
         if not _wizard_acquire(rid):
             if cb.message:
                 await cb.message.answer(
-                    f"⏳ Ozon-мастер для заявки #{rid} уже запущен. Подожди завершения."
+                    f"⏳ Ozon-мастер для поставки #{rid} уже запущен. Подожди завершения."
                 )
             return
         if cb.message:
@@ -1022,7 +1022,7 @@ async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
     ])
     await safe_edit_or_answer(
         cb.message,
-        f"📦 <b>Заявка #{rid}</b>\n\n"
+        f"📦 <b>Поставка #{rid}</b>\n\n"
         "Как будешь грузить эту поставку?\n\n"
         "<b>📦 Коробами</b> — каждый короб опишется отдельно (короб № → SKU → qty).\n"
         "<b>🏗 Паллетами</b> — палеты с описью (палет № → SKU → qty).\n\n"
@@ -1104,7 +1104,7 @@ async def _render_ship_delete_picker(target: Message, state: FSMContext, *, edit
     rows.append([InlineKeyboardButton(text="◀ К списку", callback_data="delcancel")])
     text = (
         "🗑 <b>Удаление заявок</b>\n\n"
-        f"Тапни на заявку чтобы отметить её. Выбрано: <b>{len(picks)}</b>.\n\n"
+        f"Тапни на поставку чтобы отметить её. Выбрано: <b>{len(picks)}</b>.\n\n"
         "При удалении: связанные Ozon-поставки <b>отменяются в ЛК через API</b>, "
         "потом заявка стирается из бота. Поставки в продвинутых статусах "
         "(в пути, принято) бот трогать не будет."
@@ -1199,7 +1199,7 @@ async def cb_ship_more(cb: CallbackQuery) -> None:
         ])
         await safe_edit_or_answer(
             cb.message,
-            "📎 Кинь следующий xlsx-файл выгрузки — добавлю в текущую заявку "
+            "📎 Кинь следующий xlsx-файл выгрузки — добавлю в текущую поставку "
             "или создам новую.",
             reply_markup=kb,
         )
@@ -1240,7 +1240,7 @@ async def _start_plan_wizard(
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await msg.answer(f"Заявка #{rid} не найдена.")
+            await msg.answer(f"Поставка #{rid} не найдена.")
             return
         n_items = len(req.items)
         directions = sorted({(it.marketplace, it.cluster) for it in req.items})
@@ -1266,7 +1266,7 @@ async def _start_plan_wizard(
         ship_plan_crossdock={},
     )
     text = (
-        f"🛠 <b>Планирование заявки #{rid}</b> ({n_items} строк, {len(directions)} направлений)\n\n"
+        f"🛠 <b>Планирование поставки #{rid}</b> ({n_items} строк, {len(directions)} направлений)\n\n"
         f"📅 <b>Шаг 1/2.</b> Выбери целевые даты отгрузки (тапом):"
     )
     if preselected:
@@ -1427,7 +1427,7 @@ async def _finalize_plan_with_hours(
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await cb.answer("Заявка не найдена", show_alert=True)
+            await cb.answer("Поставка не найдена", show_alert=True)
             return
         req.target_date_from = _dt.fromisoformat(d_from.isoformat())
         req.target_date_to = _dt.fromisoformat(d_to.isoformat()) if d_to else None
@@ -1623,10 +1623,10 @@ async def _run_hunt(msg: Message, rid: int) -> None:
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await msg.answer(f"Заявка #{rid} не найдена.")
+            await msg.answer(f"Поставка #{rid} не найдена.")
             return
         if req.state not in {"planning", "slot_searching", "draft"}:
-            await msg.answer(f"Заявка #{rid} в состоянии [{_state_label(req.state)}] — разведка не нужна.")
+            await msg.answer(f"Поставка #{rid} в состоянии [{_state_label(req.state)}] — разведка не нужна.")
             return
 
         # Целевые даты
@@ -1654,7 +1654,7 @@ async def _run_hunt(msg: Message, rid: int) -> None:
             req.state = "slot_searching"
 
     if not target_dates:
-        await msg.answer("⚠ У заявки не указаны целевые даты — пройди /ship_plan сначала.")
+        await msg.answer("⚠ У поставки не указаны целевые даты — пройди /ship_plan сначала.")
         return
 
     await msg.answer(
@@ -1738,7 +1738,7 @@ async def cb_book_placeholder(cb: CallbackQuery) -> None:
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await cb.answer("Заявка не найдена", show_alert=True)
+            await cb.answer("Поставка не найдена", show_alert=True)
             return
         affected = 0
         for it in req.items:
@@ -1757,7 +1757,7 @@ async def cb_book_placeholder(cb: CallbackQuery) -> None:
             url = "https://seller.wildberries.ru/supplies-management/all-supplies"
             rows = [
                 [InlineKeyboardButton(text="🌐 Открыть WB ЛК → Поставки", url=url)],
-                [InlineKeyboardButton(text="📋 Карточка заявки", callback_data=f"ship_open:{rid}")],
+                [InlineKeyboardButton(text="📋 Карточка поставки", callback_data=f"ship_open:{rid}")],
             ]
             await cb.message.answer(
                 f"📌 Сохранил выбор WB (склад id={wid_s}, дата {ds}).\n"
@@ -1903,7 +1903,7 @@ async def cb_ship_items(cb: CallbackQuery) -> None:
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await cb.message.answer(f"Заявка #{rid} не найдена.")
+            await cb.message.answer(f"Поставка #{rid} не найдена.")
             return
         # Группируем: (marketplace, cluster) → [(article, qty, booked_supply_id, target_warehouse)]
         groups: Dict[Tuple[str, str], List[Tuple]] = {}
@@ -1989,7 +1989,7 @@ async def _send_ship_tz(msg: Message, rid: int) -> None:
     with db_session() as session:
         req = get_shipment_request(session, rid)
         if not req:
-            await msg.answer(f"Заявка #{rid} не найдена.")
+            await msg.answer(f"Поставка #{rid} не найдена.")
             return
         try:
             data = generate_ship_tz(req)
