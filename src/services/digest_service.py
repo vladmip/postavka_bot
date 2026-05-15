@@ -191,8 +191,9 @@ def _group_removals(rows: List[Dict[str, Any]]) -> List[RemovalGroup]:
         g["items_count"] += int(r.get("quantity_for_return") or 0)
         if delivery_iso:
             g["delivery_dates"].append(delivery_iso)
-        if len(g["sample_offer_ids"]) < 3 and r.get("offer_id"):
-            g["sample_offer_ids"].append(r["offer_id"])
+        oid = r.get("offer_id")
+        if oid and oid not in g["sample_offer_ids"] and len(g["sample_offer_ids"]) < 3:
+            g["sample_offer_ids"].append(oid)
     out: List[RemovalGroup] = []
     for g in groups.values():
         # Самая близкая дата прибытия (если несколько — берём самую раннюю
@@ -224,18 +225,25 @@ async def collect_sales_and_stocks(
     errors: List[str] = []
     by_sku: Dict[int, Dict[str, Any]] = {}
 
-    # 1. Остатки FBO (агрегируем present по всем складам)
+    # 1. Остатки FBO. /v4/product/info/stocks возвращает items с подсписком
+    # stocks[{type: fbo|fbs|rfbs, present, sku, ...}]. SKU привязан к подсписку,
+    # а НЕ к item верхнего уровня — там только offer_id/product_id. Раньше брал
+    # product_id, ключ не совпадал с posting.products[].sku → by_sku пустой.
     try:
         stocks = await oz.stocks_fbo(limit=5000)
         for it in stocks:
-            sku_val = it.get("sku") or it.get("product_id")
+            inner = it.get("stocks") or []
+            fbo_entries = [s for s in inner if (s.get("type") == "fbo")]
+            if not fbo_entries:
+                continue
+            sku_val = fbo_entries[0].get("sku")
             if not sku_val:
                 continue
             try:
                 sku = int(sku_val)
             except (ValueError, TypeError):
                 continue
-            present = sum(int(s.get("present") or 0) for s in (it.get("stocks") or []))
+            present = sum(int(s.get("present") or 0) for s in fbo_entries)
             entry = by_sku.setdefault(sku, {
                 "stock": 0, "sold_7d": 0, "sold_28d": 0,
                 "name": it.get("name") or "", "offer_id": it.get("offer_id") or "",
@@ -380,8 +388,9 @@ def _fmt_removal_group(g: "RemovalGroup") -> str:
     )
     addr_part = ""
     if g.warehouse_address:
-        addr_short = g.warehouse_address[:60]
-        addr_part = f"\n     <i>{addr_short}</i>"
+        # Полный адрес — юзеру нужно знать куда ехать. 60 символов было мало,
+        # обрезалось посреди фразы («городской округ Домодедово, дере…»).
+        addr_part = f"\n     <i>{g.warehouse_address}</i>"
     return (
         f"{icon} <b>{g.warehouse_name}</b> — {g.box_count} кор., "
         f"{g.items_count} шт{when_part}{sample}{addr_part}"
