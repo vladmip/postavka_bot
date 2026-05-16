@@ -351,22 +351,23 @@ async def collect_sales_and_stocks(
             "to_ship": 0,  # вычислим ниже из ads * coverage − stock
             "worst_grade": None,
         })
-        # Total stock = на складе + в пути к складу + возвраты в пути от клиентов.
-        # `requested_stock_count` от Ozon — это «срочный» дефицит без 56д
-        # горизонта (в ЛК «Рекомендации к поставке на 56 дн» — другой алгоритм
-        # внутри Ozon фронтенда, в Seller API не публикуется). Поэтому считаем
-        # сами: ads × TARGET_COVERAGE_DAYS − total_stock. Это всё ещё точнее
-        # самописного по postings, потому что ads уже учитывает выкупаемость/OOS.
-        entry["stock_total"] += int(it.get("valid_stock_count") or 0)
+        # Структура /v1/analytics/stocks (эмпирически):
+        #   ads, idc, turnover_grade — ГЛОБАЛЬНЫЕ значения по SKU (продублированы
+        #       в каждый cluster-row). Берём из ПЕРВОГО row, остальные пропускаем.
+        #   available_stock_count — per-warehouse факт. остаток (суммируем).
+        #   valid_stock_count = «свободный к продаже», часто 0 у живых SKU (за
+        #       вычетом резервов/брака) — не подходит для total_stock.
+        #   transit_stock_count — в пути к складу. return_from_customer_stock_count
+        #       — возвраты в пути от клиентов. Эти per-warehouse, суммируем.
+        entry["stock_total"] += int(it.get("available_stock_count") or 0)
         entry["stock_total"] += int(it.get("transit_stock_count") or 0)
         entry["stock_total"] += int(it.get("return_from_customer_stock_count") or 0)
         ads = it.get("ads")
-        if isinstance(ads, (int, float)):
-            entry["rate"] += float(ads)
+        if isinstance(ads, (int, float)) and entry["rate"] == 0.0:
+            entry["rate"] = float(ads)
         idc = it.get("idc")
-        if isinstance(idc, (int, float)) and idc > 0:
-            if entry["idc_min"] is None or idc < entry["idc_min"]:
-                entry["idc_min"] = float(idc)
+        if isinstance(idc, (int, float)) and idc > 0 and entry["idc_min"] is None:
+            entry["idc_min"] = float(idc)
         grade = str(it.get("turnover_grade") or "").upper()
         if grade and grade in grade_priority:
             cur = entry["worst_grade"]
