@@ -474,7 +474,8 @@ async def collect_digest(oz: OzonClient) -> DigestData:
 
 def _fmt_removal_group(g: "RemovalGroup") -> str:
     """Одна группа вывоза для рендера в digest. Кружок:
-    🔴 — уже в ПВЗ (забрать!), 🟡 — в пути."""
+    🔴 — уже в ПВЗ (забрать!), 🟡 — в пути.
+    Артикулы НЕ показываем — юзеру важно куда ехать и сколько забрать."""
     icon = "🔴" if g.is_at_pvz else "🟡"
     state_prefix = "в ПВЗ" if g.is_at_pvz else "в пути"
     when_part = f" · {state_prefix}"
@@ -485,10 +486,6 @@ def _fmt_removal_group(g: "RemovalGroup") -> str:
             when_part = f" · {state_prefix}{suffix}{dt.strftime('%d.%m')}"
         except (ValueError, TypeError):
             pass
-    sample = (
-        f" · <code>{','.join(g.sample_offer_ids)}</code>"
-        if g.sample_offer_ids else ""
-    )
     addr_part = ""
     if g.warehouse_address:
         # Полный адрес — юзеру нужно знать куда ехать. 60 символов было мало,
@@ -496,7 +493,7 @@ def _fmt_removal_group(g: "RemovalGroup") -> str:
         addr_part = f"\n     <i>{g.warehouse_address}</i>"
     return (
         f"{icon} <b>{g.warehouse_name}</b> — {g.box_count} кор., "
-        f"{g.items_count} шт{when_part}{sample}{addr_part}"
+        f"{g.items_count} шт{when_part}{addr_part}"
     )
 
 
@@ -608,7 +605,8 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"  …и ещё {len(data.urgent) - TOP_URGENT_LIMIT} в очереди")
     lines.append("")
 
-    # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢
+    # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢. Без подзаголовков-секций:
+    # эмодзи слева у каждой строки уже сообщает «красная»/«жёлтая» зону.
     lines.append("⏳ <b>Кончатся</b> <i>(по продажам за 28 дней)</i>")
     if not data.runout:
         lines.append("ℹ Нет данных по продажам — добавь товары в каталог Ozon или жди заказов.")
@@ -616,20 +614,18 @@ def build_digest_text(data: DigestData) -> str:
         red = [l for l in data.runout if l.color == "🔴"]
         yellow = [l for l in data.runout if l.color == "🟡"]
         green = [l for l in data.runout if l.color == "🟢"]
-        if red:
-            lines.append(f"<b>🔴 &lt; {RUNOUT_RED_DAYS} дн</b> ({len(red)})")
-            for line in red[:TOP_RUNOUT_RED_LIMIT]:
-                lines.append(_fmt_sku_line(line))
-            if len(red) > TOP_RUNOUT_RED_LIMIT:
-                lines.append(f"  …и ещё {len(red) - TOP_RUNOUT_RED_LIMIT}")
-        if yellow:
-            lines.append(f"<b>🟡 {RUNOUT_RED_DAYS}–{RUNOUT_GREEN_DAYS} дн</b> ({len(yellow)})")
-            for line in yellow[:TOP_RUNOUT_YELLOW_LIMIT]:
-                lines.append(_fmt_sku_line(line))
-            if len(yellow) > TOP_RUNOUT_YELLOW_LIMIT:
-                lines.append(f"  …и ещё {len(yellow) - TOP_RUNOUT_YELLOW_LIMIT}")
+        shown_red = red[:TOP_RUNOUT_RED_LIMIT]
+        for line in shown_red:
+            lines.append(_fmt_sku_line(line))
+        if len(red) > TOP_RUNOUT_RED_LIMIT:
+            lines.append(f"  …и ещё 🔴 {len(red) - TOP_RUNOUT_RED_LIMIT}")
+        shown_yellow = yellow[:TOP_RUNOUT_YELLOW_LIMIT]
+        for line in shown_yellow:
+            lines.append(_fmt_sku_line(line))
+        if len(yellow) > TOP_RUNOUT_YELLOW_LIMIT:
+            lines.append(f"  …и ещё 🟡 {len(yellow) - TOP_RUNOUT_YELLOW_LIMIT}")
         if green:
-            lines.append(f"<b>🟢 &gt; {RUNOUT_GREEN_DAYS} дн</b>: {len(green)} SKU")
+            lines.append(f"🟢 ещё {len(green)} SKU с запасом &gt; {RUNOUT_GREEN_DAYS} дн")
 
     if data.errors:
         lines.append("")
