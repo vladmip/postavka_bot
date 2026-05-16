@@ -119,7 +119,6 @@ def parse_wide_ship_file(
         raise ValueError(
             "Неизвестные кластеры в шапке файла:\n  • "
             + "\n  • ".join(unknown)
-            + "\n\nДопустимые: " + ", ".join(sorted(_KNOWN_CLUSTERS))
         )
 
     by_cluster: dict = {name: [] for _, name in cluster_cols}
