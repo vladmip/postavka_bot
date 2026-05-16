@@ -64,13 +64,15 @@ async def send_digest_to_user(bot: Bot, chat_id: int) -> None:
 
     text = build_digest_text(data)
 
-    # PDF этикетка возвратов относится только к returns/giveouts (на ПВЗ).
-    # Removals — это вывозы со стока FBO, у них своя логистика, эта этикетка
-    # к ним не относится. Раньше PDF летел в чат даже когда нет actionable
-    # returns (есть только removals) и сбивал юзера.
+    # PDF этикетка нужна когда есть что забирать — это и возвраты на ПВЗ,
+    # и вывозы со стока FBO (их тоже забирают по той же этикетке партии).
+    # Если ничего нет — PDF не шлём (чтобы не плодить «пустую» бумажку).
     r = data.returns
-    has_returns_actionable = bool(r.total or r.giveouts_available or r.giveouts_at_pvz)
-    if data.returns.pdf_bytes and has_returns_actionable:
+    has_actionable = bool(
+        r.total or r.giveouts_available or r.giveouts_at_pvz
+        or r.removal_from_stock or r.removal_from_supply
+    )
+    if data.returns.pdf_bytes and has_actionable:
         try:
             file = BufferedInputFile(data.returns.pdf_bytes, filename="ozon_returns.pdf")
             await bot.send_document(
