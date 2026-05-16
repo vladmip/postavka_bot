@@ -3040,17 +3040,31 @@ async def _auto_poll_slots(
                     # < 120 сек — даём шанс, > — связка реально невалидна.
                     if "404" in err_s and "scoring" in err_s.lower():
                         age = _t.time() - (d.get("created_ts") or 0)
-                        if age < 120:
+                        if age < 180:
                             logger.info(
                                 "auto-poll: 404 scoring on fresh draft %s (age %.0fs) "
                                 "— ретрай в следующей итерации", d.get("draft_id"), age,
                             )
                             continue
+                        # Старый draft даёт 404 — пробуем пересоздать (даём 2-й шанс).
+                        # Если новый тоже 404 → действительно невалидно, остановка.
+                        logger.info(
+                            "auto-poll: 404 on %ds-old draft %d — try to recreate",
+                            int(age), d.get("draft_id"),
+                        )
+                        new_id = await _recreate_draft_for_auto_poll(oz, rid, d, tg_id or 0)
+                        if new_id:
+                            d["draft_id"] = new_id
+                            d["created_ts"] = _t.time()
+                            logger.info("auto-poll: draft recreated %d, ждём scoring",
+                                        new_id)
+                            await asyncio.sleep(30)  # scoring time
+                            continue
                         await bot.send_message(
                             chat_id,
-                            f"🛑 Авто-поиск #{rid} остановлен: 404 «scoring not found» "
-                            f"даже на старом draft'е ({age:.0f}с). Связка draft+склад "
-                            f"невалидна — пересоздай через карточку заявки."
+                            f"🛑 Авто-поиск #{rid} ({d.get('cluster','?')}) остановлен: "
+                            f"draft невалиден ({int(age)}с, не получилось пересоздать). "
+                            f"Пересоздай через карточку заявки."
                         )
                         logger.info("auto-poll stopped on 404 scoring: rid=%d age=%.0f",
                                     rid, age)
