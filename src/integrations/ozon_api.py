@@ -211,6 +211,34 @@ class OzonClient:
 
     # ── stocks ─────────────────────────────────────────────────────────────
 
+    async def analytics_stocks(
+        self,
+        skus: List[str],
+        *,
+        turnover_grades: Optional[List[str]] = None,
+        cluster_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """`POST /v1/analytics/stocks` — Ozon-аналитика по остаткам с уже
+        посчитанными метриками: ads (средние продажи/день), idc (дни покрытия),
+        requested_stock_count (рекомендация к поставке), excess_stock_count,
+        turnover_grade (DEFICIT/POPULAR/ACTUAL/SURPLUS/...).
+
+        Возвращает items per (sku, cluster) — один SKU может быть в нескольких
+        кластерах, agregуй на стороне caller'а если нужно.
+        Обновляется на стороне Ozon 2 раза в день (07:00 и 16:00 UTC).
+        Лимит 1-100 SKU за раз — caller сам бьёт пачки.
+        """
+        if not skus:
+            return []
+        payload: Dict[str, Any] = {
+            "skus": [str(s) for s in skus[:100]],
+            "turnover_grades": turnover_grades or [],
+        }
+        if cluster_ids:
+            payload["cluster_ids"] = [str(c) for c in cluster_ids]
+        data = await self._post("/v1/analytics/stocks", payload)
+        return data.get("items", []) or []
+
     async def stocks_fbo(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """Остатки FBO: /v4/product/info/stocks (с пагинацией через cursor)."""
         items: List[Dict[str, Any]] = []

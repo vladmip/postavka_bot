@@ -260,17 +260,24 @@ async def collect_sales_and_stocks(
     *,
     days_window: int = 28,
 ) -> Tuple[Dict[int, Dict[str, Any]], List[str]]:
-    """Тянет stocks_fbo + postings_fbo за `days_window` дней.
-
-    Возвращает: { sku: {stock, sold_7d, sold_28d, name, offer_id} } + список ошибок.
+    """Источник — `POST /v1/analytics/stocks`. Ozon уже сам считает с учётом
+    выкупаемости / OOS-мультипликатора / сезонности (см. data/screenshots/
+    «принцип работы.txt»). Берём готовые метрики и агрегируем по SKU из всех
+    кластеров:
+        ads_total          — сумма ads по всем кластерам ≈ продажи/день суммарно
+        idc_min            — самый «горячий» кластер (быстрее закончится)
+        stock_total        — суммарный valid_stock_count
+        requested_total    — сумма requested_stock_count = рекомендация Ozon
+        worst_grade        — самая «красная» категория среди кластеров
+    Возвращает: { sku: {stock, rate, days_left, to_ship, grade, name, offer_id} }.
     """
     errors: List[str] = []
     by_sku: Dict[int, Dict[str, Any]] = {}
 
-    # 1. Остатки FBO. /v4/product/info/stocks возвращает items с подсписком
-    # stocks[{type: fbo|fbs|rfbs, present, sku, ...}]. SKU привязан к подсписку,
-    # а НЕ к item верхнего уровня — там только offer_id/product_id. Раньше брал
-    # product_id, ключ не совпадал с posting.products[].sku → by_sku пустой.
+    # 1. Список SKU + имена/offer_id берём из stocks_fbo — analytics/stocks
+    # требует skus[] и не возвращает offer_id если в SKU нечего.
+    sku_to_meta: Dict[int, Dict[str, str]] = {}
+    sku_to_present: Dict[int, int] = {}
     try:
         stocks = await oz.stocks_fbo(limit=5000)
         for it in stocks:
@@ -285,108 +292,146 @@ async def collect_sales_and_stocks(
                 sku = int(sku_val)
             except (ValueError, TypeError):
                 continue
-            present = sum(int(s.get("present") or 0) for s in fbo_entries)
-            entry = by_sku.setdefault(sku, {
-                "stock": 0, "sold_7d": 0, "sold_28d": 0,
-                "name": it.get("name") or "", "offer_id": it.get("offer_id") or "",
-            })
-            entry["stock"] = present
-            if it.get("name"):
-                entry["name"] = it["name"]
-            if it.get("offer_id"):
-                entry["offer_id"] = it["offer_id"]
+            sku_to_meta[sku] = {
+                "name": it.get("name") or "",
+                "offer_id": it.get("offer_id") or "",
+            }
+            sku_to_present[sku] = sum(int(s.get("present") or 0) for s in fbo_entries)
     except OzonAPIError as e:
         logger.warning("stocks_fbo failed: %s", e)
         errors.append(f"stocks_fbo: {str(e)[:200]}")
 
-    # 2. Заказы FBO за окно
-    now = datetime.now(timezone.utc)
-    date_from = (now - timedelta(days=days_window)).strftime("%Y-%m-%dT00:00:00.000Z")
-    date_to = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    cutoff_7d = now - timedelta(days=7)
-
-    try:
-        postings = await oz.postings_fbo_list(date_from, date_to, max_total=20000)
-    except OzonAPIError as e:
-        logger.warning("postings_fbo_list failed: %s", e)
-        errors.append(f"postings_fbo_list: {str(e)[:200]}")
+    if not sku_to_meta:
         return by_sku, errors
 
-    for p in postings:
-        status = str(p.get("status") or "").lower()
-        if status == "cancelled":
-            continue
-        in_process = p.get("in_process_at") or ""
+    # 2. analytics_stocks по 100 SKU за раз. На каждый SKU несколько cluster-row.
+    all_items: List[Dict[str, Any]] = []
+    sku_list = list(sku_to_meta.keys())
+    chunk_size = 100
+    for i in range(0, len(sku_list), chunk_size):
+        chunk = [str(s) for s in sku_list[i:i + chunk_size]]
         try:
-            ts = datetime.fromisoformat(in_process.replace("Z", "+00:00"))
+            items = await oz.analytics_stocks(chunk)
+            all_items.extend(items)
+        except OzonAPIError as e:
+            logger.warning("analytics_stocks chunk %d failed: %s", i // chunk_size, e)
+            errors.append(f"analytics_stocks: {str(e)[:200]}")
+
+    # 3. Агрегация per SKU. Цветовая шкала Ozon → наша:
+    # DEFICIT (<28д ожидаемый запас), POPULAR (28-56д), ACTUAL (56-120д),
+    # SURPLUS (>120д), WAITING_FOR_SUPPLY (ждёт поставки от тебя),
+    # WAS_* — «был X недавно», NO_SALES/COLLECTING_DATA — пропускаем.
+    grade_priority = {
+        # Меньше = «хуже» = краснее
+        "DEFICIT": 0, "WAS_DEFICIT": 1,
+        "POPULAR": 2, "WAS_POPULAR": 3,
+        "WAITING_FOR_SUPPLY": 4,
+        "ACTUAL": 5, "WAS_ACTUAL": 6,
+        "SURPLUS": 7, "WAS_SURPLUS": 8,
+        "NO_SALES": 9, "WAS_NO_SALES": 10,
+        "RESTRICTED_NO_SALES": 11, "COLLECTING_DATA": 12,
+        "UNSPECIFIED": 99, "TURNOVER_GRADE_NONE": 99,
+    }
+
+    for it in all_items:
+        sku_val = it.get("sku")
+        if not sku_val:
+            continue
+        try:
+            sku = int(sku_val)
         except (ValueError, TypeError):
-            ts = None
-        is_recent = bool(ts and ts >= cutoff_7d)
-        for prod in p.get("products") or []:
-            sku_val = prod.get("sku")
-            if not sku_val:
-                continue
-            try:
-                sku = int(sku_val)
-            except (ValueError, TypeError):
-                continue
-            qty = int(prod.get("quantity") or 0)
-            if qty <= 0:
-                continue
-            entry = by_sku.setdefault(sku, {
-                "stock": 0, "sold_7d": 0, "sold_28d": 0,
-                "name": prod.get("name") or "", "offer_id": prod.get("offer_id") or "",
-            })
-            entry["sold_28d"] += qty
-            if is_recent:
-                entry["sold_7d"] += qty
-            if not entry["name"] and prod.get("name"):
-                entry["name"] = prod["name"]
-            if not entry["offer_id"] and prod.get("offer_id"):
-                entry["offer_id"] = prod["offer_id"]
+            continue
+        meta = sku_to_meta.get(sku, {})
+        entry = by_sku.setdefault(sku, {
+            "name": meta.get("name") or it.get("name") or "",
+            "offer_id": meta.get("offer_id") or it.get("offer_id") or "",
+            "stock_total": 0,
+            "rate": 0.0,
+            "idc_min": None,
+            "to_ship": 0,
+            "worst_grade": None,
+        })
+        entry["stock_total"] += int(it.get("valid_stock_count") or 0)
+        ads = it.get("ads")
+        if isinstance(ads, (int, float)):
+            entry["rate"] += float(ads)
+        idc = it.get("idc")
+        if isinstance(idc, (int, float)) and idc > 0:
+            if entry["idc_min"] is None or idc < entry["idc_min"]:
+                entry["idc_min"] = float(idc)
+        entry["to_ship"] += int(it.get("requested_stock_count") or 0)
+        grade = str(it.get("turnover_grade") or "").upper()
+        if grade and grade in grade_priority:
+            cur = entry["worst_grade"]
+            if cur is None or grade_priority[grade] < grade_priority.get(cur, 99):
+                entry["worst_grade"] = grade
+
+    # Если у SKU не было ни одной cluster-row с idc — берём текущий valid_stock
+    # как fallback (но days_left=inf, чтобы не попасть в urgent).
+    for sku, e in by_sku.items():
+        if e["stock_total"] == 0:
+            e["stock_total"] = sku_to_present.get(sku, 0)
 
     return by_sku, errors
 
 
 def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLine]:
-    """mode='urgent' → срочно отгрузить (по 7d-rate), 🔴 < 7д, 🟡 < 14д, остальное скрываем.
-                       Сортировка по to_ship_qty ↓ (что больше всего просит — наверху).
-    mode='runout' → когда кончится (по 28d-rate), 🔴 < 15д, 🟡 < 30д, 🟢 > 30д.
-                    Сортировка по days_left ↑ (что быстрее закончится — наверху).
-    Для обоих режимов to_ship_qty = ceil(rate * TARGET_COVERAGE_DAYS) − stock —
-    докинуть, чтобы покрыло заявленный период. Товары с stock=0 пропускаем."""
+    """Источник данных — `/v1/analytics/stocks` (см. collect_sales_and_stocks).
+
+    mode='urgent' — SKU с requested_stock_count > 0 (Ozon рекомендует докинуть).
+        Цвет по worst_grade: DEFICIT/WAS_DEFICIT → 🔴, POPULAR/WAS_POPULAR → 🟡.
+        Сортировка по to_ship ↓.
+    mode='runout' — остальные SKU с idc ≤ 30 (быстро закончится).
+        🔴 < 15д, 🟡 15-30д, 🟢 > 30д.
+        Сортировка по idc ↑.
+    SKU с WAITING_FOR_SUPPLY / NO_SALES / COLLECTING_DATA пропускаем — там
+    Ozon ещё не может посчитать, шум."""
+    skip_grades = {
+        "WAITING_FOR_SUPPLY", "NO_SALES", "WAS_NO_SALES",
+        "RESTRICTED_NO_SALES", "COLLECTING_DATA",
+        "UNSPECIFIED", "TURNOVER_GRADE_NONE",
+    }
+    red_grades = {"DEFICIT", "WAS_DEFICIT"}
+    yellow_grades = {"POPULAR", "WAS_POPULAR"}
+
     lines: List[SkuLine] = []
     for sku, e in by_sku.items():
-        stock = int(e.get("stock") or 0)
-        if stock <= 0:
-            continue  # уже закончилось — не «срочно», просто факт
+        stock = int(e.get("stock_total") or 0)
+        rate = float(e.get("rate") or 0.0)
+        idc = e.get("idc_min")
+        to_ship = int(e.get("to_ship") or 0)
+        grade = str(e.get("worst_grade") or "")
+
+        if grade in skip_grades and to_ship == 0:
+            continue
+
         if mode == "urgent":
-            sold = e.get("sold_7d") or 0
-            rate = sold / 7.0
-            if rate <= 0:
+            if to_ship <= 0:
                 continue
-            days_left = stock / rate if rate > 0 else float("inf")
-            if days_left < URGENT_RED_DAYS:
+            if grade in red_grades:
                 color = "🔴"
-            elif days_left < URGENT_YELLOW_DAYS:
+            elif grade in yellow_grades:
+                color = "🟡"
+            elif idc is not None and idc < URGENT_RED_DAYS:
+                color = "🔴"
+            elif idc is not None and idc < URGENT_YELLOW_DAYS:
                 color = "🟡"
             else:
-                continue
+                color = "🟡"  # дефолт для прочих с requested > 0
         else:  # runout
-            sold = e.get("sold_28d") or 0
-            rate = sold / 28.0
-            if rate <= 0:
+            if to_ship > 0:
+                # уже показали в urgent — не дублируем
                 continue
-            days_left = stock / rate if rate > 0 else float("inf")
-            if days_left < RUNOUT_RED_DAYS:
-                color = "🔴"
-            elif days_left <= RUNOUT_GREEN_DAYS:
-                color = "🟡"
-            else:
+            if idc is None or idc <= 0:
+                continue
+            if idc > RUNOUT_GREEN_DAYS:
                 color = "🟢"
-        # Покрытие на TARGET_COVERAGE_DAYS, ceil — лучше +1, чем «впритык».
-        target_qty = rate * TARGET_COVERAGE_DAYS
-        to_ship = max(0, int(-(-target_qty // 1)) - stock)
+            elif idc < RUNOUT_RED_DAYS:
+                color = "🔴"
+            else:
+                color = "🟡"
+
+        days_left = float(idc) if idc is not None else float("inf")
         lines.append(SkuLine(
             sku=sku,
             offer_id=str(e.get("offer_id") or ""),
@@ -397,8 +442,8 @@ def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLin
             color=color,
             to_ship_qty=to_ship,
         ))
+
     if mode == "urgent":
-        # Самые «голодные» (что больше всего просит докинуть) — наверху.
         lines.sort(key=lambda x: (-x.to_ship_qty, x.days_left))
     else:
         lines.sort(key=lambda x: x.days_left)
@@ -589,11 +634,13 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"  …и ещё {len(r.removal_from_supply) - 8} групп")
         lines.append("")
 
-    # Срочно отгрузить — топ-5 по объёму к отгрузке.
+    # Срочно отгрузить — топ-5 по требуемому количеству к отгрузке.
+    # Данные — `/v1/analytics/stocks` Ozon: ads/idc/requested_stock_count.
+    # Ozon уже посчитал с учётом выкупаемости, OOS-мультипликатора и сезонности.
     header_count = min(TOP_URGENT_LIMIT, len(data.urgent))
     lines.append(
         f"🔥 <b>Топ-{header_count} срочно отгрузить</b> "
-        f"<i>(по продажам за 7 дней, покрытие на {TARGET_COVERAGE_DAYS}д)</i>"
+        f"<i>(прогноз Ozon: выкупаемость + OOS + сезонность)</i>"
     )
     if not data.urgent:
         lines.append("✅ Запасов хватает — паника отменяется.")
@@ -606,10 +653,7 @@ def build_digest_text(data: DigestData) -> str:
 
     # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢. Без подзаголовков-секций:
     # эмодзи слева у каждой строки уже сообщает «красная»/«жёлтая» зону.
-    lines.append(
-        f"⏳ <b>Кончатся</b> "
-        f"<i>(по продажам за 28 дней, покрытие на {TARGET_COVERAGE_DAYS}д)</i>"
-    )
+    lines.append("⏳ <b>Кончатся</b> <i>(дни покрытия по прогнозу Ozon)</i>")
     if not data.runout:
         lines.append("ℹ Нет данных по продажам — добавь товары в каталог Ozon или жди заказов.")
     else:
