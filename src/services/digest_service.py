@@ -635,12 +635,14 @@ def build_digest_text(data: DigestData) -> str:
         lines.append("")
 
     # Срочно отгрузить — топ-5 по требуемому количеству к отгрузке.
-    # Данные — `/v1/analytics/stocks` Ozon: ads/idc/requested_stock_count.
-    # Ozon уже посчитал с учётом выкупаемости, OOS-мультипликатора и сезонности.
+    # Источник — `/v1/analytics/stocks` Ozon: ads (ср. продажи/день),
+    # idc (дни покрытия), requested_stock_count (рекомендация).
+    # Ozon учитывает наличие/заказы; сезонность отдельной аналитической
+    # системы (data.ozon) тут НЕ применяется — это другой сервис.
     header_count = min(TOP_URGENT_LIMIT, len(data.urgent))
     lines.append(
         f"🔥 <b>Топ-{header_count} срочно отгрузить</b> "
-        f"<i>(прогноз Ozon: выкупаемость + OOS + сезонность)</i>"
+        f"<i>(рекомендация Ozon из аналитики остатков)</i>"
     )
     if not data.urgent:
         lines.append("✅ Запасов хватает — паника отменяется.")
