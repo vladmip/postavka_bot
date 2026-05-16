@@ -388,16 +388,14 @@ async def collect_sales_and_stocks(
 def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLine]:
     """Источник данных — `/v1/analytics/stocks` (см. collect_sales_and_stocks).
 
-    mode='urgent' — SKU с requested_stock_count > 0 (Ozon рекомендует докинуть).
-        Цвет по worst_grade: DEFICIT/WAS_DEFICIT → 🔴, POPULAR/WAS_POPULAR → 🟡.
+    mode='urgent' — горящие: idc < 14д ИЛИ worst_grade ∈ DEFICIT/POPULAR.
         Сортировка по to_ship ↓.
-    mode='runout' — остальные SKU с idc ≤ 30 (быстро закончится).
-        🔴 < 15д, 🟡 15-30д, 🟢 > 30д.
+    mode='runout' — SKU с idc 14-30д (зона риска через 2-4 недели).
         Сортировка по idc ↑.
-    SKU с WAITING_FOR_SUPPLY / NO_SALES / COLLECTING_DATA пропускаем — там
-    Ozon ещё не может посчитать, шум."""
+    SKU с WAITING_FOR_SUPPLY / NO_SALES / COLLECTING_DATA пропускаем —
+    у них Ozon ещё не может посчитать `ads`, шум."""
     skip_grades = {
-        "WAITING_FOR_SUPPLY", "NO_SALES", "WAS_NO_SALES",
+        "NO_SALES", "WAS_NO_SALES",
         "RESTRICTED_NO_SALES", "COLLECTING_DATA",
         "UNSPECIFIED", "TURNOVER_GRADE_NONE",
     }
@@ -406,40 +404,32 @@ def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLin
 
     lines: List[SkuLine] = []
     for sku, e in by_sku.items():
-        stock = int(e.get("stock_total") or 0)
         rate = float(e.get("rate") or 0.0)
+        if rate <= 0:
+            continue
+        grade = str(e.get("worst_grade") or "")
+        if grade in skip_grades:
+            continue
+        stock = int(e.get("stock_total") or 0)
         idc = e.get("idc_min")
         to_ship = int(e.get("to_ship") or 0)
-        grade = str(e.get("worst_grade") or "")
 
-        if grade in skip_grades and to_ship == 0:
+        # Определяем зону. Urgent: красная/жёлтая по idc или grade.
+        # Runout: 14-30 дней покрытия (всё ещё надо думать о поставке).
+        if grade in red_grades or (idc is not None and idc < URGENT_RED_DAYS):
+            zone, color = "urgent", "🔴"
+        elif grade in yellow_grades or (idc is not None and idc < URGENT_YELLOW_DAYS):
+            zone, color = "urgent", "🟡"
+        elif idc is not None and idc <= RUNOUT_GREEN_DAYS:
+            zone = "runout"
+            color = "🔴" if idc < RUNOUT_RED_DAYS else "🟡"
+        elif idc is not None and idc > RUNOUT_GREEN_DAYS:
+            zone, color = "runout", "🟢"
+        else:
             continue
 
-        if mode == "urgent":
-            if to_ship <= 0:
-                continue
-            if grade in red_grades:
-                color = "🔴"
-            elif grade in yellow_grades:
-                color = "🟡"
-            elif idc is not None and idc < URGENT_RED_DAYS:
-                color = "🔴"
-            elif idc is not None and idc < URGENT_YELLOW_DAYS:
-                color = "🟡"
-            else:
-                color = "🟡"  # дефолт для прочих с requested > 0
-        else:  # runout
-            if to_ship > 0:
-                # уже показали в urgent — не дублируем
-                continue
-            if idc is None or idc <= 0:
-                continue
-            if idc > RUNOUT_GREEN_DAYS:
-                color = "🟢"
-            elif idc < RUNOUT_RED_DAYS:
-                color = "🔴"
-            else:
-                color = "🟡"
+        if zone != mode:
+            continue
 
         days_left = float(idc) if idc is not None else float("inf")
         lines.append(SkuLine(
