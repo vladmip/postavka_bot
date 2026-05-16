@@ -13,6 +13,106 @@
 
 ---
 
+## 2026-05-16 (13:30) — авто-брон Ozon финал: 3-кнопочный режим + auto-poll сам бронит + UX wizard
+
+Длинный спринт (~3 часа) — закончили Фазу 3 (auto-book) end-to-end, плюс полировка UX обычного wizard'а. **HEAD `7ceb0d6` — стабильная рабочая версия на проде.**
+
+### Что готово (полный flow)
+
+**Создание поставки (новый UX):**
+1. Юзер кидает xlsx → бот парсит.
+2. **Спрашивает тип Ozon** (Прямая / Кросс-докинг) ДО создания заявки.
+3. Создаётся ShipmentRequest с типом, открывается карточка.
+4. Юзер жмёт `🛠 Спланировать даты` → picker дат + picker часов.
+5. **После часов** — 3 inline-кнопки:
+   - `🎯 В одну дату` — найти best_date с макс. кластеров, бронить любое время.
+   - `🎯 В одно время` — best_date + best_hour (синхрон).
+   - `🛠 Ручной` — обычный wizard.
+6. После выбора — auto_book_mode сохраняется в БД (виден в карточке).
+
+**Авто-брон pipeline (🎯):**
+- Создаёт draft per кластер с пауза 8с между (Ozon /v2/draft/create/info per-second limit).
+- Ждёт scoring (5 попыток × 3с — для DIRECT, top-1 wh из FULL_AVAILABLE).
+- Дёргает draft_timeslot_info с диапазоном дат.
+- `find_best_common_date` (auto_book.py) — выбирает оптимальную.
+- Сразу bulk-book: для каждого кластера со слотом на best_date → `_book_one_slot`.
+- Для кластеров **без** слота на best_date → spawn `_auto_poll_slots` с `auto_book=True`.
+
+**Auto-poll auto-book режим:**
+- Каждые 60с дёргает timeslot/info для каждого draft.
+- При нахождении слота → `_silent_book_slot` (упрощённый без state/UI) бронит сам.
+- Шлёт «🔔 Авто-брон #N: Самара забронирована! 📌 21.05 18:00».
+- Через 60 мин если ничего не нашлось — «😔 за час не сложилось».
+- Recovery: на 404 «scoring not found» >180с — пробуем пересоздать draft.
+
+**CROSSDOCK особенности:**
+- При `🎯 В одну дату` для CROSSDOCK без drop-off в БД → **сразу** перекидываем в карточку поставки (без промежуточного сообщения). Юзер кликает обычный «🚛 Создать поставку Ozon», проходит drop-off picker → drop-off сохраняется в БД через `_ask_dropoff_for_next_cluster` (commit a1e8268).
+- При повторном клике `🎯` — уже работает.
+
+**UX wizard'а (обычного, не auto):**
+- «draft» / «scoring» → «расчёт» / «Ozon считает варианты».
+- Между попытками scoring — чёткие строки «попытка X/4: Ozon ещё считает. Жду Yс до попытки X+1/4».
+- В финале: «❌ Не удалось за 4 попытки. 🔄 Перехожу к следующему кластеру».
+- Bulk-book заголовок: «X из Y (ещё Z в авто-поиске)».
+- Bulk-book финал: «✅ Забронировано X/Y · ⏳ Z ищу слот ещё час».
+- Failed-scoring кластеры явно в finale.
+- Пауза между кластерами 60→5с (rate-limit Ozon 2 req/sec).
+
+### Файлы (новые/изменённые)
+
+**Новые:**
+- `src/services/auto_book.py` (185 строк) — `find_best_common_date`, `parse_timeslot_response`, `clusters_with_slots_on`, `pick_earliest_slot`, `date_options_summary`.
+- `tests/test_auto_book.py` (166 строк, 14 unit-тестов, все зелёные).
+- `alembic/versions/a92f1c5d7e84_add_auto_book_mode.py` — миграция.
+
+**Изменённые:**
+- `src/db/models.py` — `ShipmentRequest.auto_book_mode VARCHAR(8) NULLABLE`.
+- `src/bot/handlers/ozon_book.py` (+~900 строк): `cb_obauto`, `_auto_book_explore`, `_auto_run_bulk`, `_silent_book_slot`, `_spawn_auto_poll_for_best_date`, `cb_obauto_book_day`, `cb_obauto_book_hour`. UX wizard'а — пересмотр текстов.
+- `src/bot/handlers/shipment.py` — кнопка `🎯` (потом убрана из карточки), 3-кнопочный экран после ship_plan, `kind="wide"` в `cb_up_otype`, drop-off в БД.
+- `src/bot/handlers/upload.py` — `_handle_wide_ship_file` спрашивает тип ДО create_shipment_request.
+- `src/integrations/ozon_api.py` — добавлен метод `analytics_stocks` (для digest, не auto-book).
+
+### Статус
+- HEAD: `7ceb0d6` на проде через NL-прокси.
+- Бот active, NRestarts стабильно 0.
+- 17 unit-тестов passed (14 новых + 3 старых).
+- Telegram через прокси `socks5://...@168.80.80.109:8000` (NL, аренда на неделю — закончится ~22.05).
+
+### Open issues / следующие задачи
+
+1. **Параллелизация авто-брон** (юзер очень хочет, обсуждали детально):
+   - Сейчас `for cl in clusters` синхронно: 4 кластера × ~3 мин = ~12 мин.
+   - Параллельно через `asyncio.gather` + semaphore(2) для draft_create: ~4 мин.
+   - Реализуемо в `_auto_book_explore`. ~150 строк. **Главная следующая задача.**
+
+2. **Multi-drop-off fallback для CROSSDOCK** (после параллелизации):
+   - Сейчас auto-poll сидит на одной точке кросс-дока (Щербинка). Если не даёт слотов → ничего.
+   - Юзер выбирает 2-3 «точки кросс-докинга» (НЕ «drop-off» в UI — переименовать!).
+   - Бот перебирает их при провале. С параллелизацией: ~9 мин на 4 кластера × 3 точки.
+
+3. **Переименование UI**: «drop-off» → «точка кросс-докинга». Юзер: «дроп-офф это не так называется».
+   - Файлы: `ozon_book.py` (_ask_dropoff_for_next_cluster), `favorites.py`, `auto_book` messages.
+   - В **коде** оставить `drop_off_*` (это термин Ozon API).
+
+4. **Multi-warehouse fallback для DIRECT auto-poll**:
+   - Сейчас auto-poll бьёт в один wh_id. Если 404 → ждёт час впустую.
+   - Сделать топ-3 wh из scoring. ~40-60 строк.
+
+5. **Pre-check ассортимента** (low priority):
+   - `/v1/analytics/stocks` per-cluster данные → знать заранее что SKU не торгуется в кластере.
+   - Не создавать заведомо мёртвые drafts.
+
+6. **Smart-selection точек кросс-дока** (после сбора истории):
+   - Логировать (drop_off, cluster) → success/fail.
+   - Через 1-2 нед использования — выбирать «исторически лучшую» точку для кластера.
+
+### Запуск с новой сессии
+1. Прочитать `memory/project_current_focus.md` (актуальный TODO).
+2. Прочитать `C:\Users\vladi\.claude\plans\smart-supply-booking.md` (большой план).
+3. **Главный приоритет — параллелизация авто-брон** (#1 выше).
+
+---
+
 ## 2026-05-16 (11:30) — авто-брон Ozon: foundation + UI explore-этап
 
 ### Зачем
