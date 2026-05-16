@@ -495,7 +495,7 @@ async def _start_ozon_book_wizard(
     # Собираем Ozon-направления заявки
     summaries: List[Tuple[str, int, int, List[str]]] = []  # (cluster, n_items, total_qty, missing)
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return False
@@ -904,8 +904,9 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
     # Ozon-кабинете. Без этого мы рискуем получить OUT_OF_ASSORTMENT (если
     # ozon_sku из другого кабинета) или, что хуже, успешно отправить мусор.
     all_skus_to_check: List[int] = []
+    tg_id_pre = int(data.get("ob_tg_id") or 0)
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_pre)
         if req:
             for cl in clusters:
                 items_check, _ = _build_items_for_cluster(req, cl)
@@ -1011,7 +1012,7 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
             continue
 
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_pre)
             if not req:
                 await progress_add(msg, state, f"Заявка #{rid} пропала.")
                 return
@@ -1497,7 +1498,10 @@ async def _run_autowalk(msg: Message, state: FSMContext, idx: int) -> None:
         return
 
     # Постим найденные слоты
-    await _post_found_slots(cb.message.bot, cb.message.chat.id, data["ob_rid"], found_slots)
+    await _post_found_slots(
+        cb.message.bot, cb.message.chat.id, data["ob_rid"], found_slots,
+        tg_id=int(data.get("ob_tg_id") or 0),
+    )
 
 
 @router.callback_query(F.data.startswith("obscored:"))
@@ -1686,8 +1690,9 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
 
     # Pre-check SKU (см. _create_drafts_and_fetch_scoring — та же логика)
     all_skus_to_check: List[int] = []
+    tg_id_cd = int(data.get("ob_tg_id") or 0)
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_cd)
         if req:
             for cl in clusters:
                 items_check, _ = _build_items_for_cluster(req, cl)
@@ -1745,7 +1750,7 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
             continue
 
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_cd)
             if not req:
                 await progress_add(msg, state, f"Заявка #{rid} пропала.")
                 return
@@ -1843,9 +1848,10 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
     # Даты уже забронированных кластеров — чтобы подсвечивать «✓ та же дата»
     # в слотах следующих кластеров (синхронизировать отгрузку по датам).
     booked_dates: set = set()
+    tg_id_fs = int(data.get("ob_tg_id") or 0)
     if rid:
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_fs)
             if req:
                 for it in req.items:
                     if it.marketplace == "ozon" and it.booked_slot_at:
@@ -2085,7 +2091,7 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
 
 
 async def _recreate_draft_for_auto_poll(
-    oz: OzonClient, rid: int, fd: Dict,
+    oz: OzonClient, rid: int, fd: Dict, tg_id: int,
 ) -> Optional[int]:
     """Пересоздаёт draft для failed_draft записи. items берём из БД по rid+cluster,
     drop_off / тип / cluster_id — из самой записи fd (обогащено caller'ом).
@@ -2095,7 +2101,7 @@ async def _recreate_draft_for_auto_poll(
     """
     try:
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id)
             if not req:
                 return None
             items, _missing = _build_items_for_cluster(req, fd["cluster"])
@@ -2172,7 +2178,7 @@ async def _auto_poll_slots(
             recreated_this_iter = 0
             for fd in drafts:
                 if fd.get("created_ts") and _t.time() - fd["created_ts"] > recreate_after:
-                    new_id = await _recreate_draft_for_auto_poll(oz, rid, fd)
+                    new_id = await _recreate_draft_for_auto_poll(oz, rid, fd, tg_id or 0)
                     if new_id:
                         logger.info("auto-poll: recreated draft for cluster=%s old=%d new=%d",
                                     fd["cluster"], fd["draft_id"], new_id)
@@ -2261,7 +2267,7 @@ async def _auto_poll_slots(
 
             if all_slot_entries:
                 # Успех — постим слоты
-                await _post_found_slots(bot, chat_id, rid, all_slot_entries)
+                await _post_found_slots(bot, chat_id, rid, all_slot_entries, tg_id=tg_id or 0)
                 logger.info("auto-poll success: rid=%d, slots=%d", rid, len(all_slot_entries))
                 return
 
@@ -2327,7 +2333,9 @@ async def _auto_poll_slots(
         _AUTO_POLL_TASKS.pop(rid, None)
 
 
-async def _post_found_slots(bot, chat_id: int, rid: int, slots: List[Dict]) -> None:
+async def _post_found_slots(
+    bot, chat_id: int, rid: int, slots: List[Dict], tg_id: int = 0,
+) -> None:
     """Постит найденные слоты пользователю с inline-кнопками.
 
     Уже забронированные слоты других направлений — выносим в текст-подсказку
@@ -2338,7 +2346,7 @@ async def _post_found_slots(bot, chat_id: int, rid: int, slots: List[Dict]) -> N
     """
     booked_info: List[str] = []
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if req:
             for it in req.items:
                 if it.marketplace == "ozon" and it.booked_slot_at:
@@ -2437,8 +2445,9 @@ async def cb_ob_found_slot_pick(cb: CallbackQuery, state: FSMContext) -> None:
         remaining_clusters_count = 0
         next_mode = "cross" if slot.get("supply_type") == 1 else "direct"
         if rid is not None:
+            tg_id_remain = cb.from_user.id if cb.from_user else 0
             with db_session() as session:
-                req = get_shipment_request(session, rid)
+                req = get_shipment_request(session, rid, user_id=tg_id_remain)
                 if req:
                     remaining_clusters = {
                         it.cluster for it in req.items
@@ -2586,8 +2595,9 @@ async def _do_book_slot(
             f"Слот {slot['from'][:16]}–{slot['to'][11:16]}"
         )
         if rid:
+            tg_id_book2 = cb.from_user.id if cb.from_user else 0
             with db_session() as session:
-                req = get_shipment_request(session, rid)
+                req = get_shipment_request(session, rid, user_id=tg_id_book2)
                 if req:
                     if order_id:
                         is_crossdock = _is_crossdock_wh(slot.get("warehouse_name"), slot.get("warehouse_id"))
@@ -3308,8 +3318,9 @@ async def _book_one_slot(bot, msg, state, slot: Dict, rid: Optional[int]) -> Tup
         f"  ✅ order_id <code>{order_id}</code> · drop-off {drop_off_display}",
     )
     if rid:
+        tg_id_book3 = int((await state.get_data()).get("ob_tg_id") or 0)
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_book3)
             if req and order_id:
                 is_crossdock = _is_crossdock_wh(slot.get("warehouse_name"), slot.get("warehouse_id"))
                 wh_to_save = None if is_crossdock else slot.get("warehouse_name")

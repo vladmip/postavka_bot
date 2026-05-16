@@ -333,8 +333,9 @@ async def cmd_ship_show(msg: Message, command: CommandObject) -> None:
     except ValueError:
         await msg.answer("Использование: <code>/ship_show ID</code>")
         return
+    tg_id = msg.from_user.id if msg.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return
@@ -684,7 +685,8 @@ async def cb_ship_open(cb: CallbackQuery) -> None:
         logger.warning("ship_open: status refresh failed rid=%s: %s", rid, e)
 
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        tg_id_open = cb.from_user.id if cb.from_user else 0
+        req = get_shipment_request(session, rid, user_id=tg_id_open)
         if not req:
             await cb.answer("Не найдена", show_alert=True)
             return
@@ -918,7 +920,7 @@ async def cb_ship_cancel_oz(cb: CallbackQuery) -> None:
                 await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
             return
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id)
             if not req:
                 return
             oids = []
@@ -937,7 +939,7 @@ async def cb_ship_cancel_oz(cb: CallbackQuery) -> None:
         # Перезагрузим статусы — обнулит CANCELLED items.
         with db_session() as session:
             await refresh_supply_status(session, cli, rid, force=True)
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id)
             text, kb = _render_request_card(req)
         ok = sum(1 for r in results if r["cancelled"])
         fails = [(r["order_id"], r["error"]) for r in results if not r["cancelled"]]
@@ -979,7 +981,7 @@ async def cb_ship_refresh_oz(cb: CallbackQuery) -> None:
         return
 
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             return
         text, kb = _render_request_card(req)
@@ -995,8 +997,9 @@ async def _create_zip_together_request(
     его в req.ozon_supply_type. Прогресс — в одну «сардельку»."""
     from src.bot.helpers import progress_start, progress_add, progress_reset
     await progress_reset(state)
+    tg_id_zip = msg.from_user.id if msg.from_user else 0
     with db_session() as session:
-        req = create_shipment_request(session, source_file=zip_name)
+        req = create_shipment_request(session, source_file=zip_name, user_id=tg_id_zip)
         if otype:
             req.ozon_supply_type = otype
         rid = req.id
@@ -1017,7 +1020,7 @@ async def _create_zip_together_request(
         try:
             parsed = parse_ship_file(path)
             with db_session() as session:
-                attach_ship_file(session, rid, parsed)
+                attach_ship_file(session, rid, parsed, user_id=tg_id_zip)
             ok += 1
             await progress_add(msg, state, f"  ✅ <code>{inner_name}</code>")
         except Exception as e:
@@ -1029,7 +1032,7 @@ async def _create_zip_together_request(
             )
     await progress_add(msg, state, f"\n📦 Готово: {ok} ок, {errs} с ошибками.")
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_zip)
         if req:
             text, kb = _render_request_card(req)
             await msg.answer(text, reply_markup=kb)
@@ -1114,8 +1117,9 @@ async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
             await cb.answer("Битый callback", show_alert=True)
             return
         fmt = "BOX" if chosen == "box" else "PALLET"
+        tg_id_fmt = cb.from_user.id if cb.from_user else 0
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_fmt)
             if not req:
                 await cb.answer("Не найдена", show_alert=True)
                 return
@@ -1183,8 +1187,9 @@ async def cb_ship_set_otype(cb: CallbackQuery) -> None:
         await cb.answer("Неизвестный тип", show_alert=True)
         return
     otype = "direct" if code == "d" else "cross"
+    tg_id_setotype = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_setotype)
         if not req:
             await cb.answer("Не найдена", show_alert=True)
             return
@@ -1361,7 +1366,8 @@ async def cmd_ship_plan(msg: Message, command: CommandObject, state: FSMContext)
     except ValueError:
         await msg.answer("Использование: <code>/ship_plan ID</code>")
         return
-    await _start_plan_wizard(msg, state, rid)
+    tg_id_plan = msg.from_user.id if msg.from_user else 0
+    await _start_plan_wizard(msg, state, rid, tg_id=tg_id_plan)
 
 
 @router.callback_query(F.data.startswith("ship_plan:"))
@@ -1369,11 +1375,12 @@ async def cb_ship_plan(cb: CallbackQuery, state: FSMContext) -> None:
     rid = int(cb.data.split(":", 1)[1])
     await cb.answer()
     if cb.message:
-        await _start_plan_wizard(cb.message, state, rid, edit=True)
+        tg_id_plan = cb.from_user.id if cb.from_user else 0
+        await _start_plan_wizard(cb.message, state, rid, tg_id=tg_id_plan, edit=True)
 
 
 async def _start_plan_wizard(
-    msg: Message, state: FSMContext, rid: int, *, edit: bool = False,
+    msg: Message, state: FSMContext, rid: int, *, tg_id: int, edit: bool = False,
 ) -> None:
     """Показать заявку + календарь дат. edit=True редактирует исходное сообщение.
 
@@ -1382,7 +1389,7 @@ async def _start_plan_wizard(
     """
     from datetime import date as _date
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return
@@ -1471,8 +1478,9 @@ async def cb_sp_confirm_dates(cb: CallbackQuery, state: FSMContext) -> None:
     # Предзаполняем выбор часов из заявки если был раньше — юзер видит свой
     # прошлый выбор и может скорректировать (как и для дат).
     preselected_hours: List[int] = []
+    tg_id_hrs = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_hrs)
         if req and req.target_hours_json:
             preselected_hours = list(req.target_hours_json)
 
@@ -1568,8 +1576,9 @@ async def _finalize_plan_with_hours(
     d_to = dates[-1] if len(dates) > 1 else None
     await state.clear()
 
+    tg_id_fin = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_fin)
         if not req:
             await cb.answer("Поставка не найдена", show_alert=True)
             return
@@ -1715,8 +1724,9 @@ async def cb_sp_save(cb: CallbackQuery, state: FSMContext) -> None:
     crossdock = data.get("ship_plan_crossdock", {})
     await state.clear()
 
+    tg_id_save = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_save)
         if not req:
             await cb.answer("Не найдена", show_alert=True)
             return
@@ -1732,7 +1742,7 @@ async def cb_sp_save(cb: CallbackQuery, state: FSMContext) -> None:
     if cb.message:
         # Показываем обновлённую карточку с кнопками действий
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_save)
             if req:
                 text, kb = _render_request_card(req)
                 await safe_edit_or_answer(cb.message, text, reply_markup=kb)
@@ -1768,7 +1778,7 @@ async def _run_hunt(msg: Message, rid: int) -> None:
         return
 
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return
@@ -1884,8 +1894,9 @@ async def cb_book_placeholder(cb: CallbackQuery) -> None:
     rid = int(rid_s)
     mp = "wb" if mp_short == "w" else "ozon"
 
+    tg_id_pk = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_pk)
         if not req:
             await cb.answer("Поставка не найдена", show_alert=True)
             return
@@ -2022,8 +2033,9 @@ async def cb_skip_direction(cb: CallbackQuery) -> None:
     await cb.answer("Пропущено")
     if cb.message and rid:
         # Возвращаемся в карточку заявки
+        tg_id_skip = cb.from_user.id if cb.from_user else 0
         with db_session() as session:
-            req = get_shipment_request(session, rid)
+            req = get_shipment_request(session, rid, user_id=tg_id_skip)
             if req:
                 text, kb = _render_request_card(req)
                 await safe_edit_or_answer(cb.message, text, reply_markup=kb)
@@ -2049,8 +2061,9 @@ async def cb_ship_items(cb: CallbackQuery) -> None:
     if not cb.message:
         return
 
+    tg_id_items = cb.from_user.id if cb.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_items)
         if not req:
             await cb.message.answer(f"Поставка #{rid} не найдена.")
             return
@@ -2138,8 +2151,9 @@ async def _send_ship_tz(msg: Message, rid: int) -> None:
     except Exception as e:
         logger.warning("ship_tz: status refresh failed rid=%s: %s", rid, e)
 
+    tg_id_tz = msg.from_user.id if msg.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid)
+        req = get_shipment_request(session, rid, user_id=tg_id_tz)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return
