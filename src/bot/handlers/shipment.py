@@ -424,10 +424,15 @@ def _render_request_card(req) -> tuple:
             # до миграции — даём юзеру выбрать тип однократно прямо здесь.
             # cargo_format (BOX/PALLET) — спрашиваем тоже, перед запуском wizard'а.
             if req.ozon_supply_type and not req.cargo_format:
-                # Тип уже задан, осталось спросить формат
+                # Тип уже задан, осталось спросить формат (для обычного wizard).
+                # Для авто-брон формат не нужен — Ozon сам выберет.
                 rows.append([InlineKeyboardButton(
                     text="🚀 Создать поставку Ozon (выбрать формат)",
                     callback_data=f"ship_pick_fmt:{req.id}",
+                )])
+                rows.append([InlineKeyboardButton(
+                    text="🎯 Авто-брон на одну дату",
+                    callback_data=f"obauto:{req.id}",
                 )])
             elif req.ozon_supply_type == "direct":
                 rows.append([InlineKeyboardButton(
