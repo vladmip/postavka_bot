@@ -348,10 +348,18 @@ async def collect_sales_and_stocks(
             "stock_total": 0,
             "rate": 0.0,
             "idc_min": None,
-            "to_ship": 0,
+            "to_ship": 0,  # вычислим ниже из ads * coverage − stock
             "worst_grade": None,
         })
+        # Total stock = на складе + в пути к складу + возвраты в пути от клиентов.
+        # `requested_stock_count` от Ozon — это «срочный» дефицит без 56д
+        # горизонта (в ЛК «Рекомендации к поставке на 56 дн» — другой алгоритм
+        # внутри Ozon фронтенда, в Seller API не публикуется). Поэтому считаем
+        # сами: ads × TARGET_COVERAGE_DAYS − total_stock. Это всё ещё точнее
+        # самописного по postings, потому что ads уже учитывает выкупаемость/OOS.
         entry["stock_total"] += int(it.get("valid_stock_count") or 0)
+        entry["stock_total"] += int(it.get("transit_stock_count") or 0)
+        entry["stock_total"] += int(it.get("return_from_customer_stock_count") or 0)
         ads = it.get("ads")
         if isinstance(ads, (int, float)):
             entry["rate"] += float(ads)
@@ -359,7 +367,6 @@ async def collect_sales_and_stocks(
         if isinstance(idc, (int, float)) and idc > 0:
             if entry["idc_min"] is None or idc < entry["idc_min"]:
                 entry["idc_min"] = float(idc)
-        entry["to_ship"] += int(it.get("requested_stock_count") or 0)
         grade = str(it.get("turnover_grade") or "").upper()
         if grade and grade in grade_priority:
             cur = entry["worst_grade"]
@@ -371,6 +378,9 @@ async def collect_sales_and_stocks(
     for sku, e in by_sku.items():
         if e["stock_total"] == 0:
             e["stock_total"] = sku_to_present.get(sku, 0)
+        # to_ship по нашей формуле: «дозаправить до TARGET_COVERAGE_DAYS дней».
+        target_qty = e["rate"] * TARGET_COVERAGE_DAYS
+        e["to_ship"] = max(0, int(-(-target_qty // 1)) - e["stock_total"])
 
     return by_sku, errors
 
@@ -635,14 +645,15 @@ def build_digest_text(data: DigestData) -> str:
         lines.append("")
 
     # Срочно отгрузить — топ-5 по требуемому количеству к отгрузке.
-    # Источник — `/v1/analytics/stocks` Ozon: ads (ср. продажи/день),
-    # idc (дни покрытия), requested_stock_count (рекомендация).
-    # Ozon учитывает наличие/заказы; сезонность отдельной аналитической
-    # системы (data.ozon) тут НЕ применяется — это другой сервис.
+    # `ads` (ср. продажи/день) и `idc` (дни покрытия) — из Ozon
+    # `/v1/analytics/stocks` (учитывает выкупаемость и наличие).
+    # `to_ship` считаем сами: ceil(ads × 56) − total_stock. У Ozon в ЛК
+    # «Рекомендации к поставке на 56 дн» — отдельный алгоритм с выкупаемостью
+    # на горизонте + сезонностью data.ozon. В Seller API его нет.
     header_count = min(TOP_URGENT_LIMIT, len(data.urgent))
     lines.append(
         f"🔥 <b>Топ-{header_count} срочно отгрузить</b> "
-        f"<i>(рекомендация Ozon из аналитики остатков)</i>"
+        f"<i>(покрытие на {TARGET_COVERAGE_DAYS}д, ads/idc от Ozon)</i>"
     )
     if not data.urgent:
         lines.append("✅ Запасов хватает — паника отменяется.")
