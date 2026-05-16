@@ -868,6 +868,13 @@ async def cb_obauto_book_day(cb: CallbackQuery, state: FSMContext) -> None:
         )
         return
 
+    # Запускаем auto-poll для кластеров без слота на best_date.
+    # Бот будет дёргать timeslot/info каждые 60с в течение часа и забронирует
+    # как только слот появится на best_date.
+    await _spawn_auto_poll_for_best_date(
+        cb.message, rid, best_date_iso, not_fit_clusters, drafts_meta, data,
+    )
+
     # Готовим state как ожидает _run_bulk_book
     await state.update_data(
         ob_picker_choices=choices,
@@ -877,6 +884,61 @@ async def cb_obauto_book_day(cb: CallbackQuery, state: FSMContext) -> None:
         ob_failed_clusters=not_fit_clusters,
     )
     await _run_bulk_book(cb.message.bot, cb.message, state)
+
+
+async def _spawn_auto_poll_for_best_date(
+    msg: Message, rid: int, best_date_iso: str,
+    failed_clusters: List[str], drafts_meta: Dict[str, Dict],
+    state_data: Dict,
+) -> None:
+    """Запустить background auto-poll для кластеров где нет слотов на best_date.
+    Использует существующий `_auto_poll_slots` с фильтром date_picks=[best_date]."""
+    import time as _time
+    if not failed_clusters:
+        return
+    poll_drafts: List[Dict] = []
+    crossdock_map = state_data.get("ob_dropoff_choices") or {}
+    is_cross = (state_data.get("ob_type") or "").upper().endswith("CROSSDOCK")
+    draft_type = "CREATE_TYPE_CROSSDOCK" if is_cross else "CREATE_TYPE_DIRECT"
+    for cl in failed_clusters:
+        meta = drafts_meta.get(cl)
+        if not meta:
+            continue
+        do_choice = crossdock_map.get(cl) or {}
+        poll_drafts.append({
+            "cluster": cl,
+            "cluster_id": int(meta.get("cluster_id") or 0),
+            "draft_id": int(meta.get("draft_id") or 0),
+            "drop_off_warehouse_id": int(do_choice.get("wh_id") or 0) if is_cross else None,
+            "drop_off_warehouse_name": do_choice.get("name") if is_cross else None,
+            "draft_type": draft_type,
+            "created_ts": _time.time(),
+            "wh_id": int(meta.get("wh_id") or 0),
+            "supply_type": int(meta.get("supply_type") or 2),
+        })
+    if not poll_drafts:
+        return
+    # date_picks=[best_date] — auto-poll будет фильтровать слоты по этой дате.
+    date_from_iso = f"{best_date_iso}T00:00:00Z"
+    date_to_iso = f"{best_date_iso}T23:59:59Z"
+    task = asyncio.create_task(_auto_poll_slots(
+        msg.bot, msg.chat.id, rid, poll_drafts,
+        date_from_iso, date_to_iso,
+        [best_date_iso],
+        state_data.get("ob_hour_picks") or [],
+        tg_id=state_data.get("ob_tg_id"),
+    ))
+    _AUTO_POLL_TASKS[rid] = task
+    try:
+        await msg.bot.send_message(
+            msg.chat.id,
+            f"♻ <b>Авто-поиск запущен</b> на {best_date_iso}\n"
+            f"Кластеры: {', '.join(failed_clusters)}\n"
+            f"<i>Бот будет проверять слоты каждые 60с в течение часа. "
+            f"Если найдётся — забронирует и пришлёт сообщение.</i>"
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("obauto:bhour:"))
@@ -939,6 +1001,12 @@ async def cb_obauto_book_hour(cb: CallbackQuery, state: FSMContext) -> None:
         f"🎯 Общий час: <b>{best_hour:02d}:00</b> · "
         f"{len(clusters_at_hour)} кластеров"
     )
+
+    # Auto-poll для кластеров без слота на этот час на best_date
+    await _spawn_auto_poll_for_best_date(
+        cb.message, rid, best_date_iso, not_fit_clusters, drafts_meta, data,
+    )
+
     await state.update_data(
         ob_picker_choices=choices,
         ob_picker_clusters=[],
