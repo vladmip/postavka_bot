@@ -8,6 +8,19 @@ load_dotenv(PROJECT_ROOT / ".env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0") or "0")
 
+# Telegram-ID администраторов. Имеют доступ к /admin-панели (статистика юзеров,
+# логи, диагностика). Формат в .env: ADMIN_USER_IDS=1234,5678 (через запятую).
+# Если переменная пустая — fallback на {ALLOWED_USER_ID} (если задан).
+_admin_raw = os.getenv("ADMIN_USER_IDS", "").strip()
+ADMIN_USER_IDS: set[int] = set()
+if _admin_raw:
+    for piece in _admin_raw.split(","):
+        piece = piece.strip()
+        if piece.isdigit():
+            ADMIN_USER_IDS.add(int(piece))
+if not ADMIN_USER_IDS and ALLOWED_USER_ID:
+    ADMIN_USER_IDS.add(ALLOWED_USER_ID)
+
 APIKEY_OZON = os.getenv("APIKEY_OZON", "")
 CLIENT_ID_OZON = os.getenv("CLIEN_TID", "")
 APIKEY_WB = os.getenv("APIKEY_WB", "")

@@ -11,7 +11,7 @@ from aiogram.filters import Filter
 from aiogram.types import Message, CallbackQuery, TelegramObject, BotCommand
 
 from src.config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, TELEGRAM_PROXY_URL
-from src.bot.handlers import common, catalog, upload, integrations, shipment, ozon_book, returns, favorites, product_hints, onboarding, digest
+from src.bot.handlers import common, catalog, upload, integrations, shipment, ozon_book, returns, favorites, product_hints, onboarding, digest, admin
 from src.bot.handlers.digest import send_digest_to_user
 from src.bot.middleware import LogAndCatchMiddleware, EnsureUserMiddleware, RateLimitMiddleware
 
@@ -269,7 +269,7 @@ async def main() -> None:
     # перехватываются main menu router'ом первыми.
     for r in (onboarding.router, common.router, catalog.router, product_hints.router,
               shipment.router, ozon_book.router, upload.router, integrations.router,
-              returns.router, favorites.router, digest.router):
+              returns.router, favorites.router, digest.router, admin.router):
         r.message.filter(user_filter)
         r.callback_query.filter(user_filter)
         dp.include_router(r)

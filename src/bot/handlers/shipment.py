@@ -741,10 +741,10 @@ async def cmd_clear_drafts(msg: Message) -> None:
     удалить из БД все заявки, у которых нет активных booked items.
 
     Не трогает поставки в более продвинутых статусах (READY_TO_SUPPLY и далее).
-    Только для ALLOWED_USER_ID (защита от случайного нажатия чужими)."""
-    from src.config import ALLOWED_USER_ID
-    if msg.from_user and msg.from_user.id != ALLOWED_USER_ID:
-        await msg.answer("⛔ Команда доступна только владельцу.")
+    Доступно только админам (ADMIN_USER_IDS)."""
+    from src.config import ADMIN_USER_IDS
+    if not msg.from_user or msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.answer("⛔ Команда доступна только админам.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -768,29 +768,31 @@ async def cmd_clear_drafts(msg: Message) -> None:
 
 @router.callback_query(F.data == "clear_drafts:yes")
 async def cb_clear_drafts(cb: CallbackQuery) -> None:
-    from src.config import ALLOWED_USER_ID
-    if cb.from_user.id != ALLOWED_USER_ID:
-        await cb.answer("⛔ Только владельцу", show_alert=True)
+    from src.config import ADMIN_USER_IDS
+    if cb.from_user.id not in ADMIN_USER_IDS:
+        await cb.answer("⛔ Только админам", show_alert=True)
         return
     await cb.answer("Чищу…")
     if not cb.message:
         return
 
+    tg_id = cb.from_user.id
     from src.services.ozon_supply_status_service import (
         cancel_supply_orders, refresh_supply_status,
     )
     with db_session() as _s:
-        cli = get_ozon_client_for(_s, cb.from_user.id)
+        cli = get_ozon_client_for(_s, tg_id)
     if cli is None:
         await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
         return
 
     # Шаг 1: освежить статусы по всем заявкам с booked items.
+    # Чистим ТОЛЬКО свои черновики — каждый админ имеет свой кабинет.
     progress = await cb.message.answer("⏳ Освежаю статусы Ozon…")
     with db_session() as session:
         from src.db.models import ShipmentRequest
         all_reqs = session.query(ShipmentRequest).filter(
-            ShipmentRequest.user_id == ALLOWED_USER_ID
+            ShipmentRequest.user_id == tg_id
         ).all()
         rids_with_booked = [
             r.id for r in all_reqs

@@ -20,8 +20,9 @@ router = Router()
 ONBOARDING_URL = "https://telegra.ph/Postavkinbot-bot-pomoshchnik-dlya-FBOFBW-postavok-05-13"
 
 
-def _main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def _main_menu_kb(tg_id: int | None = None) -> InlineKeyboardMarkup:
+    from src.config import ADMIN_USER_IDS
+    rows = [
         [InlineKeyboardButton(text="📋 Мои поставки", callback_data="menu:ships")],
         [InlineKeyboardButton(text="☀ Утренняя сводка", callback_data="menu:digest")],
         [InlineKeyboardButton(text="📥 Возвраты", callback_data="menu:returns")],
@@ -29,7 +30,11 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📖 Для новичка — как пользоваться",
                               url=ONBOARDING_URL)],
         [InlineKeyboardButton(text="📚 Справка", callback_data="menu:help")],
-    ])
+    ]
+    if tg_id and tg_id in ADMIN_USER_IDS:
+        rows.insert(-1, [InlineKeyboardButton(text="🛠 Админка",
+                                              callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _settings_menu_kb() -> InlineKeyboardMarkup:
@@ -151,7 +156,8 @@ async def cmd_start(msg: Message, state: FSMContext) -> None:
     from src.bot.handlers.onboarding import maybe_start_onboarding
     if await maybe_start_onboarding(msg, state):
         return
-    await msg.answer(_MAIN_TEXT, reply_markup=_main_menu_kb())
+    tg_id = msg.from_user.id if msg.from_user else None
+    await msg.answer(_MAIN_TEXT, reply_markup=_main_menu_kb(tg_id))
 
 
 # ── menu:home — главное меню (edit существующего сообщения) ──────────────
@@ -161,7 +167,8 @@ async def cmd_start(msg: Message, state: FSMContext) -> None:
 async def cb_menu_home(cb: CallbackQuery) -> None:
     await cb.answer()
     if cb.message:
-        await safe_edit_or_answer(cb.message, _MAIN_TEXT, reply_markup=_main_menu_kb())
+        tg_id = cb.from_user.id if cb.from_user else None
+        await safe_edit_or_answer(cb.message, _MAIN_TEXT, reply_markup=_main_menu_kb(tg_id))
 
 
 # ── menu:help ─────────────────────────────────────────────────────────────
@@ -291,7 +298,8 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer("Отменено")
     if cb.message:
         # После отмены — сразу возвращаем в меню
-        await safe_edit_or_answer(cb.message, _MAIN_TEXT, reply_markup=_main_menu_kb())
+        tg_id = cb.from_user.id if cb.from_user else None
+        await safe_edit_or_answer(cb.message, _MAIN_TEXT, reply_markup=_main_menu_kb(tg_id))
 
 
 # ── /forget_me — удалить все данные юзера (GDPR + удобство тестов) ────────
@@ -358,9 +366,9 @@ async def cb_forget_me_confirm(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(Command("admin_stats"))
 async def cmd_admin_stats(msg: Message) -> None:
-    from src.config import ALLOWED_USER_ID
+    from src.config import ADMIN_USER_IDS
     tg_id = msg.from_user.id if msg.from_user else None
-    if not tg_id or tg_id != ALLOWED_USER_ID:
+    if not tg_id or tg_id not in ADMIN_USER_IDS:
         return  # молча игнорируем — команда не для всех
     from src.db.session import db_session
     from src.db.models import User, ShipmentRequest
