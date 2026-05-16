@@ -30,7 +30,9 @@ URGENT_RED_DAYS = 7        # < 7 дней по 7d-rate → 🔴 срочно
 URGENT_YELLOW_DAYS = 14    # 7-14 дней по 7d-rate → 🟡 пора подумать
 RUNOUT_RED_DAYS = 15       # <15 дней по 28d-rate → 🔴 кончается
 RUNOUT_GREEN_DAYS = 30     # >30 дней по 28d-rate → 🟢 в порядке
-TOP_LIST_LIMIT = 12        # сколько SKU показывать в каждом списке
+TOP_URGENT_LIMIT = 5       # топ-5 «срочно отгрузить» — чтобы на 100+ SKU не было каши
+TOP_RUNOUT_RED_LIMIT = 5   # топ-5 🔴 «кончится за <15 дней»
+TOP_RUNOUT_YELLOW_LIMIT = 3 # топ-3 🟡 «15–30 дней»
 
 
 # ── Структуры результата ─────────────────────────────────────────────────
@@ -575,18 +577,18 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"  …и ещё {len(r.removal_from_supply) - 8} групп")
         lines.append("")
 
-    # Срочно отгрузить
+    # Срочно отгрузить — топ-5
     lines.append("🔥 <b>Срочно отгрузить</b> <i>(по продажам за 7 дней)</i>")
     if not data.urgent:
         lines.append("✅ Запасов хватает — паника отменяется.")
     else:
-        for line in data.urgent[:TOP_LIST_LIMIT]:
+        for line in data.urgent[:TOP_URGENT_LIMIT]:
             lines.append(_fmt_sku_line(line))
-        if len(data.urgent) > TOP_LIST_LIMIT:
-            lines.append(f"  …и ещё {len(data.urgent) - TOP_LIST_LIMIT}")
+        if len(data.urgent) > TOP_URGENT_LIMIT:
+            lines.append(f"  …и ещё {len(data.urgent) - TOP_URGENT_LIMIT}")
     lines.append("")
 
-    # Runout
+    # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢
     lines.append("⏳ <b>Кончатся</b> <i>(по продажам за 28 дней)</i>")
     if not data.runout:
         lines.append("ℹ Нет данных по продажам — добавь товары в каталог Ozon или жди заказов.")
@@ -596,16 +598,16 @@ def build_digest_text(data: DigestData) -> str:
         green = [l for l in data.runout if l.color == "🟢"]
         if red:
             lines.append(f"<b>🔴 &lt; {RUNOUT_RED_DAYS} дн</b> ({len(red)})")
-            for line in red[:TOP_LIST_LIMIT]:
+            for line in red[:TOP_RUNOUT_RED_LIMIT]:
                 lines.append(_fmt_sku_line(line))
-            if len(red) > TOP_LIST_LIMIT:
-                lines.append(f"  …и ещё {len(red) - TOP_LIST_LIMIT}")
+            if len(red) > TOP_RUNOUT_RED_LIMIT:
+                lines.append(f"  …и ещё {len(red) - TOP_RUNOUT_RED_LIMIT}")
         if yellow:
             lines.append(f"<b>🟡 {RUNOUT_RED_DAYS}–{RUNOUT_GREEN_DAYS} дн</b> ({len(yellow)})")
-            for line in yellow[:TOP_LIST_LIMIT // 2]:
+            for line in yellow[:TOP_RUNOUT_YELLOW_LIMIT]:
                 lines.append(_fmt_sku_line(line))
-            if len(yellow) > TOP_LIST_LIMIT // 2:
-                lines.append(f"  …и ещё {len(yellow) - TOP_LIST_LIMIT // 2}")
+            if len(yellow) > TOP_RUNOUT_YELLOW_LIMIT:
+                lines.append(f"  …и ещё {len(yellow) - TOP_RUNOUT_YELLOW_LIMIT}")
         if green:
             lines.append(f"<b>🟢 &gt; {RUNOUT_GREEN_DAYS} дн</b>: {len(green)} SKU")
 
