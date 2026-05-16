@@ -498,21 +498,21 @@ def _fmt_removal_group(g: "RemovalGroup") -> str:
 
 
 def _fmt_sku_line(line: SkuLine, *, show_days: bool = True) -> str:
+    """Три строки на SKU — чтобы не сливалось в кашу на узких экранах:
+      1) {эмодзи} {название}
+      2) {артикул в моноширине}
+      3) {остаток · скорость · дни → к отгрузке (если urgent)}
+    """
     name = line.name or f"SKU {line.sku}"
-    label = f"<b>{name}</b>"
-    if line.offer_id:
-        label += f" <code>{line.offer_id}</code>"
+    head = f"{line.color} <b>{name}</b>"
+    article_part = f"\n   <code>{line.offer_id}</code>" if line.offer_id else ""
     days = "∞" if line.days_left == float("inf") else f"{line.days_left:.0f}д"
     ship_part = f" · <b>отгрузить {line.to_ship_qty}</b>" if line.to_ship_qty > 0 else ""
     if show_days:
-        return (
-            f"{line.color} {label}\n"
-            f"   ост. {line.stock} · {line.rate_per_day:.1f}/д → {days}{ship_part}"
-        )
-    return (
-        f"{line.color} {label}\n"
-        f"   ост. {line.stock} · {line.rate_per_day:.1f}/д{ship_part}"
-    )
+        tail = f"\n   ост. {line.stock} · {line.rate_per_day:.1f}/д → {days}{ship_part}"
+    else:
+        tail = f"\n   ост. {line.stock} · {line.rate_per_day:.1f}/д{ship_part}"
+    return f"{head}{article_part}{tail}"
 
 
 def build_digest_text(data: DigestData) -> str:
