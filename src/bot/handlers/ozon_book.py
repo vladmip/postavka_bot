@@ -584,6 +584,7 @@ async def _auto_book_explore(
 
     # 4. Per-cluster: создать draft, дождаться scoring, дёрнуть timeslot/info
     slots_per_cluster: Dict[str, List] = {}
+    drafts_meta: Dict[str, Dict] = {}  # cluster → {draft_id, cluster_id, wh_id, wh_name, drop_off}
     log_lines: List[str] = []
     is_cross = ozon_supply_type == "cross"
     supply_type = 1 if is_cross else 2
@@ -705,6 +706,11 @@ async def _auto_book_explore(
             ts_response, cluster=cl, warehouse_id=wh_id, warehouse_name=wh_name,
         )
         slots_per_cluster[cl] = slots
+        drafts_meta[cl] = {
+            "draft_id": draft_id, "cluster_id": cl_id,
+            "wh_id": wh_id, "wh_name": wh_name,
+            "drop_off_name": "", "supply_type": supply_type,
+        }
         unique_dates = sorted(set(s.date for s in slots))
         log_lines.append(
             f"  ✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
@@ -726,16 +732,37 @@ async def _auto_book_explore(
         allowed_hours=allowed_hours_set,
     )
 
-    # 6. Итоговое сообщение
+    # 6. Сохраняем контекст в state для callback'ов bulk-book
+    # SlotInfo сериализуем как dict (state хранит JSON-совместимое).
+    slots_serialized = {
+        cl: [
+            {"from_ts": s.from_ts, "to_ts": s.to_ts,
+             "warehouse_id": s.warehouse_id, "warehouse_name": s.warehouse_name}
+            for s in slots
+        ]
+        for cl, slots in slots_per_cluster.items()
+    }
+    await state.update_data(
+        ob_rid=rid,
+        ob_tg_id=tg_id,
+        ob_auto_slots=slots_serialized,
+        ob_auto_drafts=drafts_meta,
+        ob_auto_best_date=best_date.isoformat() if best_date else None,
+        ob_auto_allowed_hours=sorted(allowed_hours_set) if allowed_hours_set else None,
+    )
+
+    # 7. Итоговое сообщение + кнопки бронирования
     result_lines = [
         f"🎯 <b>Авто-брон поставки #{rid} — результат</b>\n",
-        f"<i>Drafts:</i>",
+        f"<i>Расчёты:</i>",
     ]
     result_lines.extend(log_lines)
     result_lines.append("")
+    rows: List[List[InlineKeyboardButton]] = []
     if best_date is None:
         result_lines.append(
-            "🔴 <b>Не нашёл общей даты</b> — нет слотов ни по одной из твоих дат."
+            "🔴 <b>Не нашёл общей даты</b> — нет слотов ни по одной из твоих дат.\n"
+            "Расширь даты в /ship_plan и попробуй ещё раз."
         )
     else:
         clusters_on_best = sorted({
@@ -743,8 +770,9 @@ async def _auto_book_explore(
             for s in slots if s.date == best_date
             and (allowed_hours_set is None or s.hour in allowed_hours_set)
         })
+        date_label = best_date.strftime("%d.%m")
         result_lines.append(
-            f"🎯 <b>Оптимальная дата: {best_date.strftime('%d.%m')}</b>\n"
+            f"🎯 <b>Оптимальная дата: {date_label}</b>\n"
             f"   Могут уехать: <b>{len(clusters_on_best)}/{len(oz_clusters)}</b> "
             f"({', '.join(clusters_on_best)})"
         )
@@ -755,20 +783,170 @@ async def _auto_book_explore(
                     f"  {d.strftime('%d.%m')}: {n} кл. — {', '.join(cls[:4])}"
                 )
         result_lines.append(
-            "\n⚠ <i>Авто-бронирование пока в разработке. "
-            "Запусти обычный wizard «🚀 Создать поставку Ozon» — "
-            "теперь знаешь оптимальную дату.</i>"
+            f"\n<i>Кластеры без слотов на {date_label} — после брони запустим "
+            f"авто-поиск в течение часа.</i>"
         )
+        rows.append([InlineKeyboardButton(
+            text=f"🎯 Брон {date_label} — все в один день",
+            callback_data=f"obauto:bday:{rid}",
+        )])
+        rows.append([InlineKeyboardButton(
+            text=f"🎯 Брон {date_label} + один час старта",
+            callback_data=f"obauto:bhour:{rid}",
+        )])
+    rows.append([InlineKeyboardButton(text="✖ Отмена",
+                                       callback_data=f"ship_open:{rid}")])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀ К карточке заявки",
-                              callback_data=f"ship_open:{rid}")],
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await _edit("\n".join(result_lines))
     try:
         await progress.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass
+
+
+def _slot_dict_to_picker_choice(slot_dict: Dict, cluster: str, meta: Dict) -> Dict:
+    """Из {from_ts, to_ts, warehouse_id, warehouse_name} + meta делаем choice
+    структуру для `_run_bulk_book` (которая ждёт ob_picker_choices словарь).
+    """
+    return {
+        "cluster": cluster,
+        "cluster_id": meta.get("cluster_id"),
+        "draft_id": meta.get("draft_id"),
+        "supply_type": meta.get("supply_type", 2),
+        "drop_off_name": meta.get("drop_off_name", ""),
+        "warehouse_id": slot_dict["warehouse_id"],
+        "warehouse_name": slot_dict["warehouse_name"],
+        # _run_bulk_book ждёт "from"/"to" с Z-суффиксом (как Ozon шлёт).
+        # У нас в state from_ts без Z (локальный) — добавим.
+        "from": slot_dict["from_ts"] + ("Z" if not slot_dict["from_ts"].endswith("Z") else ""),
+        "to": slot_dict["to_ts"] + ("Z" if not slot_dict["to_ts"].endswith("Z") else ""),
+    }
+
+
+@router.callback_query(F.data.startswith("obauto:bday:"))
+async def cb_obauto_book_day(cb: CallbackQuery, state: FSMContext) -> None:
+    """Bulk-book на best_date — для каждого кластера со слотами на эту дату
+    берём самый ранний слот (либо в allowed_hours)."""
+    if not cb.message:
+        return
+    rid = int(cb.data.split(":")[2])
+    data = await state.get_data()
+    best_date_iso = data.get("ob_auto_best_date")
+    slots_ser = data.get("ob_auto_slots") or {}
+    drafts_meta = data.get("ob_auto_drafts") or {}
+    allowed_hours = data.get("ob_auto_allowed_hours") or None
+    if not best_date_iso or not slots_ser:
+        await cb.answer("Контекст потерян — запусти 🎯 Авто-брон заново", show_alert=True)
+        return
+    await cb.answer(f"Бронирую на {best_date_iso}…")
+
+    from datetime import date as _date_cls
+    best_d = _date_cls.fromisoformat(best_date_iso)
+    allowed_hours_set = set(allowed_hours) if allowed_hours else None
+
+    # Собираем choices: для каждого кластера — самый ранний слот на best_date
+    choices: Dict[str, Dict] = {}
+    not_fit_clusters: List[str] = []
+    for idx, (cluster, slots_list) in enumerate(slots_ser.items()):
+        on_date = [
+            s for s in slots_list
+            if s["from_ts"][:10] == best_date_iso
+            and (allowed_hours_set is None or int(s["from_ts"][11:13]) in allowed_hours_set)
+        ]
+        if not on_date:
+            not_fit_clusters.append(cluster)
+            continue
+        on_date.sort(key=lambda s: s["from_ts"])
+        choices[str(idx)] = _slot_dict_to_picker_choice(
+            on_date[0], cluster, drafts_meta.get(cluster, {})
+        )
+
+    if not choices:
+        await cb.message.answer(
+            "⚠ Не нашлось ни одного слота на эту дату. Попробуй другую."
+        )
+        return
+
+    # Готовим state как ожидает _run_bulk_book
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_clusters=[],  # не критично для bulk-book
+        ob_picker_msg_id=None,
+        ob_progress_msg_id=cb.message.message_id,
+        ob_failed_clusters=not_fit_clusters,
+    )
+    await _run_bulk_book(cb.message.bot, cb.message, state)
+
+
+@router.callback_query(F.data.startswith("obauto:bhour:"))
+async def cb_obauto_book_hour(cb: CallbackQuery, state: FSMContext) -> None:
+    """Bulk-book на best_date + один час старта — находим час с максимумом
+    пересекающихся кластеров, берём слот этого часа в каждом кластере."""
+    if not cb.message:
+        return
+    rid = int(cb.data.split(":")[2])
+    data = await state.get_data()
+    best_date_iso = data.get("ob_auto_best_date")
+    slots_ser = data.get("ob_auto_slots") or {}
+    drafts_meta = data.get("ob_auto_drafts") or {}
+    allowed_hours = data.get("ob_auto_allowed_hours") or None
+    if not best_date_iso or not slots_ser:
+        await cb.answer("Контекст потерян — запусти 🎯 Авто-брон заново", show_alert=True)
+        return
+    await cb.answer("Ищу общий час…")
+
+    allowed_hours_set = set(allowed_hours) if allowed_hours else None
+
+    # Считаем для каждого часа: какие кластеры имеют слот.
+    hour_to_clusters: Dict[int, Set[str]] = {}
+    cluster_slot_by_hour: Dict[tuple, Dict] = {}  # (cluster, hour) → slot_dict
+    for cluster, slots_list in slots_ser.items():
+        for s in slots_list:
+            if s["from_ts"][:10] != best_date_iso:
+                continue
+            hour = int(s["from_ts"][11:13])
+            if allowed_hours_set is not None and hour not in allowed_hours_set:
+                continue
+            hour_to_clusters.setdefault(hour, set()).add(cluster)
+            if (cluster, hour) not in cluster_slot_by_hour:
+                cluster_slot_by_hour[(cluster, hour)] = s
+
+    if not hour_to_clusters:
+        await cb.message.answer("⚠ Не нашлось общих часов на эту дату.")
+        return
+
+    # Лучший час = max-кластеров (tie-break: пораньше).
+    best_hour = max(hour_to_clusters.items(), key=lambda kv: (len(kv[1]), -kv[0]))[0]
+    clusters_at_hour = hour_to_clusters[best_hour]
+
+    choices: Dict[str, Dict] = {}
+    not_fit_clusters: List[str] = []
+    for idx, cluster in enumerate(slots_ser.keys()):
+        if cluster not in clusters_at_hour:
+            not_fit_clusters.append(cluster)
+            continue
+        slot = cluster_slot_by_hour[(cluster, best_hour)]
+        choices[str(idx)] = _slot_dict_to_picker_choice(
+            slot, cluster, drafts_meta.get(cluster, {})
+        )
+
+    if not choices:
+        await cb.message.answer("⚠ Не нашлось слотов на общий час.")
+        return
+
+    await cb.message.answer(
+        f"🎯 Общий час: <b>{best_hour:02d}:00</b> · "
+        f"{len(clusters_at_hour)} кластеров"
+    )
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_clusters=[],
+        ob_picker_msg_id=None,
+        ob_progress_msg_id=cb.message.message_id,
+        ob_failed_clusters=not_fit_clusters,
+    )
+    await _run_bulk_book(cb.message.bot, cb.message, state)
 
 
 async def _resolve_macrolocal_id(oz: OzonClient, cluster_name: str) -> Optional[int]:
