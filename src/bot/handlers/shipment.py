@@ -1140,8 +1140,11 @@ async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
                 await cb.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
+            tg_id_fmt2 = cb.from_user.id if cb.from_user else 0
             try:
-                launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+                launched = await _start_ozon_book_wizard(
+                    cb.message, state, rid, tg_id_fmt2, mode=mode,
+                )
             except Exception:
                 _wizard_release(rid)
                 raise
