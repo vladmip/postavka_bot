@@ -475,6 +475,330 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
         _wizard_release(rid)
 
 
+# ── Авто-брон на одну дату (Фаза 3 умной брони) ──────────────────────────
+# План: C:\Users\vladi\.claude\plans\smart-supply-booking.md
+# Сейчас — этап «explore»: создаём drafts для всех Ozon-кластеров заявки,
+# собираем слоты, ищем оптимальную дату. Bulk-book — следующая итерация.
+
+
+@router.callback_query(F.data.startswith("obauto:"))
+async def cb_obauto(cb: CallbackQuery, state: FSMContext) -> None:
+    """Кнопка «🎯 Авто-брон на одну дату» в карточке поставки.
+
+    Этап 1 (текущий): explore — создаём drafts, собираем слоты, показываем
+    оптимальную дату с топ-5 альтернатив. Без bulk-book.
+    Этап 2 (следующий): кнопка «✅ Бронируем» → bulk-book + auto-poll.
+    """
+    parts = cb.data.split(":")
+    if len(parts) < 2:
+        await cb.answer("Битый callback", show_alert=True)
+        return
+    rid = int(parts[1])
+    tg_id = cb.from_user.id if cb.from_user else 0
+    if not _wizard_acquire(rid):
+        await cb.answer(
+            f"⏳ Ozon-мастер для поставки #{rid} уже запущен.",
+            show_alert=True,
+        )
+        return
+    await cb.answer("🎯 Запускаю авто-брон…")
+    if not cb.message:
+        _wizard_release(rid)
+        return
+    try:
+        await _auto_book_explore(cb.message, state, rid, tg_id)
+    finally:
+        _wizard_release(rid)
+
+
+async def _auto_book_explore(
+    msg: Message, state: FSMContext, rid: int, tg_id: int,
+) -> None:
+    """Создать drafts для всех Ozon-кластеров заявки, дёрнуть scoring +
+    timeslot/info, посчитать `find_best_common_date`, показать юзеру.
+
+    Не бронирует — это этап «explore», даём юзеру выбрать что делать.
+    """
+    from src.services.auto_book import (
+        parse_timeslot_response, find_best_common_date, date_options_summary,
+    )
+
+    # 1. Контекст заявки
+    with db_session() as session:
+        req = get_shipment_request(session, rid, user_id=tg_id)
+        if not req:
+            await msg.answer(f"Поставка #{rid} не найдена.")
+            return
+        if not req.target_date_from:
+            await msg.answer(
+                "⚠ Сначала задай даты в /ship_plan — авто-брон ищет по ним."
+            )
+            return
+        oz_clusters = sorted({
+            it.cluster for it in req.items
+            if it.marketplace == "ozon" and not it.booked_supply_id
+        })
+        date_picks = list(req.target_dates_json or [])
+        hour_picks = list(req.target_hours_json or [])
+        items_per_cluster: Dict[str, List[Dict]] = {}
+        for cl in oz_clusters:
+            items, _ = _build_items_for_cluster(req, cl)
+            items_per_cluster[cl] = items
+        ozon_supply_type = req.ozon_supply_type or "direct"
+        crossdock_map = dict(req.crossdock_warehouses_json or {})
+
+    if not oz_clusters:
+        await msg.answer("В заявке нет несзабронированных Ozon-направлений.")
+        return
+
+    # 2. Ozon client
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id)
+    if oz is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
+        return
+
+    # 3. Прогресс-сообщение (одно, обновляем через edit_text)
+    allowed_dates_set = set()
+    from datetime import date as _date_cls
+    for d in date_picks:
+        try:
+            allowed_dates_set.add(_date_cls.fromisoformat(d))
+        except (ValueError, TypeError):
+            pass
+    allowed_hours_set = set(int(h) for h in hour_picks) if hour_picks else None
+
+    progress = await msg.answer(
+        f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
+        f"Кластеров: <b>{len(oz_clusters)}</b> ({', '.join(oz_clusters)})\n"
+        f"Дат: {', '.join(sorted(date_picks)) if date_picks else 'все 7 дней'}\n"
+        f"Часы: {sorted(allowed_hours_set) if allowed_hours_set else 'любые'}\n\n"
+        f"⏳ Создаю drafts… (~30-90с/кластер из-за лимита Ozon)"
+    )
+
+    async def _edit(text: str) -> None:
+        try:
+            await progress.edit_text(text)
+        except Exception:
+            pass  # MessageNotModified
+
+    # 4. Per-cluster: создать draft, дождаться scoring, дёрнуть timeslot/info
+    slots_per_cluster: Dict[str, List] = {}
+    log_lines: List[str] = []
+    is_cross = ozon_supply_type == "cross"
+    supply_type = 1 if is_cross else 2
+    draft_type = "CREATE_TYPE_CROSSDOCK" if is_cross else "CREATE_TYPE_DIRECT"
+
+    # Дата-диапазон для timeslot/info: от today до max(date_picks) + 1д.
+    from datetime import datetime as _dt, timezone, timedelta
+    now = _dt.now(timezone.utc)
+    date_from_iso = now.strftime("%Y-%m-%dT00:00:00Z")
+    if allowed_dates_set:
+        max_d = max(allowed_dates_set)
+        date_to_iso = (_dt.combine(max_d, _dt.min.time()) + timedelta(days=1)).replace(
+            tzinfo=timezone.utc
+        ).strftime("%Y-%m-%dT23:59:59Z")
+    else:
+        date_to_iso = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
+
+    for idx, cl in enumerate(oz_clusters, 1):
+        items = items_per_cluster[cl]
+        if not items:
+            log_lines.append(f"  ⚠ <b>{cl}</b>: пустой состав")
+            continue
+        # cluster_id (macrolocal)
+        cl_id = await _resolve_macrolocal_id(oz, cl)
+        if not cl_id:
+            log_lines.append(f"  ⚠ <b>{cl}</b>: cluster_id не сматчил")
+            continue
+        # CROSSDOCK требует drop_off — из ShipmentRequest.crossdock_warehouses_json
+        drop_off = None
+        if is_cross:
+            v = crossdock_map.get(cl)
+            try:
+                drop_off = int(v) if v else None
+            except (ValueError, TypeError):
+                drop_off = None
+            if not drop_off:
+                log_lines.append(
+                    f"  ⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off — задай через wizard"
+                )
+                continue
+
+        await _edit(
+            f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
+            f"⏳ Кластер {idx}/{len(oz_clusters)}: <b>{cl}</b> — создаю draft…\n\n"
+            + "\n".join(log_lines)
+        )
+
+        try:
+            op_id = await oz.draft_create(
+                items=items,
+                cluster_ids=[cl_id],
+                draft_type=draft_type,
+                drop_off_point_warehouse_id=drop_off,
+            )
+        except OzonAPIError as e:
+            log_lines.append(f"  ❌ <b>{cl}</b>: draft_create — <code>{str(e)[:120]}</code>")
+            continue
+        if op_id.startswith("sync:"):
+            draft_id = int(op_id.split(":", 1)[1])
+        else:
+            # async — polling до DONE
+            try:
+                info = await _wait_draft_ready(oz, op_id, max_attempts=10)
+            except OzonAPIError as e:
+                log_lines.append(f"  ❌ <b>{cl}</b>: poll — <code>{str(e)[:120]}</code>")
+                continue
+            draft_id = int(info.get("draft_id") or 0)
+            if not draft_id:
+                log_lines.append(f"  ❌ <b>{cl}</b>: draft_id не получен")
+                continue
+
+        # Wait scoring (FULL_AVAILABLE)
+        wh_id = None
+        wh_name = ""
+        for attempt in range(5):
+            await asyncio.sleep(3)
+            try:
+                info = await oz.draft_create_info(draft_id=draft_id)
+            except OzonAPIError as e:
+                if "429" in str(e):
+                    await asyncio.sleep(15)
+                    continue
+                break
+            all_whs = [
+                w for c in info.get("clusters", []) for w in c.get("warehouses", [])
+            ]
+            avail = [
+                w for w in all_whs
+                if (w.get("availability_status") or {}).get("state") == "FULL_AVAILABLE"
+            ]
+            if avail:
+                # Берём top-1 по rank
+                avail.sort(key=lambda w: w.get("total_rank", 999))
+                sw = avail[0].get("storage_warehouse") or {}
+                wh_id = int(sw.get("warehouse_id") or 0)
+                wh_name = str(sw.get("name") or "")
+                break
+        if not wh_id:
+            log_lines.append(
+                f"  ⚠ <b>{cl}</b>: scoring не нашёл подходящий склад (FULL_AVAILABLE)"
+            )
+            continue
+
+        # Дёргаем timeslot/info
+        try:
+            ts_response = await oz.draft_timeslot_info(
+                draft_id=draft_id,
+                date_from=date_from_iso,
+                date_to=date_to_iso,
+                warehouse_ids=[wh_id],
+                cluster_id=cl_id,
+                supply_type=supply_type,
+                retries_on_429=1,
+            )
+        except OzonAPIError as e:
+            log_lines.append(f"  ❌ <b>{cl}</b>: timeslot — <code>{str(e)[:120]}</code>")
+            continue
+        slots = parse_timeslot_response(
+            ts_response, cluster=cl, warehouse_id=wh_id, warehouse_name=wh_name,
+        )
+        slots_per_cluster[cl] = slots
+        unique_dates = sorted(set(s.date for s in slots))
+        log_lines.append(
+            f"  ✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
+            f"{len(unique_dates)} дат"
+        )
+        # Пауза между кластерами для соблюдения лимитов Ozon
+        if idx < len(oz_clusters):
+            await asyncio.sleep(5)
+
+    # 5. Алгоритм best_date
+    best_date = find_best_common_date(
+        slots_per_cluster,
+        allowed_dates=allowed_dates_set or None,
+        allowed_hours=allowed_hours_set,
+    )
+    summary_lines = date_options_summary(
+        slots_per_cluster,
+        allowed_dates=allowed_dates_set or None,
+        allowed_hours=allowed_hours_set,
+    )
+
+    # 6. Итоговое сообщение
+    result_lines = [
+        f"🎯 <b>Авто-брон поставки #{rid} — результат</b>\n",
+        f"<i>Drafts:</i>",
+    ]
+    result_lines.extend(log_lines)
+    result_lines.append("")
+    if best_date is None:
+        result_lines.append(
+            "🔴 <b>Не нашёл общей даты</b> — нет слотов ни по одной из твоих дат."
+        )
+    else:
+        clusters_on_best = sorted({
+            s.cluster for slots in slots_per_cluster.values()
+            for s in slots if s.date == best_date
+            and (allowed_hours_set is None or s.hour in allowed_hours_set)
+        })
+        result_lines.append(
+            f"🎯 <b>Оптимальная дата: {best_date.strftime('%d.%m')}</b>\n"
+            f"   Могут уехать: <b>{len(clusters_on_best)}/{len(oz_clusters)}</b> "
+            f"({', '.join(clusters_on_best)})"
+        )
+        if len(summary_lines) > 1:
+            result_lines.append("\n<i>Топ дат:</i>")
+            for d, n, cls in summary_lines[:5]:
+                result_lines.append(
+                    f"  {d.strftime('%d.%m')}: {n} кл. — {', '.join(cls[:4])}"
+                )
+        result_lines.append(
+            "\n⚠ <i>Авто-бронирование пока в разработке. "
+            "Запусти обычный wizard «🚀 Создать поставку Ozon» — "
+            "теперь знаешь оптимальную дату.</i>"
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ К карточке заявки",
+                              callback_data=f"ship_open:{rid}")],
+    ])
+    await _edit("\n".join(result_lines))
+    try:
+        await progress.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _resolve_macrolocal_id(oz: OzonClient, cluster_name: str) -> Optional[int]:
+    """Поиск macrolocal_cluster_id по имени кластера."""
+    try:
+        clusters = await oz.cluster_list(allow_stale=True)
+    except OzonAPIError:
+        return None
+    target_norm = _normalize(cluster_name)
+    for cl in clusters:
+        if _normalize(cl.get("name") or "") == target_norm:
+            mcid = cl.get("macrolocal_cluster_id") or cl.get("id")
+            try:
+                return int(mcid)
+            except (ValueError, TypeError):
+                return None
+    # Soft-match по подстроке
+    for cl in clusters:
+        if target_norm in _normalize(cl.get("name") or ""):
+            mcid = cl.get("macrolocal_cluster_id") or cl.get("id")
+            try:
+                return int(mcid)
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+# ── Конец авто-брон секции ──────────────────────────────────────────────
+
+
 async def _start_ozon_book_wizard(
     msg: Message, state: FSMContext, rid: int, tg_id: int, *, mode: str = "direct",
 ) -> bool:

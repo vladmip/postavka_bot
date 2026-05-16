@@ -434,10 +434,18 @@ def _render_request_card(req) -> tuple:
                     text="🚀 Создать поставку Ozon → Прямая",
                     callback_data=f"ozon_book_card:{req.id}:direct",
                 )])
+                rows.append([InlineKeyboardButton(
+                    text="🎯 Авто-брон на одну дату",
+                    callback_data=f"obauto:{req.id}",
+                )])
             elif req.ozon_supply_type == "cross":
                 rows.append([InlineKeyboardButton(
                     text="🚛 Создать поставку Ozon → Кросс-докинг",
                     callback_data=f"ozon_book_card:{req.id}:cross",
+                )])
+                rows.append([InlineKeyboardButton(
+                    text="🎯 Авто-брон на одну дату",
+                    callback_data=f"obauto:{req.id}",
                 )])
             else:
                 rows.append([InlineKeyboardButton(
