@@ -423,34 +423,23 @@ def _render_request_card(req) -> tuple:
             # Тип Ozon-поставки фиксируется при создании. NULL = legacy-заявка
             # до миграции — даём юзеру выбрать тип однократно прямо здесь.
             # cargo_format (BOX/PALLET) — спрашиваем тоже, перед запуском wizard'а.
+            # Кнопка «🎯 Авто-брон» убрана из карточки — авто-брон предлагается
+                # в финале /ship_plan flow (3 кнопки: 🎯 В одну дату / 🎯 В одно время / 🛠 Ручной).
+                # В карточке юзер видит только обычный wizard.
             if req.ozon_supply_type and not req.cargo_format:
-                # Тип уже задан, осталось спросить формат (для обычного wizard).
-                # Для авто-брон формат не нужен — Ozon сам выберет.
                 rows.append([InlineKeyboardButton(
                     text="🚀 Создать поставку Ozon (выбрать формат)",
                     callback_data=f"ship_pick_fmt:{req.id}",
-                )])
-                rows.append([InlineKeyboardButton(
-                    text="🎯 Авто-брон на одну дату",
-                    callback_data=f"obauto:{req.id}",
                 )])
             elif req.ozon_supply_type == "direct":
                 rows.append([InlineKeyboardButton(
                     text="🚀 Создать поставку Ozon → Прямая",
                     callback_data=f"ozon_book_card:{req.id}:direct",
                 )])
-                rows.append([InlineKeyboardButton(
-                    text="🎯 Авто-брон на одну дату",
-                    callback_data=f"obauto:{req.id}",
-                )])
             elif req.ozon_supply_type == "cross":
                 rows.append([InlineKeyboardButton(
                     text="🚛 Создать поставку Ozon → Кросс-докинг",
                     callback_data=f"ozon_book_card:{req.id}:cross",
-                )])
-                rows.append([InlineKeyboardButton(
-                    text="🎯 Авто-брон на одну дату",
-                    callback_data=f"obauto:{req.id}",
                 )])
             else:
                 rows.append([InlineKeyboardButton(
