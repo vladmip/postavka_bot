@@ -576,30 +576,20 @@ async def _auto_book_explore(
         return
 
     # CROSSDOCK без drop-off в БД — авто-брон не сработает (нужен warehouse_id
-    # для draft_create). Перекидываем в карточку: юзер откроет обычный wizard,
-    # пройдёт drop-off picker, drop-off сохранится в БД → второй клик 🎯 уже
-    # сработает.
+    # для draft_create). Перекидываем сразу в карточку поставки — юзер сам
+    # кликнет обычный wizard «🚛 Создать поставку Ozon → Кросс-докинг»,
+    # пройдёт drop-off picker, drop-off сохранится в БД. Никаких промежуточных
+    # сообщений (юзер просил без них).
     is_cross = ozon_supply_type == "cross"
     if is_cross:
         unfilled = [cl for cl in oz_clusters if not crossdock_map.get(cl)]
         if unfilled:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🚛 Открыть обычный wizard (выбор drop-off)",
-                    callback_data=f"ozon_book_card:{rid}:cross",
-                )],
-                [InlineKeyboardButton(text="📋 К карточке поставки",
-                                      callback_data=f"ship_open:{rid}")],
-            ])
-            await msg.answer(
-                f"🔀 <b>CROSSDOCK без drop-off</b>\n\n"
-                f"Нужно сначала выбрать точки отгрузки для кластеров:\n"
-                f"  • {', '.join(unfilled[:5])}"
-                + (f"\n  …и ещё {len(unfilled) - 5}" if len(unfilled) > 5 else "")
-                + f"\n\nОткрой обычный wizard, пройди picker drop-off — "
-                f"они сохранятся в поставке. Потом снова жми «🎯 Авто-брон».",
-                reply_markup=kb,
-            )
+            from src.bot.handlers.shipment import _render_request_card
+            with db_session() as session:
+                req = get_shipment_request(session, rid, user_id=tg_id)
+                if req:
+                    text, kb = _render_request_card(req)
+                    await safe_edit_or_answer(msg, text, reply_markup=kb)
             return
 
     # 2. Ozon client
