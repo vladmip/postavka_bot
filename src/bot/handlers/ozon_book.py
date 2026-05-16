@@ -1196,8 +1196,8 @@ async def _fetch_scoring_persistent(
             if attempt + 1 < max_outer:
                 delay = base_delay + random.randint(0, 30)
                 await _say(
-                    f"  ⏳ scoring попытка {attempt+1}/{max_outer}: "
-                    f"{err[:150]}. Жду {delay}с…"
+                    f"  ⏳ Жду расчёт от Ozon (попытка {attempt+1}/{max_outer}): "
+                    f"{err[:150]}. Ещё {delay}с…"
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -1268,7 +1268,7 @@ async def _fetch_scoring_persistent(
                     "<i>Ozon отклонил scoring. См. конкретную причину выше.</i>"
                 )
             await _say(
-                f"  🚫 <b>Ozon отклонил draft</b> (status=FAILED).\n{detail}\n\n{hint}"
+                f"  🚫 <b>Ozon отказал в расчёте</b> (нельзя забронировать).\n{detail}\n\n{hint}"
             )
             # Удаляем cached draft чтобы при повторном входе тот же drop-off
             # не подтянулся заново и не зациклил ту же ошибку.
@@ -1334,11 +1334,11 @@ async def _fetch_scoring_persistent(
                     if n_unspecified > 0 else "IN_PROGRESS"
                 )
                 await _say(
-                    f"  ⏳ Scoring дозревает ({hint}, попытка {attempt+1}/{max_outer}). Жду {delay}с…"
+                    f"  ⏳ Ozon считает варианты ({hint}, попытка {attempt+1}/{max_outer}). Ещё {delay}с…"
                 )
                 await asyncio.sleep(delay)
                 continue
-            await _say(f"  ❌ Scoring так и не посчитался за ~{max_outer*(base_delay+15)//60} мин.")
+            await _say(f"  ❌ Ozon не успел посчитать за ~{max_outer*(base_delay+15)//60} мин.")
             return [], None
 
         # Для CROSSDOCK wh_list пустой — не пишем «0 складов», это путает.
@@ -1572,7 +1572,7 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
 
         await progress_add(
             msg, state,
-            f"  ✅ draft <code>{draft_id}</code>, тяну scoring…"
+            f"  ✅ Расчёт #{draft_id} создан, считаю варианты складов…"
         )
 
         # Получаем scored. До 3 минут ретраев.
@@ -2262,10 +2262,10 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
             await progress_add(msg, state, f"  ⚠ «{cl}»: нет SKU с offer_id — пропуск.")
             continue
 
-        wh_log = f", target_wh={wh_id}" if wh_id else ""
+        wh_log = f" (склад #{wh_id})" if wh_id else ""
         await progress_add(
             msg, state,
-            f"  POST /v1/draft/direct/create: cluster_id={cid}, items={len(items)}{wh_log} (жду 15с)"
+            f"  📦 Создаю расчёт{wh_log}: {len(items)} SKU. Подождём 15с…"
         )
         await asyncio.sleep(15.0)
         try:
@@ -2275,13 +2275,13 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 draft_type=draft_type,
             )
         except OzonAPIError as e:
-            await progress_add(msg, state, f"  ❌ draft_create: <code>{str(e)[:400]}</code>")
+            await progress_add(msg, state, f"  ❌ Не получилось: <code>{str(e)[:400]}</code>")
             continue
 
         if op_id.startswith("sync:"):
             draft_id = op_id.split(":", 1)[1]
         else:
-            await progress_add(msg, state, f"  ⏳ operation_id={op_id[:24]}…, polling…")
+            await progress_add(msg, state, "  ⏳ Ждём Ozon…")
             info = await _wait_draft_ready(oz, op_id)
             status = info.get("status", "?")
             if "SUCCESS" not in status.upper() and "DONE" not in status.upper():
@@ -2289,12 +2289,12 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
                 err_s = "; ".join(str(e)[:120] for e in errs[:3]) if errs else "?"
                 await progress_add(
                     msg, state,
-                    f"  ❌ draft не готов: {status} / {err_s}"
+                    f"  ❌ Расчёт не готов: {status} / {err_s}"
                 )
                 continue
             draft_id = info.get("draft_id") or info.get("calculation_id")
         if not draft_id:
-            await progress_add(msg, state, "  ⚠ Нет draft_id в ответе.")
+            await progress_add(msg, state, "  ⚠ Ozon не вернул расчёт.")
             continue
 
         supply_type_int = 1 if "CROSSDOCK" in (draft_type or "").upper() else 2
@@ -2307,7 +2307,7 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
             "wh_id": wh_id,
             "supply_type": supply_type_int,
         })
-        await progress_add(msg, state, f"  ✅ draft <code>{draft_id}</code>")
+        await progress_add(msg, state, f"  ✅ Расчёт #{draft_id} готов")
 
     if not drafts_made:
         await progress_add(msg, state, "⚠ Ни один draft не создан.")
