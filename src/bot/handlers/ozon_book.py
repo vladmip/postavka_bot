@@ -3703,18 +3703,42 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
             summary.append((slot["cluster"], "❌"))
 
     final_lines = "\n".join(f"  {mark} {cl}" for cl, mark in summary)
+    # Failed-кластеры до bulk-book (отказ scoring: OUT_OF_ASSORTMENT, NO_TIMESLOTS).
+    # Раньше они не попадали в финальный отчёт → юзер видел «Успешно: 1»
+    # при реально 1 из 3 кластеров.
+    failed_scoring = data.get("ob_failed_clusters_scoring") or []
+    failed_other = data.get("ob_failed_clusters") or []
+    out_of_book = [c for c in failed_other if c not in failed_scoring]
+    skipped_block = ""
+    n_total = ok_count + fail_count + len(failed_scoring) + len(out_of_book)
+    if failed_scoring:
+        skipped_block += (
+            f"\n\n🚫 <b>Без слотов на твои даты</b> ({len(failed_scoring)}):\n  "
+            + ", ".join(failed_scoring)
+        )
+    if out_of_book:
+        skipped_block += (
+            f"\n\n⏳ <b>В авто-поиске</b> ({len(out_of_book)}): "
+            + ", ".join(out_of_book)
+            + "\n  <i>Бот ищет слоты в течение часа, пришлёт сообщение при успехе.</i>"
+        )
     await progress_add(
         msg, state,
-        f"\n🏁 <b>Готово.</b> Успешно: {ok_count}, ошибки: {fail_count}\n{final_lines}",
+        f"\n🏁 <b>Готово.</b> Из {n_total} направлений: "
+        f"✅ {ok_count} · ❌ {fail_count}"
+        + (f" · 🚫 {len(failed_scoring)} без слотов" if failed_scoring else "")
+        + (f" · ⏳ {len(out_of_book)} ищу" if out_of_book else "")
+        + f"\n{final_lines}{skipped_block}",
     )
 
     if rid:
         rows: List[List[InlineKeyboardButton]] = []
-        if fail_count > 0:
+        if fail_count > 0 or failed_scoring:
             ob_type = data.get("ob_type") or "CREATE_TYPE_DIRECT"
             resume_mode = "cross" if "CROSSDOCK" in ob_type else "direct"
+            remain = fail_count + len(failed_scoring)
             rows.append([InlineKeyboardButton(
-                text=f"🔁 Продолжить с оставшимися ({fail_count})",
+                text=f"🔁 Продолжить с оставшимися ({remain})",
                 callback_data=f"ozon_book_card:{rid}:{resume_mode}",
             )])
         rows.append([InlineKeyboardButton(
@@ -3730,8 +3754,9 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
         )])
         header = (
             f"✅ Все {ok_count} забронированы. Что дальше?"
-            if fail_count == 0
-            else f"⚠ Забронировано {ok_count}, не получилось: {fail_count}."
+            if fail_count == 0 and not failed_scoring
+            else f"⚠ Забронировано {ok_count}/{n_total}. "
+                 f"Не удалось: {fail_count + len(failed_scoring)}."
         )
         try:
             await msg.answer(header, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
