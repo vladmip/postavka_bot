@@ -503,18 +503,30 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
     if cli is None:
         await msg.answer(_NEED_OZON)
         return
-    await msg.answer("📡 Ozon: тяну весь каталог…")
+    # Одно сообщение, обновляем edit_text на каждом шаге — не плодим N сообщений
+    # как раньше (см. feedback_max_edit).
+    placeholder = await msg.answer("📡 <b>Ozon: тяну каталог…</b>")
+
+    async def _edit(text: str) -> None:
+        try:
+            await placeholder.edit_text(text)
+        except Exception:
+            pass  # MessageNotModified и т.п.
 
     try:
         prods = await cli.product_list(limit=5000)
         if not prods:
-            await msg.answer("Каталог Ozon пуст.")
+            await _edit("ℹ Каталог Ozon пуст.")
             return
         ids = [p.get("product_id") for p in prods if p.get("product_id")]
-        await msg.answer(f"Получил {len(ids)} товаров. Запрашиваю детали (с barcode)…")
+        await _edit(
+            f"📡 <b>Ozon: каталог получен</b>\n"
+            f"  • товаров: {len(ids)}\n"
+            f"  • запрашиваю детали (barcode)…"
+        )
         infos = await cli.product_info_list(ids)
     except OzonAPIError as e:
-        await msg.answer(f"⚠ Ozon API: <code>{str(e)[:500]}</code>")
+        await _edit(f"⚠ Ozon API: <code>{str(e)[:500]}</code>")
         return
 
     from sqlalchemy import or_
@@ -578,13 +590,13 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
             session.delete(p)
 
     lines = [
-        f"✅ Каталог Ozon синхронизирован.",
+        f"✅ <b>Каталог Ozon синхронизирован</b>",
         f"  • новых: {added}",
         f"  • обновлено: {updated}",
         f"  • удалено (нет в кабинете): {len(stale)}",
-        f"Всего в Ozon: {len(prods)} товаров.",
+        f"  • всего в Ozon: <b>{len(prods)}</b>",
     ]
-    await send_long(msg, "\n".join(lines))
+    await _edit("\n".join(lines))
 
 
 @router.message(Command("sku_link_wb"))
@@ -600,18 +612,25 @@ async def cmd_sku_link_wb(msg: Message) -> None:
         await msg.answer(_NEED_WB)
         return
     cli = WBClient(wb_key)
-    await msg.answer("📡 WB: тяну каталог карточек (Content API)…")
+    placeholder = await msg.answer("📡 <b>WB: тяну каталог карточек…</b>")
+
+    async def _edit(text: str) -> None:
+        try:
+            await placeholder.edit_text(text)
+        except Exception:
+            pass
+
     try:
         cards = await cli.cards_list(limit_total=5000)
     except WBAPIError as e:
-        await msg.answer(
+        await _edit(
             f"⚠ WB API: <code>{str(e)[:500]}</code>\n\n"
             f"Проверь скоуп токена «Контент». /api_check."
         )
         return
 
     if not cards:
-        await msg.answer("Карточек нет.")
+        await _edit("ℹ Карточек WB нет.")
         return
 
     from sqlalchemy import or_
@@ -663,13 +682,13 @@ async def cmd_sku_link_wb(msg: Message) -> None:
             session.delete(p)
 
     lines = [
-        f"✅ Каталог WB синхронизирован.",
+        f"✅ <b>Каталог WB синхронизирован</b>",
         f"  • новых: {added}",
         f"  • обновлено: {updated}",
         f"  • удалено (нет в кабинете): {len(stale)}",
-        f"Всего в WB: {len(cards)} карточек.",
+        f"  • всего в WB: <b>{len(cards)}</b>",
     ]
-    await send_long(msg, "\n".join(lines))
+    await _edit("\n".join(lines))
 
 
 @router.message(Command("ozon_warehouses"))

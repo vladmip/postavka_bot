@@ -305,12 +305,15 @@ async def _handle_wide_ship_file(msg, state: FSMContext, path: Path, fname: str)
         return
 
     # Pre-validation: суммируем артикулы, проверяем их наличие в каталоге ДО создания.
+    # Multi-tenant: ищем в каталоге конкретного юзера, не глобально.
     from src.services.shipment_service import _find_ozon_product
+    from src.services.user_service import current_user_id_from
+    tg_id = current_user_id_from(msg)
     all_articles = {it.article_or_barcode for p in parsed_list for it in p.items}
     with db_session() as session:
         unmatched_articles = sorted(
             art for art in all_articles
-            if _find_ozon_product(session, art) is None
+            if _find_ozon_product(session, art, user_id=tg_id) is None
         )
     if unmatched_articles:
         # Жёсткая остановка: половина и больше — отбиваем.
@@ -339,11 +342,11 @@ async def _handle_wide_ship_file(msg, state: FSMContext, path: Path, fname: str)
     clusters = [p.cluster_name for p in parsed_list]
 
     with db_session() as session:
-        req = create_shipment_request(session, source_file=fname)
+        req = create_shipment_request(session, source_file=fname, user_id=tg_id)
         rid = req.id
         per_cluster = []
         for parsed in parsed_list:
-            result = attach_ship_file(session, rid, parsed)
+            result = attach_ship_file(session, rid, parsed, user_id=tg_id)
             per_cluster.append((parsed.cluster_name, result))
 
     lines = [
