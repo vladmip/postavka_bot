@@ -3915,6 +3915,24 @@ async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None
         except Exception:
             pass  # picker мог уже не быть editable — не критично
 
+        # Сохраняем drop-off в БД — нужен для авто-брон CROSSDOCK
+        # (`/v1/draft/crossdock/create` требует drop_off_point_warehouse_id).
+        # До этого правила drop-off жил только в state и пропадал после wizard'а.
+        tg_id_dropoff = int(data.get("ob_tg_id") or 0)
+        try:
+            with db_session() as _s:
+                _req = get_shipment_request(_s, rid, user_id=tg_id_dropoff)
+                if _req:
+                    cd_map = dict(_req.crossdock_warehouses_json or {})
+                    for c, v in choices.items():
+                        try:
+                            cd_map[c] = int(v.get("wh_id") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    _req.crossdock_warehouses_json = cd_map
+        except Exception as e:
+            logger.warning("save crossdock_warehouses_json failed rid=%s: %s", rid, e)
+
         # В «сардельку» — кратко: детали уже выше, в самом picker'е.
         await progress_add(
             msg, state,
