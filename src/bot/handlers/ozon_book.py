@@ -566,6 +566,33 @@ async def _auto_book_explore(
         await msg.answer("В заявке нет несзабронированных Ozon-направлений.")
         return
 
+    # CROSSDOCK без drop-off в БД — авто-брон не сработает (нужен warehouse_id
+    # для draft_create). Перекидываем в карточку: юзер откроет обычный wizard,
+    # пройдёт drop-off picker, drop-off сохранится в БД → второй клик 🎯 уже
+    # сработает.
+    is_cross = ozon_supply_type == "cross"
+    if is_cross:
+        unfilled = [cl for cl in oz_clusters if not crossdock_map.get(cl)]
+        if unfilled:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🚛 Открыть обычный wizard (выбор drop-off)",
+                    callback_data=f"ozon_book_card:{rid}:cross",
+                )],
+                [InlineKeyboardButton(text="📋 К карточке поставки",
+                                      callback_data=f"ship_open:{rid}")],
+            ])
+            await msg.answer(
+                f"🔀 <b>CROSSDOCK без drop-off</b>\n\n"
+                f"Нужно сначала выбрать точки отгрузки для кластеров:\n"
+                f"  • {', '.join(unfilled[:5])}"
+                + (f"\n  …и ещё {len(unfilled) - 5}" if len(unfilled) > 5 else "")
+                + f"\n\nОткрой обычный wizard, пройди picker drop-off — "
+                f"они сохранятся в поставке. Потом снова жми «🎯 Авто-брон».",
+                reply_markup=kb,
+            )
+            return
+
     # 2. Ozon client
     with db_session() as s:
         oz = get_ozon_client_for(s, tg_id)
@@ -601,7 +628,6 @@ async def _auto_book_explore(
     slots_per_cluster: Dict[str, List] = {}
     drafts_meta: Dict[str, Dict] = {}  # cluster → {draft_id, cluster_id, wh_id, wh_name, drop_off}
     log_lines: List[str] = []
-    is_cross = ozon_supply_type == "cross"
     supply_type = 1 if is_cross else 2
     draft_type = "CREATE_TYPE_CROSSDOCK" if is_cross else "CREATE_TYPE_DIRECT"
 
