@@ -341,28 +341,23 @@ async def _handle_wide_ship_file(msg, state: FSMContext, path: Path, fname: str)
     total_qty = sum(sum(it.qty for it in p.items) for p in parsed_list)
     clusters = [p.cluster_name for p in parsed_list]
 
-    with db_session() as session:
-        req = create_shipment_request(session, source_file=fname, user_id=tg_id)
-        rid = req.id
-        per_cluster = []
-        for parsed in parsed_list:
-            result = attach_ship_file(session, rid, parsed, user_id=tg_id)
-            per_cluster.append((parsed.cluster_name, result))
-
-    lines = [
-        f"📦 <b>Создана заявка #{rid}</b>",
-        f"Кластеров: <b>{len(clusters)}</b> · Позиций: <b>{total_items}</b> · Количество: <b>{total_qty}</b>",
-        "",
-        "<b>По кластерам:</b>",
-    ]
-    for cl, result in per_cluster:
-        unm = f" ⚠ {len(result.unmatched_articles)} без SKU" if result.unmatched_articles else ""
-        lines.append(f"  • {cl}: {result.matched} SKU{unm}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Открыть поставку", callback_data=f"ship_open:{rid}")],
-        [InlineKeyboardButton(text="📋 Все заявки", callback_data="menu:ships")],
-    ])
-    await msg.answer("\n".join(lines), reply_markup=kb)
+    # До создания заявки — спрашиваем тип Ozon (Прямая / Кросс-докинг).
+    # Раньше тип спрашивался уже из карточки поставки — лишний клик.
+    # Сохраняем путь к файлу в state, в cb_up_otype (kind="wide") перепарсим
+    # и создадим заявку с уже выставленным ozon_supply_type.
+    from src.bot.handlers.shipment import _ask_ozon_type_for_new
+    await state.update_data(
+        up_otype_kind="wide",
+        up_wide_file_path=str(path),
+        up_wide_file_name=fname,
+    )
+    header = (
+        f"📋 Распарсил файл «{fname}»\n"
+        f"Кластеров: <b>{len(clusters)}</b> · "
+        f"Позиций: <b>{total_items}</b> · "
+        f"Количество: <b>{total_qty}</b>"
+    )
+    await _ask_ozon_type_for_new(msg, state, header=header)
 
 
 # ── ZIP handling ─────────────────────────────────────────────────────────

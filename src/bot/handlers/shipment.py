@@ -1112,6 +1112,51 @@ async def cb_up_otype(cb: CallbackQuery, state: FSMContext) -> None:
         await _create_zip_together_request(cb.message, state, paths, zip_name, otype=otype)
         return
 
+    if kind == "wide":
+        # Широкий xlsx-шаблон новой поставки (кластер × артикул × кол-во).
+        from src.parsers.wide_ship_request import parse_wide_ship_file
+        fpath = data.get("up_wide_file_path", "")
+        fname = data.get("up_wide_file_name", "")
+        if not fpath:
+            await safe_edit_or_answer(cb.message, "⚠ Путь файла потерян, пришли заново.")
+            return
+        try:
+            parsed_list = parse_wide_ship_file(Path(fpath), original_name=fname)
+        except Exception as e:
+            await safe_edit_or_answer(
+                cb.message, f"⚠ Не распарсил {fname}: <code>{e}</code>",
+            )
+            return
+        tg_id = cb.from_user.id if cb.from_user else 0
+        with db_session() as session:
+            req = create_shipment_request(session, source_file=fname, user_id=tg_id)
+            req.ozon_supply_type = otype
+            rid = req.id
+            per_cluster = []
+            for parsed in parsed_list:
+                result = attach_ship_file(session, rid, parsed, user_id=tg_id)
+                per_cluster.append((parsed.cluster_name, result))
+        total_items = sum(len(p.items) for p in parsed_list)
+        total_qty = sum(sum(it.qty for it in p.items) for p in parsed_list)
+        clusters = [p.cluster_name for p in parsed_list]
+        lines = [
+            f"📦 <b>Создана поставка #{rid}</b> · {label}",
+            f"Кластеров: <b>{len(clusters)}</b> · Позиций: <b>{total_items}</b> · Количество: <b>{total_qty}</b>",
+            "",
+            "<b>По кластерам:</b>",
+        ]
+        for cl, result in per_cluster:
+            unm = f" ⚠ {len(result.unmatched_articles)} без SKU" if result.unmatched_articles else ""
+            lines.append(f"  • {cl}: {result.matched} SKU{unm}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛠 Спланировать даты",
+                                  callback_data=f"ship_plan:{rid}")],
+            [InlineKeyboardButton(text="📋 Открыть поставку",
+                                  callback_data=f"ship_open:{rid}")],
+        ])
+        await safe_edit_or_answer(cb.message, "\n".join(lines), reply_markup=kb)
+        return
+
 
 @router.callback_query(F.data.startswith("ship_pick_fmt:"))
 async def cb_ship_pick_fmt(cb: CallbackQuery, state: FSMContext) -> None:
