@@ -1054,6 +1054,7 @@ async def _spawn_auto_poll_for_best_date(
         [best_date_iso],
         state_data.get("ob_hour_picks") or [],
         tg_id=state_data.get("ob_tg_id"),
+        auto_book=True,  # из 🎯 авто-брона — бронируем найденное автомат
     ))
     _AUTO_POLL_TASKS[rid] = task
     try:
@@ -1656,7 +1657,12 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
     with db_session() as session:
         cleanup_expired(session)
 
-    for cl in clusters:
+    for cl_idx, cl in enumerate(clusters):
+        # Пауза 8с между кластерами — Ozon /v2/draft/create/info имеет
+        # per-second лимит на кабинет. Если два кластера дают scoring запрос
+        # с разницей <1с → 429 «request rate limit per second».
+        if cl_idx > 0:
+            await asyncio.sleep(8.0)
         await progress_add(msg, state, f"🔄 Кластер <b>«{cl}»</b>…")
 
         # 1. Проверяем кэш — есть ли свежий draft (<25 мин) для (rid, cl)
@@ -2840,6 +2846,88 @@ async def _recreate_draft_for_auto_poll(
         return None
 
 
+async def _silent_book_slot(
+    bot, chat_id: int, rid: int, slot: Dict, tg_id: int,
+) -> bool:
+    """Бронирует слот без UI/state (для авто-брон из _auto_poll_slots).
+    После успеха шлёт сообщение «✅ Самара забронирована…» в чат.
+    Возвращает True/False. Никаких progress_add — мы вне FSM.
+    """
+    oz = _ozon_client_for_tg(tg_id) if tg_id else None
+    if oz is None:
+        return False
+    cluster_id = slot.get("cluster_id")
+    if not cluster_id:
+        return False
+    # supply/create с retry на 429
+    saw_429 = False
+    errors = None
+    for attempt in range(3):
+        try:
+            errors = await oz.draft_supply_create_v2(
+                draft_id=slot["draft_id"],
+                cluster_id=int(cluster_id),
+                warehouse_id=slot["warehouse_id"],
+                timeslot_from=slot["from"],
+                timeslot_to=slot["to"],
+                supply_type=slot.get("supply_type", 2),
+            )
+            break
+        except OzonAPIError as e:
+            err_str = str(e)
+            if "429" in err_str or "rate limit" in err_str.lower():
+                saw_429 = True
+                if attempt < 2:
+                    await asyncio.sleep(45)
+                    continue
+            logger.warning("auto-poll silent_book supply/create failed: %s", e)
+            return False
+    if errors:
+        return False
+    # polling status
+    final = None
+    for _ in range(30):
+        await asyncio.sleep(2)
+        try:
+            info = await oz.draft_supply_create_status_v2(slot["draft_id"])
+        except OzonAPIError:
+            return False
+        status = str(info.get("status") or "").upper()
+        if status in {"SUCCESS", "FAILED"}:
+            final = info
+            break
+    if not final or str(final.get("status") or "").upper() != "SUCCESS":
+        return False
+    order_id = final.get("order_id")
+    # Сохраняем в БД items
+    with db_session() as session:
+        req = get_shipment_request(session, rid, user_id=tg_id)
+        if req and order_id:
+            is_crossdock = _is_crossdock_wh(slot.get("warehouse_name"), slot.get("warehouse_id"))
+            wh_to_save = None if is_crossdock else slot.get("warehouse_name")
+            for it in req.items:
+                if it.marketplace == "ozon" and it.cluster == slot["cluster"]:
+                    it.booked_supply_id = str(order_id)
+                    it.target_warehouse = wh_to_save
+                    it.booked_slot_at = datetime.fromisoformat(
+                        slot["from"].replace("Z", "+00:00").split("+")[0]
+                    )
+            from src.services.shipment_service import refresh_request_state_after_booking
+            refresh_request_state_after_booking(req)
+    drop_off_display = slot.get("drop_off_name") or slot.get("warehouse_name") or "—"
+    slot_label = f"{slot['from'][:10]} {slot['from'][11:16]}"
+    try:
+        await bot.send_message(
+            chat_id,
+            f"🔔 <b>Авто-брон #{rid}: {slot['cluster']} забронирована!</b>\n"
+            f"📌 {slot_label} · {drop_off_display}\n"
+            f"order_id <code>{order_id}</code>",
+        )
+    except Exception:
+        pass
+    return True
+
+
 async def _auto_poll_slots(
     bot,
     chat_id: int,
@@ -2850,13 +2938,15 @@ async def _auto_poll_slots(
     date_picks: Optional[List[str]] = None,
     hour_picks: Optional[List[int]] = None,
     tg_id: Optional[int] = None,
+    auto_book: bool = False,
 ) -> None:
     """Раз в 60 сек дёргает timeslot/info. До 60 мин общая длительность.
     Каждые ~28 мин пересоздаёт drafts (Ozon draft живёт 30 мин). Если за час
     слотов нет — пишет финальное «не нашёл, братан» сообщение.
-    Изоляция: ключом в _AUTO_POLL_TASKS служит rid — параллельные заявки
-    запускают свои независимые auto-poll и не мешают друг другу.
-    `hour_picks` (если задан) — фильтр часов старта слотов.
+
+    `auto_book=True`: при нахождении слота сразу бронит через _silent_book_slot
+    (нужно для авто-брон режима — юзер кликнул «🎯 В одну дату», ждёт автомат).
+    `auto_book=False`: присылает inline-кнопки для ручного выбора слота (legacy).
     """
     import time as _t
     hour_set = {int(h) for h in (hour_picks or [])}
@@ -2970,7 +3060,31 @@ async def _auto_poll_slots(
                     logger.exception("auto-poll unexpected: %s", e)
 
             if all_slot_entries:
-                # Успех — постим слоты
+                if auto_book:
+                    # Авто-брон режим: бронируем сами, по 1 слоту на draft.
+                    # Берём ПЕРВЫЙ slot каждого draft (самый ранний, отсорт. выше).
+                    by_draft: Dict[int, Dict] = {}
+                    for s in all_slot_entries:
+                        d_id = int(s["draft_id"])
+                        if d_id not in by_draft:
+                            by_draft[d_id] = s
+                    booked_count = 0
+                    for d_id, slot in by_draft.items():
+                        # drop_off_name из контекста этого draft
+                        for d_ctx in drafts:
+                            if int(d_ctx.get("draft_id") or 0) == d_id:
+                                slot["drop_off_name"] = d_ctx.get("drop_off_warehouse_name") or ""
+                                break
+                        ok = await _silent_book_slot(bot, chat_id, rid, slot, tg_id or 0)
+                        if ok:
+                            booked_count += 1
+                        await asyncio.sleep(5)  # пауза между supply/create
+                    logger.info(
+                        "auto-poll auto-book: rid=%d booked %d/%d drafts",
+                        rid, booked_count, len(by_draft),
+                    )
+                    return
+                # Legacy режим — присылаем кнопки для ручного выбора
                 await _post_found_slots(bot, chat_id, rid, all_slot_entries, tg_id=tg_id or 0)
                 logger.info("auto-poll success: rid=%d, slots=%d", rid, len(all_slot_entries))
                 return
