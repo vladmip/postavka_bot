@@ -3859,20 +3859,26 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
     ok_count = 0
     fail_count = 0
     summary: List[Tuple[str, str]] = []
-    # Ozon /v2/draft/supply/create — узкий per-second лимит. Если дёргать его
-    # подряд без пауз, второй-третий кластер ловит 429. Жёсткая пауза ≥60с
-    # между кластерами разжимает окно. После 429 у предыдущего — пауза дольше.
-    pause_between = 60
-    pause_after_429 = 90
+    # Ozon /v2/draft/supply/create — per-second лимит на кабинет. Драфты уже
+    # созданы — пауза нужна только для самой брони (supply/create), и она
+    # короткая. _book_one_slot ниже сам делает retry с паузой 45с на 429,
+    # так что даже если поймаем — не страшно.
+    pause_between = 25
+    pause_after_429 = 60
     keys = sorted(choices.keys(), key=int)
     last_was_429 = False
     for idx, i_str in enumerate(keys):
         slot = choices[i_str]
         if idx > 0:
             wait_s = pause_after_429 if last_was_429 else pause_between
+            reason = (
+                "после 429 — даём Ozon отдохнуть"
+                if last_was_429
+                else "rate-limit /v2/draft/supply/create"
+            )
             await progress_add(
                 msg, state,
-                f"\n⏱ Пауза {wait_s}с перед следующим кластером (Ozon per-second лимит)…",
+                f"\n⏱ Пауза {wait_s}с до следующего кластера ({reason})…",
             )
             await asyncio.sleep(wait_s)
         await progress_add(
