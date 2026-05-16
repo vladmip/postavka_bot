@@ -3859,12 +3859,11 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
     ok_count = 0
     fail_count = 0
     summary: List[Tuple[str, str]] = []
-    # Ozon /v2/draft/supply/create — per-second лимит на кабинет. Драфты уже
-    # созданы — пауза нужна только для самой брони (supply/create), и она
-    # короткая. _book_one_slot ниже сам делает retry с паузой 45с на 429,
-    # так что даже если поймаем — не страшно.
-    pause_between = 25
-    pause_after_429 = 60
+    # Ozon /v2/draft/supply/create лимит ~2 req/sec на кабинет. Драфты уже
+    # созданы — нужно только бронирование. Пауза 5с — буфер на anti-spam,
+    # если поймаем 429 — _book_one_slot retry с паузой 45с (внутри).
+    pause_between = 5
+    pause_after_429 = 30
     keys = sorted(choices.keys(), key=int)
     last_was_429 = False
     for idx, i_str in enumerate(keys):
