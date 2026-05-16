@@ -33,6 +33,7 @@ RUNOUT_GREEN_DAYS = 30     # >30 дней по 28d-rate → 🟢 в порядк
 TOP_URGENT_LIMIT = 5       # топ-5 «срочно отгрузить» — чтобы на 100+ SKU не было каши
 TOP_RUNOUT_RED_LIMIT = 5   # топ-5 🔴 «кончится за <15 дней»
 TOP_RUNOUT_YELLOW_LIMIT = 3 # топ-3 🟡 «15–30 дней»
+URGENT_TARGET_DAYS = 14    # «дозаправляем» до 14 дней покрытия по 7d-rate
 
 
 # ── Структуры результата ─────────────────────────────────────────────────
@@ -72,6 +73,7 @@ class SkuLine:
     rate_per_day: float    # средняя скорость продаж
     days_left: float       # сколько дней до нуля
     color: str             # '🔴' / '🟡' / '🟢'
+    to_ship_qty: int = 0   # рекомендованное кол-во к отгрузке (urgent-режим)
 
 
 @dataclass
@@ -347,13 +349,17 @@ async def collect_sales_and_stocks(
 
 def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLine]:
     """mode='urgent' → срочно отгрузить (по 7d-rate), 🔴 < 7д, 🟡 < 14д, остальное скрываем.
+                       Считаем to_ship_qty = rate*URGENT_TARGET_DAYS − stock.
+                       Сортировка по to_ship_qty ↓ (что больше всего просит — наверху).
     mode='runout' → когда кончится (по 28d-rate), 🔴 < 15д, 🟡 < 30д, 🟢 > 30д.
+                    Сортировка по days_left ↑ (что быстрее закончится — наверху).
     Товары с stock=0 пропускаем — они уже закончились, в «срочно/кончатся» бессмысленно."""
     lines: List[SkuLine] = []
     for sku, e in by_sku.items():
         stock = int(e.get("stock") or 0)
         if stock <= 0:
             continue  # уже закончилось — не «срочно», просто факт
+        to_ship = 0
         if mode == "urgent":
             sold = e.get("sold_7d") or 0
             rate = sold / 7.0
@@ -366,6 +372,10 @@ def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLin
                 color = "🟡"
             else:
                 continue
+            # Сколько докинуть чтобы хватило на URGENT_TARGET_DAYS (14 по умолчанию).
+            # Округляем вверх — лучше +1 коробка, чем закончилось.
+            target_qty = rate * URGENT_TARGET_DAYS
+            to_ship = max(0, int(-(-target_qty // 1) - stock))
         else:  # runout
             sold = e.get("sold_28d") or 0
             rate = sold / 28.0
@@ -386,8 +396,13 @@ def _build_lines(by_sku: Dict[int, Dict[str, Any]], *, mode: str) -> List[SkuLin
             rate_per_day=rate,
             days_left=days_left,
             color=color,
+            to_ship_qty=to_ship,
         ))
-    lines.sort(key=lambda x: x.days_left)
+    if mode == "urgent":
+        # Самые «голодные» (что больше всего просит докинуть) — наверху.
+        lines.sort(key=lambda x: (-x.to_ship_qty, x.days_left))
+    else:
+        lines.sort(key=lambda x: x.days_left)
     return lines
 
 
@@ -490,15 +505,16 @@ def _fmt_sku_line(line: SkuLine, *, show_days: bool = True) -> str:
     label = f"<b>{name}</b>"
     if line.offer_id:
         label += f" <code>{line.offer_id}</code>"
+    days = "∞" if line.days_left == float("inf") else f"{line.days_left:.0f}д"
+    ship_part = f" · <b>отгрузить {line.to_ship_qty}</b>" if line.to_ship_qty > 0 else ""
     if show_days:
-        days = "∞" if line.days_left == float("inf") else f"{line.days_left:.0f}д"
         return (
             f"{line.color} {label}\n"
-            f"   ост. {line.stock} · {line.rate_per_day:.1f}/д → {days}"
+            f"   ост. {line.stock} · {line.rate_per_day:.1f}/д → {days}{ship_part}"
         )
     return (
         f"{line.color} {label}\n"
-        f"   ост. {line.stock} · {line.rate_per_day:.1f}/д"
+        f"   ост. {line.stock} · {line.rate_per_day:.1f}/д{ship_part}"
     )
 
 
@@ -577,15 +593,19 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"  …и ещё {len(r.removal_from_supply) - 8} групп")
         lines.append("")
 
-    # Срочно отгрузить — топ-5
-    lines.append("🔥 <b>Срочно отгрузить</b> <i>(по продажам за 7 дней)</i>")
+    # Срочно отгрузить — топ-5 по объёму к отгрузке (rate * 14дн − stock).
+    header_count = min(TOP_URGENT_LIMIT, len(data.urgent))
+    lines.append(
+        f"🔥 <b>Топ-{header_count} срочно отгрузить</b> "
+        f"<i>(по продажам за 7 дней, цель — покрыть {URGENT_TARGET_DAYS} дн)</i>"
+    )
     if not data.urgent:
         lines.append("✅ Запасов хватает — паника отменяется.")
     else:
         for line in data.urgent[:TOP_URGENT_LIMIT]:
             lines.append(_fmt_sku_line(line))
         if len(data.urgent) > TOP_URGENT_LIMIT:
-            lines.append(f"  …и ещё {len(data.urgent) - TOP_URGENT_LIMIT}")
+            lines.append(f"  …и ещё {len(data.urgent) - TOP_URGENT_LIMIT} в очереди")
     lines.append("")
 
     # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢
