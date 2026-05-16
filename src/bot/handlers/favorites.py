@@ -16,11 +16,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.bot.helpers import safe_edit_or_answer
-from src.config import APIKEY_OZON, CLIENT_ID_OZON, OZON_PROXY_URL
 from src.db.models import FavoriteCrossdockPoint
 from src.db.session import db_session
 from src.integrations import OzonClient
 from src.integrations.ozon_api import OzonAPIError
+from src.services.user_service import (
+    current_user_id_from,
+    get_ozon_client_for,
+)
 
 router = Router()
 logger = logging.getLogger("bot.favorites")
@@ -144,16 +147,18 @@ async def msg_fav_add_query(msg: Message, state: FSMContext) -> None:
         await msg.answer("Пустой запрос — попробуй ещё раз.")
         return
 
+    tg_id = current_user_id_from(msg) or 0
+
     # Если число — пробуем сразу как warehouse_id
     if query.isdigit() and len(query) >= 6:
         wh_id = int(query)
         # Попробуем найти имя в cluster_list
-        name = await _resolve_warehouse_name(wh_id) or f"#{wh_id}"
+        name = await _resolve_warehouse_name(wh_id, tg_id=tg_id) or f"#{wh_id}"
         await _confirm_add(msg, state, name, wh_id)
         return
 
     # Иначе ищем по имени в каталоге Ozon-точек
-    matches = await _search_warehouses(query)
+    matches = await _search_warehouses(query, tg_id=tg_id)
     if not matches:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✖ Отмена", callback_data="menu:favorites")],
@@ -333,7 +338,8 @@ async def cb_fav_pick(cb: CallbackQuery, state: FSMContext) -> None:
         name = selected.get("name") or f"#{wh_id}"
         point_type = selected.get("type") or ""
     else:
-        name = await _resolve_warehouse_name(wh_id) or f"#{wh_id}"
+        tg_id = current_user_id_from(cb) or 0
+        name = await _resolve_warehouse_name(wh_id, tg_id=tg_id) or f"#{wh_id}"
         point_type = ""
     await cb.answer()
     if cb.message:
@@ -374,18 +380,22 @@ def _iter_warehouses(clusters: List[dict]):
                 yield cl_name, wh
 
 
-async def _search_warehouses(query: str) -> List[dict]:
+async def _search_warehouses(query: str, *, tg_id: int) -> List[dict]:
     """Поиск точек для FBO кроссдока:
       1) /v1/warehouse/fbo/list (filter=CROSSDOCK) — авторитетный список Ozon,
          именно то что доступно для кроссдока в этом аккаунте.
       2) fallback: /v1/cluster/list (локальный кэш) — на случай если fbo/list
          пустой или недоступен.
     FBS drop-off НЕ используется — ПВЗ для FBO-кроссдока неприменимы и захламляют выдачу.
+    tg_id — Telegram-ID юзера, чьи Ozon-креды используются.
     """
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
+    if not tg_id:
+        return []
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id)
+    if oz is None:
         return []
     q = query.lower().strip()
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
     matches: List[dict] = []
     seen_ids = set()
 
@@ -440,11 +450,14 @@ async def _search_warehouses(query: str) -> List[dict]:
     return matches
 
 
-async def _resolve_warehouse_name(wh_id: int) -> Optional[str]:
+async def _resolve_warehouse_name(wh_id: int, *, tg_id: int) -> Optional[str]:
     """Найти имя по warehouse_id в кэше Ozon-кластеров."""
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
+    if not tg_id:
         return None
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id)
+    if oz is None:
+        return None
     try:
         clusters = await oz.cluster_list(allow_stale=True)
     except OzonAPIError:

@@ -17,10 +17,24 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.bot.helpers import send_long
-from src.config import APIKEY_OZON, CLIENT_ID_OZON, APIKEY_WB, OZON_PROXY_URL
+from src.config import OZON_PROXY_URL
 from src.db.models import Sku
 from src.db.session import db_session
 from src.integrations import OzonClient, OzonAPIError, WBClient, WBAPIError
+from src.services.user_service import (
+    current_user_id_from,
+    get_ozon_client_for,
+    get_ozon_creds,
+    get_wb_api_key,
+)
+
+
+_NEED_OZON = (
+    "⚠ Сначала добавь Ozon-ключи: /start → «Добавить Ozon»."
+)
+_NEED_WB = (
+    "⚠ Сначала добавь WB-ключ: /start → «Добавить WB»."
+)
 
 router = Router()
 logger = logging.getLogger("bot.integrations")
@@ -32,16 +46,21 @@ logger = logging.getLogger("bot.integrations")
 async def cmd_ozon_diag(msg: Message) -> None:
     """Минимальный тест draft/create + полные headers ответа в чат.
     Покажет реальные rate-limit headers и текст ошибки для диагностики 429."""
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await msg.answer("⚠ Нет Ozon-ключей.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
+    with db_session() as s:
+        creds = get_ozon_creds(s, tg_id)
+    if creds is None:
+        await msg.answer(_NEED_OZON)
         return
 
     import httpx
     from src.integrations.ozon_api import OZON_BASE
 
     headers = {
-        "Client-Id": CLIENT_ID_OZON,
-        "Api-Key": APIKEY_OZON,
+        "Client-Id": creds.client_id,
+        "Api-Key": creds.api_key,
         "Content-Type": "application/json",
     }
     # Минимальный payload — Ozon должен либо принять (вернуть op_id), либо
@@ -85,10 +104,17 @@ async def cmd_api_warmup(msg: Message) -> None:
     Полезно прогнать после старта бота — потом /ship_hunt не упадёт на 429."""
     import asyncio as _a
     lines = ["🔥 <b>Прогрев кэшей</b>\n"]
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
 
-    if APIKEY_WB:
+    with db_session() as s:
+        wb_key = get_wb_api_key(s, tg_id)
+        oz = get_ozon_client_for(s, tg_id)
+
+    if wb_key:
         try:
-            wb = WBClient(APIKEY_WB)
+            wb = WBClient(wb_key)
             whs = await wb.warehouses()
             lines.append(f"  WB warehouses: ✅ {len(whs)} (закэшировано на 24ч)")
             # пауза перед след. запросом чтобы не упереться
@@ -100,11 +126,10 @@ async def cmd_api_warmup(msg: Message) -> None:
         except Exception as e:
             lines.append(f"  WB: ❌ {type(e).__name__}: <code>{str(e)[:150]}</code>")
     else:
-        lines.append("  WB: ⏭ нет APIKEY_WB")
+        lines.append("  WB: ⏭ нет ключа")
 
-    if APIKEY_OZON and CLIENT_ID_OZON:
+    if oz is not None:
         try:
-            oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
             cl = await oz.cluster_list()
             lines.append(f"  Ozon clusters: ✅ {len(cl)}")
         except Exception as e:
@@ -175,16 +200,23 @@ def _classify_ozon_error(e: Exception) -> tuple[str, str]:
 async def cmd_api_check(msg: Message) -> None:
     import asyncio
     lines = ["🔑 <b>Проверка API-ключей</b>\n"]
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
+
+    with db_session() as s:
+        oz_creds = get_ozon_creds(s, tg_id)
+        wb_key = get_wb_api_key(s, tg_id)
 
     # ── Ozon ─────────────────────────────────────────────────────────────
     lines.append("<b>Ozon Seller API:</b>")
-    lines.append(f"  CLIENT_ID: {'✅ задан' if CLIENT_ID_OZON else '❌ не задан (CLIEN_TID в .env)'}")
-    lines.append(f"  API_KEY:   {'✅ задан' if APIKEY_OZON else '❌ не задан (APIKEY_OZON)'}")
+    lines.append(f"  CLIENT_ID: {'✅ задан' if oz_creds else '❌ не задан (/start → Ozon)'}")
+    lines.append(f"  API_KEY:   {'✅ задан' if oz_creds else '❌ не задан (/start → Ozon)'}")
     lines.append("")
 
-    if CLIENT_ID_OZON and APIKEY_OZON:
+    if oz_creds:
         placeholder = await msg.answer("🔍 Тестирую Ozon endpoint'ы…")
-        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        cli = OzonClient(oz_creds.client_id, oz_creds.api_key, proxy=OZON_PROXY_URL)
         tests = _ozon_api_tests(cli)
 
         # Параллелим запросы (semaphore=4 чтобы не упереться в rate-limit Ozon).
@@ -242,11 +274,11 @@ async def cmd_api_check(msg: Message) -> None:
 
     # ── WB ───────────────────────────────────────────────────────────────
     lines.append("<b>Wildberries API:</b>")
-    lines.append(f"  API_KEY: {'✅ задан' if APIKEY_WB else '❌ не задан (APIKEY_WB)'}")
+    lines.append(f"  API_KEY: {'✅ задан' if wb_key else '❌ не задан (/start → WB)'}")
 
-    if APIKEY_WB:
+    if wb_key:
         try:
-            cli = WBClient(APIKEY_WB)
+            cli = WBClient(wb_key)
             whs = await cli.warehouses()
             lines.append(f"  ✅ /api/v1/warehouses → {len(whs)} складов")
         except WBAPIError as e:
@@ -264,11 +296,16 @@ _WB_STOCKS_CACHE: Dict[str, tuple] = {}  # df → (ts, rows)
 
 @router.message(Command("wb_stocks"))
 async def cmd_wb_stocks(msg: Message) -> None:
-    if not APIKEY_WB:
-        await msg.answer("⚠ APIKEY_WB не задан в .env. Сначала /api_check.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
+    with db_session() as s:
+        wb_key = get_wb_api_key(s, tg_id)
+    if not wb_key:
+        await msg.answer(_NEED_WB)
         return
     import time as _t
-    cli = WBClient(APIKEY_WB)
+    cli = WBClient(wb_key)
     df = (date.today() - timedelta(days=1)).isoformat()
 
     # Кэш на 90 сек: WB лимитирует /supplier/stocks до ~1 req/min
@@ -334,10 +371,15 @@ def _logistics_emoji(dlv_coef_pct: float) -> str:
 @router.message(Command("wb_coefs"))
 async def cmd_wb_coefs(msg: Message) -> None:
     from src.warehouses import WB_CLUSTERS, WB_FOOD_WAREHOUSES
-    if not APIKEY_WB:
-        await msg.answer("⚠ APIKEY_WB не задан в .env. Сначала /api_check.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
         return
-    cli = WBClient(APIKEY_WB)
+    with db_session() as s:
+        wb_key = get_wb_api_key(s, tg_id)
+    if not wb_key:
+        await msg.answer(_NEED_WB)
+        return
+    cli = WBClient(wb_key)
     await msg.answer("📡 WB: коэффициенты приёмки + логистика…")
     try:
         rows = await cli.acceptance_coefficients()
@@ -406,10 +448,14 @@ async def cmd_wb_coefs(msg: Message) -> None:
 
 @router.message(Command("ozon_stocks"))
 async def cmd_ozon_stocks(msg: Message) -> None:
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await msg.answer("⚠ APIKEY_OZON или CLIEN_TID не заданы в .env. /api_check для проверки.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
         return
-    cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    with db_session() as s:
+        cli = get_ozon_client_for(s, tg_id)
+    if cli is None:
+        await msg.answer(_NEED_OZON)
+        return
     await msg.answer("📡 Ozon: остатки FBO (все артикулы)…")
     try:
         items = await cli.stocks_fbo(limit=5000)
@@ -448,10 +494,15 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
     Стирает старые записи и записывает заново — никакого matching по barcode
     с локальным каталогом. ozon_products теперь источник правды для Ozon-флоу.
     """
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await msg.answer("⚠ Ozon-ключи не заданы. /api_check.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
         return
-    cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    from src.config import ALLOWED_USER_ID
+    with db_session() as s:
+        cli = get_ozon_client_for(s, tg_id)
+    if cli is None:
+        await msg.answer(_NEED_OZON)
+        return
     await msg.answer("📡 Ozon: тяну весь каталог…")
 
     try:
@@ -466,10 +517,17 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
         await msg.answer(f"⚠ Ozon API: <code>{str(e)[:500]}</code>")
         return
 
+    from sqlalchemy import or_
     from src.db.models import OzonProduct
     added = updated = 0
     with db_session() as session:
-        existing = {p.offer_id: p for p in session.query(OzonProduct).all()}
+        # Берём ТОЛЬКО свои записи (+ legacy с user_id=None для Vladislav).
+        q = session.query(OzonProduct).filter(OzonProduct.user_id == tg_id)
+        if tg_id == ALLOWED_USER_ID:
+            q = session.query(OzonProduct).filter(
+                or_(OzonProduct.user_id == tg_id, OzonProduct.user_id.is_(None))
+            )
+        existing = {p.offer_id: p for p in q.all()}
         seen_offers = set()
         for it in infos:
             offer_id = it.get("offer_id")
@@ -495,6 +553,9 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
 
             if offer_id in existing:
                 p = existing[offer_id]
+                # legacy-запись (user_id=None) — присвоим текущему юзеру.
+                if p.user_id is None:
+                    p.user_id = tg_id
                 p.sku = ozon_sku
                 p.name = name[:256]
                 p.barcode_primary = primary_bc
@@ -502,6 +563,7 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
                 updated += 1
             else:
                 session.add(OzonProduct(
+                    user_id=tg_id,
                     offer_id=offer_id,
                     sku=ozon_sku,
                     name=name[:256],
@@ -510,7 +572,7 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
                 ))
                 added += 1
 
-        # Удаляем те что есть локально но нет в актуальном каталоге
+        # Удаляем СВОИ записи, отсутствующие в актуальном каталоге.
         stale = [p for offer, p in existing.items() if offer not in seen_offers]
         for p in stale:
             session.delete(p)
@@ -528,10 +590,16 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
 @router.message(Command("sku_link_wb"))
 async def cmd_sku_link_wb(msg: Message) -> None:
     """Полный snapshot WB-каталога в локальную таблицу wb_products."""
-    if not APIKEY_WB:
-        await msg.answer("⚠ APIKEY_WB не задан. /api_check.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
         return
-    cli = WBClient(APIKEY_WB)
+    from src.config import ALLOWED_USER_ID
+    with db_session() as s:
+        wb_key = get_wb_api_key(s, tg_id)
+    if not wb_key:
+        await msg.answer(_NEED_WB)
+        return
+    cli = WBClient(wb_key)
     await msg.answer("📡 WB: тяну каталог карточек (Content API)…")
     try:
         cards = await cli.cards_list(limit_total=5000)
@@ -546,10 +614,16 @@ async def cmd_sku_link_wb(msg: Message) -> None:
         await msg.answer("Карточек нет.")
         return
 
+    from sqlalchemy import or_
     from src.db.models import WbProduct
     added = updated = 0
     with db_session() as session:
-        existing = {p.nm_id: p for p in session.query(WbProduct).all()}
+        q = session.query(WbProduct).filter(WbProduct.user_id == tg_id)
+        if tg_id == ALLOWED_USER_ID:
+            q = session.query(WbProduct).filter(
+                or_(WbProduct.user_id == tg_id, WbProduct.user_id.is_(None))
+            )
+        existing = {p.nm_id: p for p in q.all()}
         seen_nms = set()
         for c in cards:
             nm = c.get("nmID")
@@ -567,6 +641,8 @@ async def cmd_sku_link_wb(msg: Message) -> None:
 
             if nm in existing:
                 p = existing[nm]
+                if p.user_id is None:
+                    p.user_id = tg_id
                 p.article = article[:128] or None
                 p.name = name[:256] or None
                 p.barcode_primary = primary_bc
@@ -574,6 +650,7 @@ async def cmd_sku_link_wb(msg: Message) -> None:
                 updated += 1
             else:
                 session.add(WbProduct(
+                    user_id=tg_id,
                     nm_id=nm,
                     article=article[:128] or None,
                     name=name[:256] or None,
@@ -581,7 +658,6 @@ async def cmd_sku_link_wb(msg: Message) -> None:
                     raw_barcodes_json=bcs,
                 ))
                 added += 1
-        # Удаляем те что нет в актуальном каталоге
         stale = [p for nm, p in existing.items() if nm not in seen_nms]
         for p in stale:
             session.delete(p)
@@ -598,10 +674,14 @@ async def cmd_sku_link_wb(msg: Message) -> None:
 
 @router.message(Command("ozon_warehouses"))
 async def cmd_ozon_warehouses(msg: Message) -> None:
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await msg.answer("⚠ APIKEY_OZON или CLIEN_TID не заданы в .env. /api_check.")
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
         return
-    cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    with db_session() as s:
+        cli = get_ozon_client_for(s, tg_id)
+    if cli is None:
+        await msg.answer(_NEED_OZON)
+        return
     await msg.answer("📡 Ozon: кластеры FBO…")
     try:
         clusters = await cli.cluster_list()

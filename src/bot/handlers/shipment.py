@@ -31,6 +31,13 @@ from src.services.shipment_service import (
     list_shipment_requests, get_shipment_request,
     shipment_summary,
 )
+from src.services.user_service import (
+    current_user_id_from,
+    get_ozon_client_for,
+    get_wb_api_key,
+)
+
+_NO_OZON_KEYS_MSG_SHIP = "⚠ Ozon-ключи не настроены. Открой /start → «Добавить Ozon»."
 
 router = Router()
 logger = logging.getLogger("bot.shipment")
@@ -660,11 +667,14 @@ async def cb_ship_open(cb: CallbackQuery) -> None:
     try:
         from src.services.ozon_supply_status_service import refresh_supply_status, is_cache_fresh
         if not is_cache_fresh(rid):
-            from src.integrations.ozon_api import OzonClient
-            from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
-            cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
-            with db_session() as session:
-                await refresh_supply_status(session, cli, rid, force=False)
+            tg_id = current_user_id_from(cb)
+            cli = None
+            if tg_id is not None:
+                with db_session() as session:
+                    cli = get_ozon_client_for(session, tg_id)
+            if cli is not None:
+                with db_session() as session:
+                    await refresh_supply_status(session, cli, rid, force=False)
     except Exception as e:
         logger.warning("ship_open: status refresh failed rid=%s: %s", rid, e)
 
@@ -686,9 +696,14 @@ async def cb_ship_new_template(cb: CallbackQuery) -> None:
         return
     try:
         from src.generators.new_request_template import generate_template
-        from src.integrations.ozon_api import OzonClient
-        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
-        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        tg_id = current_user_id_from(cb)
+        if tg_id is None:
+            return
+        with db_session() as session:
+            cli = get_ozon_client_for(session, tg_id)
+        if cli is None:
+            await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
+            return
         clusters = await cli.cluster_list()
         cluster_names = [c.get("name") or c.get("cluster_name") or "" for c in clusters]
         cluster_names = [n for n in cluster_names if n]
@@ -753,7 +768,7 @@ async def cmd_clear_drafts(msg: Message) -> None:
 
 @router.callback_query(F.data == "clear_drafts:yes")
 async def cb_clear_drafts(cb: CallbackQuery) -> None:
-    from src.config import ALLOWED_USER_ID, CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
+    from src.config import ALLOWED_USER_ID
     if cb.from_user.id != ALLOWED_USER_ID:
         await cb.answer("⛔ Только владельцу", show_alert=True)
         return
@@ -764,8 +779,11 @@ async def cb_clear_drafts(cb: CallbackQuery) -> None:
     from src.services.ozon_supply_status_service import (
         cancel_supply_orders, refresh_supply_status,
     )
-    from src.integrations.ozon_api import OzonClient
-    cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    with db_session() as _s:
+        cli = get_ozon_client_for(_s, cb.from_user.id)
+    if cli is None:
+        await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
+        return
 
     # Шаг 1: освежить статусы по всем заявкам с booked items.
     progress = await cb.message.answer("⏳ Освежаю статусы Ozon…")
@@ -881,9 +899,15 @@ async def cb_ship_cancel_oz(cb: CallbackQuery) -> None:
     await cb.answer("Отменяю…")
     try:
         from src.services.ozon_supply_status_service import cancel_supply_orders, refresh_supply_status
-        from src.integrations.ozon_api import OzonClient
-        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
-        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        tg_id = current_user_id_from(cb)
+        if tg_id is None:
+            return
+        with db_session() as session:
+            cli = get_ozon_client_for(session, tg_id)
+        if cli is None:
+            if cb.message:
+                await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
+            return
         with db_session() as session:
             req = get_shipment_request(session, rid)
             if not req:
@@ -928,9 +952,15 @@ async def cb_ship_refresh_oz(cb: CallbackQuery) -> None:
     await cb.answer("Обновляю…")
     try:
         from src.services.ozon_supply_status_service import refresh_supply_status
-        from src.integrations.ozon_api import OzonClient
-        from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
-        cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+        tg_id = current_user_id_from(cb)
+        if tg_id is None:
+            return
+        with db_session() as session:
+            cli = get_ozon_client_for(session, tg_id)
+        if cli is None:
+            if cb.message:
+                await cb.message.answer(_NO_OZON_KEYS_MSG_SHIP)
+            return
         with db_session() as session:
             n = await refresh_supply_status(session, cli, rid, force=True)
     except Exception as e:
@@ -1715,9 +1745,12 @@ async def cb_ship_hunt(cb: CallbackQuery) -> None:
 
 async def _run_hunt(msg: Message, rid: int) -> None:
     from datetime import timedelta as _td
-    from src.config import APIKEY_OZON, CLIENT_ID_OZON, APIKEY_WB, OZON_PROXY_URL
     from src.integrations import OzonClient, WBClient
     from src.services.slot_hunter import hunt_wb, hunt_ozon
+
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
 
     with db_session() as session:
         req = get_shipment_request(session, rid)
@@ -1762,8 +1795,10 @@ async def _run_hunt(msg: Message, rid: int) -> None:
         f"Направлений: {len(directions)}"
     )
 
-    wb_cli = WBClient(APIKEY_WB) if APIKEY_WB else None
-    oz_cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL) if (APIKEY_OZON and CLIENT_ID_OZON) else None
+    with db_session() as _s:
+        wb_key = get_wb_api_key(_s, tg_id)
+        oz_cli = get_ozon_client_for(_s, tg_id)
+    wb_cli = WBClient(wb_key) if wb_key else None
 
     for mp, cluster in directions:
         if mp == "ozon":
@@ -1777,7 +1812,7 @@ async def _run_hunt(msg: Message, rid: int) -> None:
 
         await msg.answer(f"🔄 Ищу WB «{cluster}»…")
         if not wb_cli:
-            await msg.answer("⚠ APIKEY_WB не задан — пропускаю WB.")
+            await msg.answer("⚠ WB-ключ не настроен — пропускаю WB.")
             continue
         goods_dict = wb_goods_by_cluster.get(cluster) or {}
         goods = [{"barcode": bc, "quantity": qty} for bc, qty in goods_dict.items()]
@@ -2077,11 +2112,14 @@ async def _send_ship_tz(msg: Message, rid: int) -> None:
     try:
         from src.services.ozon_supply_status_service import refresh_supply_status, is_cache_fresh
         if not is_cache_fresh(rid):
-            from src.integrations.ozon_api import OzonClient
-            from src.config import CLIENT_ID_OZON, APIKEY_OZON, OZON_PROXY_URL
-            cli = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
-            with db_session() as session:
-                await refresh_supply_status(session, cli, rid, force=False)
+            tg_id = current_user_id_from(msg)
+            cli = None
+            if tg_id is not None:
+                with db_session() as session:
+                    cli = get_ozon_client_for(session, tg_id)
+            if cli is not None:
+                with db_session() as session:
+                    await refresh_supply_status(session, cli, rid, force=False)
     except Exception as e:
         logger.warning("ship_tz: status refresh failed rid=%s: %s", rid, e)
 

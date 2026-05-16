@@ -12,7 +12,7 @@ from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 
 from src.bot.helpers import safe_edit_or_answer, send_long
-from src.config import APIKEY_WB
+from src.services.user_service import current_user_id_from, get_wb_api_key
 from src.db.session import db_session
 from src.integrations import OzonClient, WBClient
 from src.integrations.ozon_api import OzonAPIError
@@ -186,13 +186,23 @@ async def cb_ret_wb(cb: CallbackQuery) -> None:
     await cb.answer("Запрашиваю WB…")
     if not cb.message:
         return
-    if not APIKEY_WB:
-        await safe_edit_or_answer(cb.message, "⚠ APIKEY_WB не задан.", reply_markup=_back_kb())
+    tg_id = current_user_id_from(cb)
+    wb_key = None
+    if tg_id is not None:
+        from src.db.session import db_session as _db
+        with _db() as _s:
+            wb_key = get_wb_api_key(_s, tg_id)
+    if not wb_key:
+        await safe_edit_or_answer(
+            cb.message,
+            "⚠ WB-ключ не настроен. Открой /start → «Добавить WB».",
+            reply_markup=_back_kb(),
+        )
         return
 
     from datetime import datetime, timedelta
     date_from = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
-    cli = WBClient(APIKEY_WB)
+    cli = WBClient(wb_key)
     await safe_edit_or_answer(
         cb.message,
         f"🔍 Тяну WB Statistics /api/v1/supplier/sales с {date_from}…\n"

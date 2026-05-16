@@ -25,12 +25,37 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.bot.helpers import safe_edit_or_answer, send_long, progress_start, progress_add, progress_reset
-from src.config import APIKEY_OZON, CLIENT_ID_OZON, OZON_PROXY_URL
+from src.config import OZON_PROXY_URL
 from src.db.models import ShipmentRequest, ShipmentItem, Sku
 from src.db.session import db_session
 from src.integrations import OzonClient, OzonAPIError
 from src.services.shipment_service import get_shipment_request
 from src.services.slot_hunter import _ozon_cluster_to_name, _normalize
+from src.services.user_service import (
+    current_user_id_from,
+    get_ozon_client_for,
+    get_ozon_creds,
+)
+
+
+async def _ozon_client_from_state(state: FSMContext) -> Optional[OzonClient]:
+    """Помощник: вытаскивает ob_tg_id из state и возвращает готовый OzonClient
+    для этого юзера. None если tg_id нет или у юзера нет Ozon-кред."""
+    data = await state.get_data()
+    tg_id = data.get("ob_tg_id")
+    if not tg_id:
+        return None
+    with db_session() as s:
+        return get_ozon_client_for(s, int(tg_id))
+
+
+def _ozon_client_for_tg(tg_id: int) -> Optional[OzonClient]:
+    """Помощник для не-state callsites — берёт креды юзера и собирает OzonClient."""
+    with db_session() as s:
+        return get_ozon_client_for(s, tg_id)
+
+
+_NO_OZON_KEYS_MSG = "⚠ Ozon-ключи не настроены. Открой /start → «Добавить Ozon»."
 
 router = Router()
 logger = logging.getLogger("bot.ozon_book")
@@ -363,7 +388,10 @@ async def cmd_ozon_book(msg: Message, command: CommandObject, state: FSMContext)
     except ValueError:
         await msg.answer("Использование: <code>/ozon_book ID</code>")
         return
-    await _start_ozon_book_wizard(msg, state, rid)
+    tg_id = current_user_id_from(msg)
+    if tg_id is None:
+        return
+    await _start_ozon_book_wizard(msg, state, rid, tg_id)
 
 
 @router.callback_query(F.data.startswith("ozon_book_card:"))
@@ -385,6 +413,10 @@ async def cb_ozon_book_from_card(cb: CallbackQuery, state: FSMContext) -> None:
         )
         return
     await cb.answer(f"Запускаю Ozon-мастер ({mode.upper()})…")
+    tg_id = current_user_id_from(cb)
+    if tg_id is None:
+        _wizard_release(rid)
+        return
     # Гасим кнопки на карточке чтобы исключить повторный клик.
     if cb.message:
         try:
@@ -392,7 +424,7 @@ async def cb_ozon_book_from_card(cb: CallbackQuery, state: FSMContext) -> None:
         except Exception:
             pass
         try:
-            launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+            launched = await _start_ozon_book_wizard(cb.message, state, rid, tg_id, mode=mode)
         except Exception:
             _wizard_release(rid)
             raise
@@ -421,6 +453,10 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
         )
         return
     await cb.answer(f"Авто-бронирование ({mode.upper()})…")
+    tg_id = current_user_id_from(cb)
+    if tg_id is None:
+        _wizard_release(rid)
+        return
     if cb.message:
         try:
             await cb.message.edit_reply_markup(reply_markup=None)
@@ -429,7 +465,7 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
         # Флаг — будет прочитан в `_show_scored_warehouse_picker` для DIRECT.
         await state.update_data(ob_auto_walk=True)
         try:
-            launched = await _start_ozon_book_wizard(cb.message, state, rid, mode=mode)
+            launched = await _start_ozon_book_wizard(cb.message, state, rid, tg_id, mode=mode)
         except Exception:
             _wizard_release(rid)
             raise
@@ -440,13 +476,20 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
 
 
 async def _start_ozon_book_wizard(
-    msg: Message, state: FSMContext, rid: int, *, mode: str = "direct",
+    msg: Message, state: FSMContext, rid: int, tg_id: int, *, mode: str = "direct",
 ) -> bool:
     """Возвращает True если wizard взлетел в multi-step FSM-режим, False — если
     был early-exit (нет ключей/нет дат/всё уже забронировано). Caller использует
-    результат чтобы решить — снимать ли lock сразу."""
-    if not APIKEY_OZON or not CLIENT_ID_OZON:
-        await msg.answer("⚠ Ozon-ключи не заданы. /api_check для проверки.")
+    результат чтобы решить — снимать ли lock сразу.
+
+    tg_id — Telegram-ID юзера, чьи Ozon-креды используются (multi-tenant).
+    Сохраняется в state как ob_tg_id и читается всеми последующими шагами через
+    `_ozon_client_from_state`.
+    """
+    with db_session() as s:
+        creds = get_ozon_creds(s, tg_id)
+    if creds is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
         return False
 
     # Собираем Ozon-направления заявки
@@ -549,6 +592,7 @@ async def _start_ozon_book_wizard(
             )
     await state.update_data(
         ob_rid=rid,
+        ob_tg_id=tg_id,
         ob_clusters=[s[0] for s in summaries],
         ob_date_from=date_from,
         ob_date_to=date_to,
@@ -846,7 +890,10 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
     # storage_warehouse_id, теперь шлём drop_off_warehouse_id)
     supply_type = 1 if "CROSSDOCK" in (draft_type or "").upper() else 2
 
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    oz = await _ozon_client_from_state(state)
+    if oz is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
+        return
     drafts_made: List[Dict] = []
     scored_by_cluster: Dict[str, List[Dict]] = {}  # cluster → [{wh_id, name, score, available, reason}]
     # Кластеры, которые Ozon scoring отбил фатально (NO_TIMESLOTS / OUT_OF_ASSORTMENT / …).
@@ -889,7 +936,7 @@ async def _create_drafts_and_fetch_scoring_inner(msg: Message, state: FSMContext
                         lines.append(f"  • sku=<code>{s}</code> (нет в нашей БД)")
             await msg.answer(
                 f"🚫 <b>Стоп — артикулы не из текущего кабинета.</b>\n\n"
-                f"В Ozon (client_id={CLIENT_ID_OZON}) нет таких SKU:\n"
+                f"В твоём Ozon-кабинете нет таких SKU:\n"
                 + "\n".join(lines[:15])
                 + ("\n  …" if len(lines) > 15 else "")
                 + "\n\nОзон ответил бы <code>OUT_OF_ASSORTMENT</code> и заявка бы не прошла.\n"
@@ -1163,6 +1210,7 @@ async def _show_all_failed_scoring_summary(
                     data.get("ob_date_to_iso") or f"{data.get('ob_date_to')}T23:59:59Z",
                     data.get("ob_date_picks") or [],
                     data.get("ob_hour_picks") or [],
+                    tg_id=data.get("ob_tg_id"),
                 ))
                 _AUTO_POLL_TASKS[rid] = task
                 auto_poll_started = True
@@ -1322,7 +1370,10 @@ async def _run_autowalk(msg: Message, state: FSMContext, idx: int) -> None:
     date_to_iso = data["ob_date_to_iso"]
     # Hour-фильтр (юзер выбрал на time-picker'е). Если пусто — фильтра нет.
     hour_picks_set = set(int(h) for h in (data.get("ob_hour_picks") or []))
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    oz = await _ozon_client_from_state(state)
+    if oz is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
+        return
 
     found_slots: List[Dict] = []
     tried = 0
@@ -1628,7 +1679,10 @@ async def _create_drafts(msg: Message, state: FSMContext) -> None:
     date_to = data["ob_date_to"]
     wh_choices = data.get("ob_wh_choices") or {}
 
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    oz = await _ozon_client_from_state(state)
+    if oz is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
+        return
 
     # Pre-check SKU (см. _create_drafts_and_fetch_scoring — та же логика)
     all_skus_to_check: List[int] = []
@@ -1779,7 +1833,10 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    oz = await _ozon_client_from_state(state)
+    if oz is None:
+        await msg.answer(_NO_OZON_KEYS_MSG)
+        return
     clusters_with_slots: List[Dict] = []  # для нового picker'а (per-cluster)
     failed_drafts: List[Dict] = []  # для возможного retry
 
@@ -1982,6 +2039,7 @@ async def _fetch_slots_for_drafts(msg: Message, state: FSMContext) -> None:
                 data["ob_date_to_iso"],
                 data.get("ob_date_picks") or [],
                 data.get("ob_hour_picks") or [],
+                tg_id=data.get("ob_tg_id"),
             ))
             _AUTO_POLL_TASKS[rid] = task
 
@@ -2081,6 +2139,7 @@ async def _auto_poll_slots(
     date_to_iso: str,
     date_picks: Optional[List[str]] = None,
     hour_picks: Optional[List[int]] = None,
+    tg_id: Optional[int] = None,
 ) -> None:
     """Раз в 60 сек дёргает timeslot/info. До 60 мин общая длительность.
     Каждые ~28 мин пересоздаёт drafts (Ozon draft живёт 30 мин). Если за час
@@ -2105,7 +2164,10 @@ async def _auto_poll_slots(
 
         while _t.time() < deadline:
             attempts += 1
-            oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+            oz = _ozon_client_for_tg(tg_id) if tg_id else None
+            if oz is None:
+                logger.warning("auto-poll: no creds for tg_id=%s, abort", tg_id)
+                return
             # Пересоздаём drafts которым >28 мин — иначе Ozon вернёт 404 expired.
             recreated_this_iter = 0
             for fd in drafts:
@@ -2441,7 +2503,14 @@ async def _do_book_slot(
     Если передан state — статусы летят в накопительный progress-message; иначе
     отдельными ответами (legacy)."""
     await cb.answer("Бронирую…")
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    tg_id = current_user_id_from(cb)
+    if tg_id is None:
+        return {"status": "fail", "order_id": None, "error": "tg_id missing"}
+    oz = _ozon_client_for_tg(tg_id)
+    if oz is None:
+        if cb.message:
+            await cb.message.answer(_NO_OZON_KEYS_MSG)
+        return {"status": "fail", "order_id": None, "error": "no ozon creds"}
 
     async def _say(line: str) -> None:
         if state is not None and cb.message:
@@ -3170,7 +3239,10 @@ async def _book_one_slot(bot, msg, state, slot: Dict, rid: Optional[int]) -> Tup
     supply/create — bulk-loop использует это чтобы увеличить паузу до следующего
     кластера.
     """
-    oz = OzonClient(CLIENT_ID_OZON, APIKEY_OZON, proxy=OZON_PROXY_URL)
+    oz = await _ozon_client_from_state(state)
+    if oz is None:
+        await progress_add(msg, state, f"  ❌ {_NO_OZON_KEYS_MSG}")
+        return False, False
     cluster_id = slot.get("cluster_id")
     if not cluster_id:
         await progress_add(msg, state, "  ❌ Нет cluster_id — пропуск.")
@@ -3569,16 +3641,18 @@ async def msg_obdo_input(msg: Message, state: FSMContext) -> None:
     if not query:
         await msg.answer("Пустой запрос. Попробуй ещё раз или жми ✖ Отмена.")
         return
+    data = await state.get_data()
+    tg_id = int(data.get("ob_tg_id") or current_user_id_from(msg) or 0)
     if query.isdigit() and len(query) >= 6:
         wh_id = int(query)
         from src.bot.handlers.favorites import _resolve_warehouse_name
-        name = await _resolve_warehouse_name(wh_id) or f"#{wh_id}"
+        name = await _resolve_warehouse_name(wh_id, tg_id=tg_id) or f"#{wh_id}"
         # Симулируем callback для _accept_dropoff
         await _accept_dropoff_msg(msg, state, wh_id=wh_id, name=name)
         return
 
     from src.bot.handlers.favorites import _search_warehouses
-    matches = await _search_warehouses(query)
+    matches = await _search_warehouses(query, tg_id=tg_id)
     if not matches:
         await msg.answer(
             f"❌ Не нашёл точку по «{query}». Попробуй другое имя или ID."

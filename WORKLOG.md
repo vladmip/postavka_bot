@@ -13,6 +13,32 @@
 
 ---
 
+## 2026-05-16 (07:00) — E4 завершение: handlers → get_ozon_client_for(tg_id)
+
+### Зачем
+На проде ловили дыру: второй юзер (tg_id=6009938595, без своих Ozon-ключей) делал `/sku_link_ozon` и тянул каталог из `.env`-кабинета Vladislav'а (ALLOWED_USER_ID), писал в `ozon_products` (legacy `user_id=None`), смешивал с данными владельца. Тот же баг был во всех handlers, где остался прямой `OzonClient(CLIENT_ID_OZON, APIKEY_OZON, …)`. E4 был запланирован в прошлой сессии, оставались ~17 callsite.
+
+### Что сделано
+- **`src/bot/handlers/integrations.py`** — все Ozon/WB-команды (`/api_check`, `/api_warmup`, `/ozon_diag`, `/ozon_stocks`, `/ozon_warehouses`, `/sku_link_ozon`, `/sku_link_wb`, `/wb_stocks`, `/wb_coefs`) — теперь читают `current_user_id_from(msg)` → `get_ozon_client_for(s, tg_id)` / `get_wb_api_key(s, tg_id)`. Если нет кред — `_NEED_OZON` / `_NEED_WB` ответ.
+- **`/sku_link_ozon` + `/sku_link_wb`** — фикс главной утечки: existing-query фильтруется по `user_id == tg_id` (для ALLOWED_USER_ID — `+ user_id IS NULL` для legacy). При создании `OzonProduct` / `WbProduct` пишем `user_id=tg_id`. legacy-записи (`user_id=None`) подтягиваются и присваиваются текущему юзеру при следующем sync. Это закрывает «обновлено 9 артикулов в чужом каталоге».
+- **`src/bot/handlers/ozon_book.py`** — все 7 callsite заменены на `_ozon_client_from_state(state)` (читает `ob_tg_id` из state) или `_ozon_client_for_tg(tg_id)`. Сигнатура `_start_ozon_book_wizard` теперь требует явный `tg_id`. Кошерный prepass — callers (`cmd_ozon_book`, `cb_ozon_book_from_card`, `cb_ozon_book_auto`) берут `current_user_id_from(...)` и передают. `_auto_poll_slots` получил параметр `tg_id`, фоновая задача создаёт OzonClient через него.
+- **`src/bot/handlers/shipment.py`** — `cb_ship_open` (refresh status), `cb_ship_new_template`, `cb_ship_cancel_oz_confirm`, `cb_ship_refresh_oz`, `_run_hunt` (Ozon+WB), `_send_ship_tz`, `cb_clear_drafts` — все через `current_user_id_from(cb/msg)` → `get_ozon_client_for`. Если нет кред — early return с `_NO_OZON_KEYS_MSG_SHIP`.
+- **`src/bot/handlers/favorites.py`** — `_search_warehouses(query, *, tg_id)`, `_resolve_warehouse_name(wh_id, *, tg_id)` — оба требуют tg_id. Callers (`msg_fav_add_query`, `cb_fav_pick`, `msg_obdo_input` в ozon_book) пробрасывают tg_id из event / state.
+- **`src/bot/handlers/returns.py`** — `cb_ret_wb` тоже мигрирован на `get_wb_api_key(s, tg_id)` (хотя WB скрыт из меню после E5, доступ через старые callbacks возможен).
+- **Тексты** — `f"В Ozon (client_id={CLIENT_ID_OZON})"` в `ozon_book` заменено на «В твоём Ozon-кабинете» (не светим client_id ALLOWED_USER_ID).
+
+### Статус
+- `python -m pytest -x -q` → 3 passed, 8 skipped.
+- Все handlers импортируются (`python -c "import …"` OK).
+- Лучшее на проде, чем оставлять дыру.
+
+### TODO для следующей сессии
+- Сменить пароль root на VPS (был в чате — паролю кранты).
+- Digest UI: юзер просит **топ-5 урезать**, сейчас «каша» при большом каталоге. См. скрин `data/screenshots/photo_2026-05-16_06-46-13.jpg` если перекинул. Поправить в `digest_service._build_lines` + `build_digest_text` — лимит топ-5 на urgent и runout, цветные группы свернуть.
+- E2E-тест: с второго аккаунта пройти `/start` → `/sku_link_ozon` без своих кред — должен получить «Сначала /start», а не лезть в `.env`-кабинет.
+
+---
+
 ## 2026-05-15 (14:00) — Multi-tenant MVP + production hardening (E1-E6)
 
 ### Зачем
