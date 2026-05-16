@@ -203,20 +203,17 @@ def _group_removals(rows: List[Dict[str, Any]]) -> List[RemovalGroup]:
         if r.get("given_out_date") or r.get("utilization_date"):
             continue
         state = r.get("return_state") or "?"
-        if state.strip().lower() in _REMOVAL_DONE_STATES:
+        state_l = state.strip().lower()
+        if state_l in _REMOVAL_DONE_STATES:
             continue
         wh = r.get("destination_warehouse_name") or "?"
         addr = r.get("destination_warehouse_address") or ""
-        # Эвристика «в ПВЗ»: дата прибытия в прошлом (delivery_date <= today),
-        # но выдачи нет (given_out_date пустой — мы их уже отфильтровали).
+        # «В ПВЗ» определяем по return_state, не по дате доставки (delivery_date
+        # — это плановая дата, и она часто в прошлом для коробок, которые ещё в
+        # пути). Ozon явно сигналит «Можно забирать всё» когда коробка реально
+        # лежит в ПВЗ продавца.
         delivery_iso = r.get("delivery_date") or ""
-        is_at_pvz = False
-        if delivery_iso:
-            try:
-                dt = datetime.fromisoformat(delivery_iso.replace("Z", "+00:00"))
-                is_at_pvz = dt <= datetime.now(timezone.utc)
-            except (ValueError, TypeError):
-                pass
+        is_at_pvz = "забирать" in state_l or "прибы" in state_l or "доставлен" in state_l
         key = (wh, state, is_at_pvz)
         g = groups.setdefault(key, {
             "warehouse_name": wh, "warehouse_address": addr,
@@ -462,11 +459,13 @@ def _fmt_removal_group(g: "RemovalGroup") -> str:
     """Одна группа вывоза для рендера в digest. Кружок:
     🔴 — уже в ПВЗ (забрать!), 🟡 — в пути."""
     icon = "🔴" if g.is_at_pvz else "🟡"
-    when_part = ""
+    state_prefix = "в ПВЗ" if g.is_at_pvz else "в пути"
+    when_part = f" · {state_prefix}"
     if g.delivery_date:
         try:
             dt = datetime.fromisoformat(g.delivery_date.replace("Z", "+00:00"))
-            when_part = (" · в ПВЗ с " if g.is_at_pvz else " · ожидается ") + dt.strftime("%d.%m")
+            suffix = " с " if g.is_at_pvz else ", ожидается "
+            when_part = f" · {state_prefix}{suffix}{dt.strftime('%d.%m')}"
         except (ValueError, TypeError):
             pass
     sample = (
@@ -539,17 +538,14 @@ def build_digest_text(data: DigestData) -> str:
         )
         lines.append("")
 
-    # Возвраты. PDF в Ozon-API почти всегда отдаётся (универсальная этикетка
-    # партии), поэтому игнорим его при определении пустоты — иначе раздел
-    # «Возвраты» был бы «не пустым» вечно с одной строкой про PDF.
+    # Возвраты — это товары к получению в ПВЗ + giveout-партии. Removals
+    # (вывозы со стока FBO) — отдельная сущность ниже, в этом блоке их не
+    # упоминаем. PDF этикетка относится к returns/giveouts, не к removals.
     r = data.returns
     lines.append("📥 <b>Возвраты Ozon</b>")
-    nothing = (
-        r.total == 0 and r.giveouts_available == 0 and r.giveouts_at_pvz == 0
-        and not r.removal_from_stock and not r.removal_from_supply
-    )
-    if nothing:
-        lines.append("✅ Нет возвратов — забирать нечего.")
+    has_returns = bool(r.total or r.giveouts_available or r.giveouts_at_pvz)
+    if not has_returns:
+        lines.append("✅ Нет возвратов к получению.")
     else:
         if r.total:
             lines.append(f"  • На ПВЗ ждут получения: <b>{r.total}</b>")
