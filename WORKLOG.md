@@ -13,6 +13,58 @@
 
 ---
 
+## 2026-05-16 (11:30) — авто-брон Ozon: foundation + UI explore-этап
+
+### Зачем
+Большая фича для Ozon-поставок: бот сам ищет оптимальную дату (где максимум кластеров может уехать) и далее планирует bulk-book + auto-poll для оставшихся в течение часа. План — `C:\Users\vladi\.claude\plans\smart-supply-booking.md`.
+
+### Что сделано (Фаза 3 шаги 1-2)
+- **Фаза 0 (исследование)**: на проде дёрнули `/v2/draft/create/info` и `/v1/draft/timeslot/info` для тестовых SKU. Выяснили:
+  - `timeslot/info` отдаёт **все слоты на 7+ дней одним запросом** (`days[].timeslots[]`) — не нужно дёргать per-date.
+  - `scoring` готов за 3-78 секунд (asynchron, нужен retry).
+  - `availability_status.state = FULL_AVAILABLE / NOT_AVAILABLE` per warehouse.
+- **`src/services/auto_book.py`** (185 строк) headless-модуль с алгоритмом:
+  - `SlotInfo` dataclass.
+  - `parse_timeslot_response(json) → List[SlotInfo]`.
+  - `find_best_common_date(slots_per_cluster, allowed_dates, allowed_hours) → date | None` — главный алгоритм. tie-break по ранней дате.
+  - `clusters_with_slots_on`, `pick_earliest_slot`, `date_options_summary`.
+- **`tests/test_auto_book.py`** — 14 unit-тестов, все зелёные на VPS. Edge-cases: пустые слоты, разные даты, tie-break, real Ozon response structure.
+- **Smoke на проде**: Москва + Самара, 5 шт sku 1607482374 → 187/204 слотов на 9 дат → best_date=2026-05-16 (2/2 кластеров). Алгоритм работает.
+- **UI кнопка**: в `_render_request_card` добавлена `🎯 Авто-брон на одну дату` рядом с обычной «Создать поставку Ozon». Показывается для DIRECT и CROSSDOCK когда тип Ozon уже задан.
+- **`cb_obauto` + `_auto_book_explore`** в `ozon_book.py` (~250 строк):
+  - Создаёт drafts per кластер последовательно (с паузой 5с).
+  - Ждёт scoring (5 попыток × 3с).
+  - Берёт top-1 склад из FULL_AVAILABLE.
+  - Дёргает `timeslot/info` с диапазоном дат.
+  - Применяет `find_best_common_date`.
+  - Показывает результат через `edit_text` одного сообщения.
+
+### Не сделано (Фаза 3 шаги 3-5 — bulk-book)
+- Callback `obauto:confirm:rid:date` → bulk-book на best_date.
+- Auto-poll для кластеров без слотов на best_date.
+- Фоновые уведомления юзера когда auto-poll забронировал.
+
+### Известные баги (см. project_current_focus)
+1. **CROSSDOCK drop-off не сохраняется в БД** — авто-брон не работает на cross-dock.
+2. **`_run_bulk_book` summary врёт «1 успешно»** при 1 из 3 кластеров с провалом scoring — failed-кластеры не попадают в финальный отчёт.
+3. **Wizard UX**: «draft» / «scoring» — техжаргон. Юзер не понимает.
+4. **Регрессия исправлена** (`f554822`): `cb_ship_pick_fmt` в `shipment.py:1144` не передавал `tg_id` в `_start_ozon_book_wizard` после E4-миграции. После «Коробами/Паллетами» получали TypeError.
+
+### Файлы
+**Новые:**
+- `src/services/auto_book.py`
+- `tests/test_auto_book.py`
+
+**Изменённые:**
+- `src/bot/handlers/shipment.py` — кнопка + регрессия fix
+- `src/bot/handlers/ozon_book.py` — handler `cb_obauto` + `_auto_book_explore` + `_resolve_macrolocal_id`
+- `pyproject.toml` — добавлен aiohttp-socks/httpx-socks (раньше) — нет, это другой commit
+
+### Статус
+HEAD на проде `8b16a87`. Бот active. Кнопка видна, для DIRECT — работает.
+
+---
+
 ## 2026-05-16 (07:00) — E4 завершение: handlers → get_ozon_client_for(tg_id)
 
 ### Зачем
