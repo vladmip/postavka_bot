@@ -1391,14 +1391,16 @@ async def _fetch_scoring_persistent(
             if attempt + 1 < max_outer:
                 delay = base_delay + random.randint(0, 30)
                 await _say(
-                    f"  ⏳ Жду расчёт от Ozon (попытка {attempt+1}/{max_outer}): "
-                    f"{err[:150]}. Ещё {delay}с…"
+                    f"  ⏳ Попытка {attempt+1}/{max_outer}: <i>{err[:120]}</i>. "
+                    f"Жду {delay}с до попытки {attempt+2}/{max_outer}…"
                 )
                 await asyncio.sleep(delay)
                 continue
             await _say(
-                f"  ❌ Scoring не получен за ~{max_outer*(base_delay+15)//60} мин. "
-                f"Последняя ошибка: <code>{err[:200]}</code>"
+                f"  ❌ <b>Не удалось получить расчёт за {max_outer} попыток "
+                f"(~{max_outer*(base_delay+15)//60} мин)</b>.\n"
+                f"     Последняя ошибка: <code>{err[:200]}</code>\n"
+                f"     🔄 Перехожу к следующему кластеру."
             )
             return [], None
 
@@ -1525,15 +1527,20 @@ async def _fetch_scoring_persistent(
             if attempt + 1 < max_outer:
                 delay = base_delay + random.randint(0, 30)
                 hint = (
-                    f"UNSPECIFIED={n_unspecified}, дозревает"
-                    if n_unspecified > 0 else "IN_PROGRESS"
+                    f"{n_unspecified} склад(ов) ещё считается"
+                    if n_unspecified > 0 else "Ozon ещё не закончил"
                 )
                 await _say(
-                    f"  ⏳ Ozon считает варианты ({hint}, попытка {attempt+1}/{max_outer}). Ещё {delay}с…"
+                    f"  ⏳ Попытка {attempt+1}/{max_outer}: {hint}. "
+                    f"Жду {delay}с до попытки {attempt+2}/{max_outer}…"
                 )
                 await asyncio.sleep(delay)
                 continue
-            await _say(f"  ❌ Ozon не успел посчитать за ~{max_outer*(base_delay+15)//60} мин.")
+            await _say(
+                f"  ❌ <b>Ozon не успел посчитать за {max_outer} попыток "
+                f"(~{max_outer*(base_delay+15)//60} мин)</b>.\n"
+                f"     🔄 Перехожу к следующему кластеру."
+            )
             return [], None
 
         # Для CROSSDOCK wh_list пустой — не пишем «0 складов», это путает.
