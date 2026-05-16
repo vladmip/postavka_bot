@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Filter
 from aiogram.types import Message, CallbackQuery, TelegramObject, BotCommand
 
-from src.config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID
+from src.config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, TELEGRAM_PROXY_URL
 from src.bot.handlers import common, catalog, upload, integrations, shipment, ozon_book, returns, favorites, product_hints, onboarding, digest
 from src.bot.handlers.digest import send_digest_to_user
 from src.bot.middleware import LogAndCatchMiddleware, EnsureUserMiddleware, RateLimitMiddleware
@@ -194,6 +194,33 @@ def _get_digest_recipients() -> list[int]:
     return sorted(out)
 
 
+def _mask_proxy(url: str) -> str:
+    """Маскирует user:pass в прокси-URL для лога."""
+    import re
+    return re.sub(r"://[^@]+@", "://***@", url)
+
+
+def _make_proxied_session(proxy_url: str):
+    """AiohttpSession, чьё внутреннее aiohttp ClientSession создаётся через
+    aiohttp_socks.ProxyConnector — поддерживает socks5://, socks4://, http://.
+    Нужно для обхода блокировок api.telegram.org у российских хостингов."""
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiohttp import ClientSession
+    from aiohttp_socks import ProxyConnector
+
+    class _ProxiedSession(AiohttpSession):
+        async def create_session(self) -> ClientSession:
+            if self._session is None or self._session.closed:
+                connector = ProxyConnector.from_url(proxy_url)
+                self._session = ClientSession(
+                    connector=connector,
+                    json_serialize=self.json_dumps,
+                )
+            return self._session
+
+    return _ProxiedSession()
+
+
 async def _retry_telegram(call, name: str, max_attempts: int = 5):
     """Retry для startup-вызовов Telegram-API. Если api.telegram.org
     неотзывчив — ждём и пробуем снова, не валим процесс."""
@@ -220,7 +247,16 @@ async def main() -> None:
             "Также добавь ALLOWED_USER_ID=<твой Telegram user id> (узнать у @userinfobot)."
         )
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    session = _make_proxied_session(TELEGRAM_PROXY_URL) if TELEGRAM_PROXY_URL else None
+    if session is not None:
+        logging.info("Telegram session via proxy: %s", _mask_proxy(TELEGRAM_PROXY_URL))
+    bot_kwargs = dict(
+        token=TELEGRAM_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    if session is not None:
+        bot_kwargs["session"] = session
+    bot = Bot(**bot_kwargs)
     dp = Dispatcher()
 
     log_mw = LogAndCatchMiddleware()

@@ -18,6 +18,11 @@ APIKEY_CLAUDE = os.getenv("APIKEY_CLAUDE", "")
 # Если пусто — без прокси, прямое соединение.
 OZON_PROXY_URL = os.getenv("OZON_PROXY_URL", "").strip() or None
 
+# Прокси для Telegram Bot API (если провайдер VPS блокирует api.telegram.org).
+# Формат: 'socks5://USER:PASS@HOST:PORT' (либо http://...). Пусто — прямое соединение.
+# Нужен пакет aiohttp-socks (см. pyproject.toml).
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip() or None
+
 # Fernet master-key для шифрования ozon_api_key / wb_api_key в БД.
 # Генерация: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Если пусто — на проде fail-fast (см. src/security/crypto.py).
