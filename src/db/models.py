@@ -277,6 +277,12 @@ class ShipmentRequest(Base):
     # NULL = не выбрано (юзер выберет перед бронированием).
     cargo_format: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
+    # Режим авто-брон выбранный в финале /ship_plan: 'day' (в одну дату, любые
+    # часы) | 'hour' (в одну дату + один час) | NULL (ручной wizard, default).
+    # Используется для отображения в карточке. Сам режим уже сработал через
+    # callback obauto:* — но юзер может вернуться позже и увидеть свой выбор.
+    auto_book_mode: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
     source_files_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     comments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

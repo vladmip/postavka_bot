@@ -502,10 +502,19 @@ async def cb_obauto(cb: CallbackQuery, state: FSMContext) -> None:
         auto_mode = "hour"
     else:
         rid = int(parts[1])
-        # Если callback пришёл из ship_plan «🎯 В одну дату» — сразу bday.
-        # Если из карточки «🎯 Авто-брон» — стандартный flow с выбором.
+        # Из ship_plan «🎯 В одну дату» — сразу bday (callback obauto:<rid>).
         auto_mode = "day"
     tg_id = cb.from_user.id if cb.from_user else 0
+
+    # Сохраняем выбранный режим в БД для отображения в карточке.
+    try:
+        with db_session() as _s:
+            _r = get_shipment_request(_s, rid, user_id=tg_id)
+            if _r:
+                _r.auto_book_mode = auto_mode
+    except Exception:
+        pass
+
     if not _wizard_acquire(rid):
         await cb.answer(
             f"⏳ Ozon-мастер для поставки #{rid} уже запущен.",

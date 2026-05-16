@@ -386,6 +386,13 @@ def _render_request_card(req) -> tuple:
     if has_ozon and req.cargo_format:
         fmt_label = "📦 Коробами" if req.cargo_format == "BOX" else "🏗 Паллетами"
         text += f"\n<b>Формат:</b> {fmt_label}"
+    if has_ozon and getattr(req, "auto_book_mode", None):
+        mode_label = (
+            "🎯 В одну дату" if req.auto_book_mode == "day"
+            else "🎯 В одно время (дата + час)" if req.auto_book_mode == "hour"
+            else "?"
+        )
+        text += f"\n<b>Режим:</b> {mode_label}"
 
     # Статусы Ozon supply-orders — для каждого направления с booked_supply_id.
     booked_ozon = [it for it in req.items if it.marketplace == "ozon" and it.booked_supply_id]
@@ -1639,6 +1646,9 @@ async def _finalize_plan_with_hours(
         req.target_dates_json = [d.isoformat() for d in dates]
         req.target_hours_json = hours  # NULL = «любое время»
         req.state = "planning"
+        # auto_book_mode сбрасываем здесь — юзер выберет режим на следующем
+        # экране (3 кнопки). До выбора — None.
+        req.auto_book_mode = None
         has_ozon_unbooked = any(
             it.marketplace == "ozon" and not it.booked_supply_id for it in req.items
         )
