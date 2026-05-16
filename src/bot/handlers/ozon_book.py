@@ -483,17 +483,28 @@ async def cb_ozon_book_auto(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("obauto:"))
 async def cb_obauto(cb: CallbackQuery, state: FSMContext) -> None:
-    """Кнопка «🎯 Авто-брон на одну дату» в карточке поставки.
-
-    Этап 1 (текущий): explore — создаём drafts, собираем слоты, показываем
-    оптимальную дату с топ-5 альтернатив. Без bulk-book.
-    Этап 2 (следующий): кнопка «✅ Бронируем» → bulk-book + auto-poll.
+    """Авто-брон на одну дату. Варианты callback'ов:
+      obauto:<rid>           — стандартный: explore + показать кнопки выбора
+      obauto:hour:<rid>      — explore + сразу bulk-book на best_date + best_hour
+      obauto:bday:<rid>      — handled by cb_obauto_book_day (после explore)
+      obauto:bhour:<rid>     — handled by cb_obauto_book_hour
     """
     parts = cb.data.split(":")
     if len(parts) < 2:
         await cb.answer("Битый callback", show_alert=True)
         return
-    rid = int(parts[1])
+    # Отсекаем под-callback'и bday/bhour — у них свои handlers
+    if parts[1] in ("bday", "bhour"):
+        return  # обработают cb_obauto_book_day / cb_obauto_book_hour
+    # auto_mode определяет что делать после explore.
+    if parts[1] == "hour":
+        rid = int(parts[2])
+        auto_mode = "hour"
+    else:
+        rid = int(parts[1])
+        # Если callback пришёл из ship_plan «🎯 В одну дату» — сразу bday.
+        # Если из карточки «🎯 Авто-брон» — стандартный flow с выбором.
+        auto_mode = "day"
     tg_id = cb.from_user.id if cb.from_user else 0
     if not _wizard_acquire(rid):
         await cb.answer(
@@ -501,18 +512,22 @@ async def cb_obauto(cb: CallbackQuery, state: FSMContext) -> None:
             show_alert=True,
         )
         return
-    await cb.answer("🎯 Запускаю авто-брон…")
+    await cb.answer(
+        "🎯 Найду оптимальную дату и забронирую…"
+        if auto_mode in ("day", "hour") else "🎯 Запускаю…"
+    )
     if not cb.message:
         _wizard_release(rid)
         return
     try:
-        await _auto_book_explore(cb.message, state, rid, tg_id)
+        await _auto_book_explore(cb.message, state, rid, tg_id, auto_mode=auto_mode)
     finally:
         _wizard_release(rid)
 
 
 async def _auto_book_explore(
     msg: Message, state: FSMContext, rid: int, tg_id: int,
+    *, auto_mode: str = "manual",
 ) -> None:
     """Создать drafts для всех Ozon-кластеров заявки, дёрнуть scoring +
     timeslot/info, посчитать `find_best_common_date`, показать юзеру.
@@ -786,14 +801,15 @@ async def _auto_book_explore(
             f"\n<i>Кластеры без слотов на {date_label} — после брони запустим "
             f"авто-поиск в течение часа.</i>"
         )
-        rows.append([InlineKeyboardButton(
-            text=f"🎯 Брон {date_label} — все в один день",
-            callback_data=f"obauto:bday:{rid}",
-        )])
-        rows.append([InlineKeyboardButton(
-            text=f"🎯 Брон {date_label} + один час старта",
-            callback_data=f"obauto:bhour:{rid}",
-        )])
+        if auto_mode == "manual":
+            rows.append([InlineKeyboardButton(
+                text=f"🎯 Брон {date_label} — все в один день",
+                callback_data=f"obauto:bday:{rid}",
+            )])
+            rows.append([InlineKeyboardButton(
+                text=f"🎯 Брон {date_label} + один час старта",
+                callback_data=f"obauto:bhour:{rid}",
+            )])
     rows.append([InlineKeyboardButton(text="✖ Отмена",
                                        callback_data=f"ship_open:{rid}")])
 
@@ -803,6 +819,92 @@ async def _auto_book_explore(
         await progress.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass
+
+    # Auto-mode: сразу запускаем bulk-book без confirm от юзера.
+    if best_date is not None and auto_mode in ("day", "hour"):
+        # Эмулируем cb_obauto_book_day / cb_obauto_book_hour через дополнительный
+        # callback. Чтобы не дублировать код — делаем internal call с теми же
+        # параметрами state как они ждут.
+        await _auto_run_bulk(msg, state, rid, mode=auto_mode)
+
+
+async def _auto_run_bulk(
+    msg: Message, state: FSMContext, rid: int, *, mode: str,
+) -> None:
+    """Внутренний эквивалент cb_obauto_book_day / cb_obauto_book_hour —
+    зовётся когда юзер выбрал режим ещё на шаге ship_plan и нам не нужен
+    второй confirm. mode = 'day' | 'hour'.
+    """
+    data = await state.get_data()
+    best_date_iso = data.get("ob_auto_best_date")
+    slots_ser = data.get("ob_auto_slots") or {}
+    drafts_meta = data.get("ob_auto_drafts") or {}
+    allowed_hours = data.get("ob_auto_allowed_hours") or None
+    if not best_date_iso or not slots_ser:
+        return
+    allowed_hours_set = set(allowed_hours) if allowed_hours else None
+
+    choices: Dict[str, Dict] = {}
+    not_fit: List[str] = []
+
+    if mode == "day":
+        for idx, (cluster, slots_list) in enumerate(slots_ser.items()):
+            on_date = [
+                s for s in slots_list
+                if s["from_ts"][:10] == best_date_iso
+                and (allowed_hours_set is None or int(s["from_ts"][11:13]) in allowed_hours_set)
+            ]
+            if not on_date:
+                not_fit.append(cluster)
+                continue
+            on_date.sort(key=lambda s: s["from_ts"])
+            choices[str(idx)] = _slot_dict_to_picker_choice(
+                on_date[0], cluster, drafts_meta.get(cluster, {})
+            )
+    else:  # mode == "hour"
+        hour_to_clusters: Dict[int, set] = {}
+        cluster_slot_by_hour: Dict[tuple, Dict] = {}
+        for cluster, slots_list in slots_ser.items():
+            for s in slots_list:
+                if s["from_ts"][:10] != best_date_iso:
+                    continue
+                hour = int(s["from_ts"][11:13])
+                if allowed_hours_set is not None and hour not in allowed_hours_set:
+                    continue
+                hour_to_clusters.setdefault(hour, set()).add(cluster)
+                if (cluster, hour) not in cluster_slot_by_hour:
+                    cluster_slot_by_hour[(cluster, hour)] = s
+        if not hour_to_clusters:
+            await msg.answer("⚠ Не нашёл общих часов на эту дату.")
+            return
+        best_hour = max(hour_to_clusters.items(), key=lambda kv: (len(kv[1]), -kv[0]))[0]
+        clusters_at_hour = hour_to_clusters[best_hour]
+        await msg.answer(
+            f"🎯 Общий час: <b>{best_hour:02d}:00</b> · "
+            f"{len(clusters_at_hour)} кластеров"
+        )
+        for idx, cluster in enumerate(slots_ser.keys()):
+            if cluster not in clusters_at_hour:
+                not_fit.append(cluster)
+                continue
+            slot = cluster_slot_by_hour[(cluster, best_hour)]
+            choices[str(idx)] = _slot_dict_to_picker_choice(
+                slot, cluster, drafts_meta.get(cluster, {})
+            )
+
+    if not choices:
+        await msg.answer("⚠ Не нашлось ни одного слота для авто-брон.")
+        return
+
+    await _spawn_auto_poll_for_best_date(msg, rid, best_date_iso, not_fit, drafts_meta, data)
+    await state.update_data(
+        ob_picker_choices=choices,
+        ob_picker_clusters=[],
+        ob_picker_msg_id=None,
+        ob_progress_msg_id=msg.message_id,
+        ob_failed_clusters=not_fit,
+    )
+    await _run_bulk_book(msg.bot, msg, state)
 
 
 def _slot_dict_to_picker_choice(slot_dict: Dict, cluster: str, meta: Dict) -> Dict:

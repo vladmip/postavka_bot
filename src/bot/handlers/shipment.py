@@ -1618,7 +1618,8 @@ async def cb_sp_hp_ok(cb: CallbackQuery, state: FSMContext) -> None:
 async def _finalize_plan_with_hours(
     cb: CallbackQuery, state: FSMContext, hours: Optional[List[int]],
 ) -> None:
-    """Сохранить даты + часы в БД и показать карточку заявки.
+    """Сохранить даты + часы в БД и предложить режим бронирования:
+    в одну дату / в одно время / пропустить (ручной wizard).
 
     hours=None → «любое время» (target_hours_json=NULL, фильтра нет).
     hours=[9,10,11] → слоты только в эти часы старта.
@@ -1638,6 +1639,7 @@ async def _finalize_plan_with_hours(
     await state.clear()
 
     tg_id_fin = cb.from_user.id if cb.from_user else 0
+    has_ozon_unbooked = False
     with db_session() as session:
         req = get_shipment_request(session, rid, user_id=tg_id_fin)
         if not req:
@@ -1648,11 +1650,48 @@ async def _finalize_plan_with_hours(
         req.target_dates_json = [d.isoformat() for d in dates]
         req.target_hours_json = hours  # NULL = «любое время»
         req.state = "planning"
-        text, kb = _render_request_card(req)
+        has_ozon_unbooked = any(
+            it.marketplace == "ozon" and not it.booked_supply_id for it in req.items
+        )
 
-    await cb.answer("✅ Сохранено")
-    if cb.message:
+    await cb.answer("✅ План сохранён")
+    if not cb.message:
+        return
+
+    # Если есть Ozon-направления без брони — предлагаем 3 варианта режима.
+    # Иначе (только WB или всё забронировано) — просто карточка.
+    if has_ozon_unbooked:
+        dates_label = ", ".join(d.strftime("%d.%m") for d in dates[:6])
+        if len(dates) > 6:
+            dates_label += f", …+{len(dates) - 6}"
+        text = (
+            f"✅ <b>План сохранён</b>\n"
+            f"📅 Дат: {len(dates)} ({dates_label})\n"
+            f"🕒 Часы: {sorted(hours) if hours else 'любые'}\n\n"
+            f"<b>Как бронируем Ozon-поставку?</b>\n\n"
+            f"🎯 <b>В одну дату</b> — бот найдёт дату где максимум кластеров может уехать "
+            f"и забронирует всех на эту дату (разное время). Кластеры без слота на эту дату — "
+            f"в авто-поиске на час.\n\n"
+            f"🎯 <b>В одно время</b> — то же + бронирует на один час старта.\n\n"
+            f"🛠 <b>Ручной</b> — обычный wizard: для каждого кластера выбираешь слот сам."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 В одну дату",
+                                  callback_data=f"obauto:{rid}")],
+            [InlineKeyboardButton(text="🎯 В одно время",
+                                  callback_data=f"obauto:hour:{rid}")],
+            [InlineKeyboardButton(text="🛠 Ручной — к карточке",
+                                  callback_data=f"ship_open:{rid}")],
+        ])
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
+        return
+
+    # Только WB / всё забронировано — обычная карточка
+    with db_session() as session:
+        req = get_shipment_request(session, rid, user_id=tg_id_fin)
+        if req:
+            text, kb = _render_request_card(req)
+            await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
 async def _ask_crossdock_mode(msg: Message, state: FSMContext) -> None:
