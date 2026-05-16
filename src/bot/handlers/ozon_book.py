@@ -3838,7 +3838,16 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
         return
 
     # Превращаем picker-panel в running-статус (он же станет «сарделькой» брони).
-    header = f"⚙ <b>Bulk-бронирование</b> заявки #{rid or '?'} — {len(choices)} поставок"
+    not_fit_pre = data.get("ob_failed_clusters") or []
+    n_book = len(choices)
+    n_total_card = n_book + len(not_fit_pre)
+    if not_fit_pre:
+        header = (
+            f"⚙ <b>Bulk-бронирование</b> заявки #{rid or '?'} — "
+            f"{n_book} из {n_total_card} (ещё {len(not_fit_pre)} в авто-поиске)"
+        )
+    else:
+        header = f"⚙ <b>Bulk-бронирование</b> заявки #{rid or '?'} — {n_book} поставок"
     try:
         if msg_id:
             await bot.edit_message_text(
@@ -3959,12 +3968,22 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
             text="🌐 Ozon ЛК → Поставки",
             url="https://seller.ozon.ru/app/supply-orders",
         )])
-        header = (
-            f"✅ Все {ok_count} забронированы. Что дальше?"
-            if fail_count == 0 and not failed_scoring
-            else f"⚠ Забронировано {ok_count}/{n_total}. "
-                 f"Не удалось: {fail_count + len(failed_scoring)}."
-        )
+        n_polling = len(out_of_book)
+        if fail_count == 0 and not failed_scoring and not n_polling:
+            header = f"✅ Все {ok_count} забронированы. Что дальше?"
+        elif fail_count == 0 and not failed_scoring and n_polling:
+            header = (
+                f"✅ Забронировано {ok_count}/{n_total} · "
+                f"⏳ {n_polling} ищу слот ещё час\n"
+                f"<i>Не нашлось — пришлю сообщение через час.</i>"
+            )
+        else:
+            header = (
+                f"⚠ Забронировано {ok_count}/{n_total}. "
+                f"Не удалось: {fail_count + len(failed_scoring)}."
+            )
+            if n_polling:
+                header += f"\n⏳ Ещё {n_polling} в авто-поиске на час."
         try:
             await msg.answer(header, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         except Exception:
