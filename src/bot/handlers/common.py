@@ -194,7 +194,8 @@ async def cb_menu_ships(cb: CallbackQuery) -> None:
     await cb.answer()
     if cb.message:
         from src.bot.handlers.shipment import _render_ship_list
-        await _render_ship_list(cb.message, edit=True)
+        tg_id = cb.from_user.id if cb.from_user else 0
+        await _render_ship_list(cb.message, tg_id=tg_id, edit=True)
 
 
 # ── menu:returns ──────────────────────────────────────────────────────────
@@ -238,16 +239,16 @@ async def cb_run_sku_link_wb(cb: CallbackQuery) -> None:
     await cb.answer("Запускаю…")
     if cb.message:
         from src.bot.handlers.integrations import cmd_sku_link_wb
-        # Привязка длинная и пишет прогресс — отдельные сообщения, это OK
-        await cmd_sku_link_wb(cb.message)
+        await cmd_sku_link_wb(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)
 
 
 @router.callback_query(lambda c: c.data == "run:sku_link_ozon")
 async def cb_run_sku_link_ozon(cb: CallbackQuery) -> None:
     await cb.answer("Запускаю…")
-    if cb.message:
+    if cb.message and cb.from_user:
         from src.bot.handlers.integrations import cmd_sku_link_ozon
-        await cmd_sku_link_ozon(cb.message)
+        # cb.message.from_user — это бот; передаём tg_id юзера явно
+        await cmd_sku_link_ozon(cb.message, _tg_id=cb.from_user.id)
 
 
 
@@ -277,7 +278,7 @@ async def cb_diag_api_check(cb: CallbackQuery) -> None:
     await cb.answer("Проверяю…")
     if cb.message:
         from src.bot.handlers.integrations import cmd_api_check
-        await cmd_api_check(cb.message)
+        await cmd_api_check(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)
 
 
 @router.callback_query(lambda c: c.data == "diag:wb_coefs")
@@ -285,7 +286,7 @@ async def cb_diag_wb_coefs(cb: CallbackQuery) -> None:
     await cb.answer("Тяну коэффициенты WB…")
     if cb.message:
         from src.bot.handlers.integrations import cmd_wb_coefs
-        await cmd_wb_coefs(cb.message)
+        await cmd_wb_coefs(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)
 
 
 # ── inline-callback «✖ Отмена» в wizard'ах ────────────────────────────────

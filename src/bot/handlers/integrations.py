@@ -43,10 +43,12 @@ logger = logging.getLogger("bot.integrations")
 # ── /ozon_diag — диагностический запрос на draft/create ─────────────────────
 
 @router.message(Command("ozon_diag"))
-async def cmd_ozon_diag(msg: Message) -> None:
+async def cmd_ozon_diag(msg: Message, _tg_id: int | None = None) -> None:
     """Минимальный тест draft/create + полные headers ответа в чат.
-    Покажет реальные rate-limit headers и текст ошибки для диагностики 429."""
-    tg_id = current_user_id_from(msg)
+    Покажет реальные rate-limit headers и текст ошибки для диагностики 429.
+    `_tg_id` — explicit override для случая когда команда вызывается из
+    callback (cb.message.from_user — это бот, не юзер)."""
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     with db_session() as s:
@@ -99,12 +101,12 @@ async def cmd_ozon_diag(msg: Message) -> None:
 # ── /api_warmup — прогреть кэш WB (файловый) ────────────────────────────────
 
 @router.message(Command("api_warmup"))
-async def cmd_api_warmup(msg: Message) -> None:
+async def cmd_api_warmup(msg: Message, _tg_id: int | None = None) -> None:
     """Запросить и закэшировать в файл WB-склады и Ozon-кластеры.
     Полезно прогнать после старта бота — потом /ship_hunt не упадёт на 429."""
     import asyncio as _a
     lines = ["🔥 <b>Прогрев кэшей</b>\n"]
-    tg_id = current_user_id_from(msg)
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
 
@@ -197,10 +199,10 @@ def _classify_ozon_error(e: Exception) -> tuple[str, str]:
 
 
 @router.message(Command("api_check"))
-async def cmd_api_check(msg: Message) -> None:
+async def cmd_api_check(msg: Message, _tg_id: int | None = None) -> None:
     import asyncio
     lines = ["🔑 <b>Проверка API-ключей</b>\n"]
-    tg_id = current_user_id_from(msg)
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
 
@@ -295,8 +297,8 @@ _WB_STOCKS_CACHE: Dict[str, tuple] = {}  # df → (ts, rows)
 
 
 @router.message(Command("wb_stocks"))
-async def cmd_wb_stocks(msg: Message) -> None:
-    tg_id = current_user_id_from(msg)
+async def cmd_wb_stocks(msg: Message, _tg_id: int | None = None) -> None:
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     with db_session() as s:
@@ -369,9 +371,9 @@ def _logistics_emoji(dlv_coef_pct: float) -> str:
 
 
 @router.message(Command("wb_coefs"))
-async def cmd_wb_coefs(msg: Message) -> None:
+async def cmd_wb_coefs(msg: Message, _tg_id: int | None = None) -> None:
     from src.warehouses import WB_CLUSTERS, WB_FOOD_WAREHOUSES
-    tg_id = current_user_id_from(msg)
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     with db_session() as s:
@@ -447,8 +449,8 @@ async def cmd_wb_coefs(msg: Message) -> None:
 # ── Ozon ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("ozon_stocks"))
-async def cmd_ozon_stocks(msg: Message) -> None:
-    tg_id = current_user_id_from(msg)
+async def cmd_ozon_stocks(msg: Message, _tg_id: int | None = None) -> None:
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     with db_session() as s:
@@ -488,13 +490,13 @@ async def cmd_ozon_stocks(msg: Message) -> None:
 # ── импорт каталога: snapshot Ozon/WB catalog ──────────────────────────────
 
 @router.message(Command("sku_link_ozon"))
-async def cmd_sku_link_ozon(msg: Message) -> None:
+async def cmd_sku_link_ozon(msg: Message, _tg_id: int | None = None) -> None:
     """Полный snapshot Ozon-каталога в локальную таблицу ozon_products.
 
     Стирает старые записи и записывает заново — никакого matching по barcode
     с локальным каталогом. ozon_products теперь источник правды для Ozon-флоу.
-    """
-    tg_id = current_user_id_from(msg)
+    `_tg_id` — explicit override (callback-обёртки передают cb.from_user.id)."""
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     from src.config import ALLOWED_USER_ID
@@ -600,9 +602,9 @@ async def cmd_sku_link_ozon(msg: Message) -> None:
 
 
 @router.message(Command("sku_link_wb"))
-async def cmd_sku_link_wb(msg: Message) -> None:
+async def cmd_sku_link_wb(msg: Message, _tg_id: int | None = None) -> None:
     """Полный snapshot WB-каталога в локальную таблицу wb_products."""
-    tg_id = current_user_id_from(msg)
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     from src.config import ALLOWED_USER_ID
@@ -692,8 +694,8 @@ async def cmd_sku_link_wb(msg: Message) -> None:
 
 
 @router.message(Command("ozon_warehouses"))
-async def cmd_ozon_warehouses(msg: Message) -> None:
-    tg_id = current_user_id_from(msg)
+async def cmd_ozon_warehouses(msg: Message, _tg_id: int | None = None) -> None:
+    tg_id = _tg_id if _tg_id is not None else current_user_id_from(msg)
     if tg_id is None:
         return
     with db_session() as s:

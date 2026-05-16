@@ -189,9 +189,10 @@ async def cb_adm_api_check(cb: CallbackQuery) -> None:
         return
     await cb.answer("Запускаю /api_check…")
     # Делегируем готовому handler'у — он умеет работать с msg.
+    # cb.message.from_user — это бот, поэтому tg_id передаём явно.
     from src.bot.handlers.integrations import cmd_api_check
     if cb.message:
-        await cmd_api_check(cb.message)
+        await cmd_api_check(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)
 
 
 @router.callback_query(F.data == "adm:ozon_diag")
@@ -202,7 +203,7 @@ async def cb_adm_ozon_diag(cb: CallbackQuery) -> None:
     await cb.answer("Запускаю /ozon_diag…")
     from src.bot.handlers.integrations import cmd_ozon_diag
     if cb.message:
-        await cmd_ozon_diag(cb.message)
+        await cmd_ozon_diag(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)
 
 
 @router.callback_query(F.data == "adm:clear_drafts")
@@ -211,9 +212,8 @@ async def cb_adm_clear_drafts(cb: CallbackQuery) -> None:
         await cb.answer("⛔", show_alert=True)
         return
     # Реально-чищающий callback уже есть в shipment.py: clear_drafts:yes.
-    # Тут — подтверждение. Делегируем UI к существующему cmd_clear_drafts,
-    # который покажет кнопку подтверждения.
+    # Тут — подтверждение. cb.message.from_user — это бот, нам нужен админ.
     await cb.answer()
     from src.bot.handlers.shipment import cmd_clear_drafts
     if cb.message:
-        await cmd_clear_drafts(cb.message)
+        await cmd_clear_drafts(cb.message, _tg_id=cb.from_user.id if cb.from_user else None)

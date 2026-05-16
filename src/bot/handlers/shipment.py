@@ -148,7 +148,8 @@ _HUNT_CACHE: Dict[tuple, dict] = {}
 
 @router.message(Command("ship"))
 async def cmd_ship(msg: Message) -> None:
-    await _render_ship_list(msg, edit=False)
+    tg_id = msg.from_user.id if msg.from_user else 0
+    await _render_ship_list(msg, tg_id=tg_id, edit=False)
 
 
 @router.callback_query(F.data.startswith("ships_ext:"))
@@ -158,7 +159,8 @@ async def cb_ships_toggle_external(cb: CallbackQuery) -> None:
     if not cb.message:
         return
     show = cb.data.split(":", 1)[1] == "on"
-    await _render_ship_list(cb.message, edit=True, show_external=show)
+    tg_id = cb.from_user.id if cb.from_user else 0
+    await _render_ship_list(cb.message, tg_id=tg_id, edit=True, show_external=show)
 
 
 async def _collect_external_supplies(
@@ -223,12 +225,14 @@ async def _collect_external_supplies(
 async def _render_ship_list(
     target: Message,
     *,
+    tg_id: int,
     edit: bool = False,
     show_external: bool = False,
 ) -> None:
     """Список поставок с инлайн-кнопками. Группировка: WB / Ozon / Смешанные.
     edit=True пытается отредактировать сообщение target вместо answer.
     show_external=True — добавляем секцию «Поставки из Ozon ЛК (не из бота)».
+    `tg_id` — обязательный, чтобы list не утекал между кабинетами.
     """
     wb_rows: List[InlineKeyboardButton] = []
     oz_rows: List[InlineKeyboardButton] = []
@@ -236,7 +240,7 @@ async def _render_ship_list(
     total = 0
     own_order_ids: set = set()  # supply_id'ы созданные ботом (для исключения из external)
     with db_session() as session:
-        reqs = list_shipment_requests(session, limit=30)
+        reqs = list_shipment_requests(session, user_id=tg_id, limit=30)
         for r in reqs:
             for it in r.items:
                 if it.booked_supply_id:
@@ -509,8 +513,9 @@ async def handle_ship_document(msg: Message, state: FSMContext, stored_path: Pat
     # Заявки без items (свежие пустые) тоже подходят.
     file_mp = parsed.marketplace  # 'wb' | 'ozon'
     open_summaries: List[tuple] = []  # (rid, state, n_items)
+    tg_id_attach = msg.from_user.id if msg.from_user else 0
     with db_session() as session:
-        reqs = list_shipment_requests(session, limit=10)
+        reqs = list_shipment_requests(session, user_id=tg_id_attach, limit=10)
         for r in reqs:
             if r.state not in {"draft", "planning"}:
                 continue
@@ -736,14 +741,16 @@ async def cb_ship_new_template(cb: CallbackQuery) -> None:
 
 
 @router.message(Command("clear_drafts"))
-async def cmd_clear_drafts(msg: Message) -> None:
+async def cmd_clear_drafts(msg: Message, _tg_id: int | None = None) -> None:
     """Массовая чистка: отменить в Ozon все supply orders в статусе DATA_FILLING +
     удалить из БД все заявки, у которых нет активных booked items.
 
     Не трогает поставки в более продвинутых статусах (READY_TO_SUPPLY и далее).
-    Доступно только админам (ADMIN_USER_IDS)."""
+    Доступно только админам (ADMIN_USER_IDS).
+    `_tg_id` — explicit override (callback-обёртки передают cb.from_user.id)."""
     from src.config import ADMIN_USER_IDS
-    if not msg.from_user or msg.from_user.id not in ADMIN_USER_IDS:
+    actor = _tg_id if _tg_id is not None else (msg.from_user.id if msg.from_user else None)
+    if not actor or actor not in ADMIN_USER_IDS:
         await msg.answer("⛔ Команда доступна только админам.")
         return
 
@@ -1192,12 +1199,14 @@ async def cb_ship_set_otype(cb: CallbackQuery) -> None:
         await safe_edit_or_answer(cb.message, text, reply_markup=kb)
 
 
-async def _render_ship_delete_picker(target: Message, state: FSMContext, *, edit: bool) -> None:
+async def _render_ship_delete_picker(
+    target: Message, state: FSMContext, *, tg_id: int, edit: bool,
+) -> None:
     """Экран multi-select удаления заявок. Состояние выбора — в state[delpicks]."""
     data = await state.get_data()
     picks = set(data.get("delpicks") or [])
     with db_session() as session:
-        reqs = list_shipment_requests(session, limit=50)
+        reqs = list_shipment_requests(session, user_id=tg_id, limit=50)
         items_visible = [r for r in reqs if r.state not in {"closed", "cancelled"}]
         # Кэшируем display для UI.
         items_data = [
@@ -1251,7 +1260,8 @@ async def cb_ships_delete_picker(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.update_data(delpicks=[])
     if cb.message:
-        await _render_ship_delete_picker(cb.message, state, edit=True)
+        tg_id = cb.from_user.id if cb.from_user else 0
+        await _render_ship_delete_picker(cb.message, state, tg_id=tg_id, edit=True)
 
 
 @router.callback_query(F.data.startswith("delpick:"))
@@ -1266,7 +1276,8 @@ async def cb_delpick(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(delpicks=list(picks))
     await cb.answer()
     if cb.message:
-        await _render_ship_delete_picker(cb.message, state, edit=True)
+        tg_id = cb.from_user.id if cb.from_user else 0
+        await _render_ship_delete_picker(cb.message, state, tg_id=tg_id, edit=True)
 
 
 @router.callback_query(F.data == "delconfirm")
@@ -1300,17 +1311,18 @@ async def cb_delconfirm(cb: CallbackQuery, state: FSMContext) -> None:
 async def cb_delconfirm_yes(cb: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     picks = list(data.get("delpicks") or [])
+    tg_id = cb.from_user.id if cb.from_user else 0
     deleted = 0
     with db_session() as session:
         for rid in picks:
-            r = get_shipment_request(session, rid)
+            r = get_shipment_request(session, rid, user_id=tg_id)
             if r:
                 session.delete(r)
                 deleted += 1
     await state.update_data(delpicks=[])
     await cb.answer(f"Удалено: {deleted}")
     if cb.message:
-        await _render_ship_list(cb.message, edit=True)
+        await _render_ship_list(cb.message, tg_id=tg_id, edit=True)
 
 
 @router.callback_query(F.data == "delcancel")
@@ -1318,7 +1330,8 @@ async def cb_delcancel(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(delpicks=[])
     await cb.answer()
     if cb.message:
-        await _render_ship_list(cb.message, edit=True)
+        tg_id = cb.from_user.id if cb.from_user else 0
+        await _render_ship_list(cb.message, tg_id=tg_id, edit=True)
 
 
 @router.callback_query(F.data == "ship_more")
