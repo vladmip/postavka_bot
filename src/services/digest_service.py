@@ -167,19 +167,46 @@ async def collect_returns_summary(oz: OzonClient) -> Tuple[ReturnsSummary, List[
     return summary, errors
 
 
+_REMOVAL_DONE_STATES = {
+    # RU
+    "завершено", "выдан", "выдана", "выданы", "получен", "получено",
+    "утилизирован", "утилизировано", "возвращён", "возвращен", "отказ",
+    # EN — на случай если Ozon переключит локаль
+    "issued", "completed", "delivered_to_seller", "given_out",
+    "disposed", "utilized", "cancelled", "returned",
+}
+
+
 def _group_removals(rows: List[Dict[str, Any]]) -> List[RemovalGroup]:
     """Свернуть rows в группы по (destination_warehouse, return_state).
-    Скрываем уже выданные (given_out_date != null) и утилизированные —
-    юзеру важно то, что СЕЙЧАС требует действия.
+    Юзеру важно только то, что СЕЙЧАС требует действия — поэтому отсекаем:
+      • given_out_date / utilization_date проставлены;
+      • return_state из «терминальных» (Завершено / Выдан / Утилизирован / ...);
+      • дубликаты (box_id, offer_id) — Ozon-API часто возвращает одну коробку
+        N раз построчно для каждого товара в ней.
+
     Сортировка: «в ПВЗ» сверху → «в пути» → старые сверху."""
-    groups: Dict[tuple, Dict[str, Any]] = {}
+    # Шаг 1: dedup. Ключ (box_id, offer_id) — Ozon API повторяет одни и те же
+    # записи многократно (видели 75 одинаковых row → раздували items_count в 75 раз).
+    seen: set = set()
+    deduped: List[Dict[str, Any]] = []
     for r in rows:
-        # Уже выдан в ПВЗ юзеру — пропускаем (или утилизирован).
+        key = (r.get("box_id"), r.get("offer_id"), r.get("return_state"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    groups: Dict[tuple, Dict[str, Any]] = {}
+    for r in deduped:
+        # Уже выдан / утилизирован — пропускаем.
         if r.get("given_out_date") or r.get("utilization_date"):
+            continue
+        state = r.get("return_state") or "?"
+        if state.strip().lower() in _REMOVAL_DONE_STATES:
             continue
         wh = r.get("destination_warehouse_name") or "?"
         addr = r.get("destination_warehouse_address") or ""
-        state = r.get("return_state") or "?"
         # Эвристика «в ПВЗ»: дата прибытия в прошлом (delivery_date <= today),
         # но выдачи нет (given_out_date пустой — мы их уже отфильтровали).
         delivery_iso = r.get("delivery_date") or ""
@@ -512,7 +539,9 @@ def build_digest_text(data: DigestData) -> str:
         )
         lines.append("")
 
-    # Возвраты
+    # Возвраты. PDF в Ozon-API почти всегда отдаётся (универсальная этикетка
+    # партии), поэтому игнорим его при определении пустоты — иначе раздел
+    # «Возвраты» был бы «не пустым» вечно с одной строкой про PDF.
     r = data.returns
     lines.append("📥 <b>Возвраты Ozon</b>")
     nothing = (
@@ -520,7 +549,7 @@ def build_digest_text(data: DigestData) -> str:
         and not r.removal_from_stock and not r.removal_from_supply
     )
     if nothing:
-        lines.append("✅ Всё пусто — забирать нечего.")
+        lines.append("✅ Нет возвратов — забирать нечего.")
     else:
         if r.total:
             lines.append(f"  • На ПВЗ ждут получения: <b>{r.total}</b>")

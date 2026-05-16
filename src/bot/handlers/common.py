@@ -205,20 +205,10 @@ async def cb_menu_digest(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "menu:returns")
 async def cb_menu_returns(cb: CallbackQuery) -> None:
-    await cb.answer()
-    if cb.message:
-        text = (
-            "📥 <b>Возвраты</b>\n\n"
-            "Тяну PDF этикетки получения возвратов из маркетплейса. "
-            "Одна PDF на партию + список товаров внутри.\n\n"
-            "Выбери маркетплейс:"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔵 Ozon — этикетка получения PDF",
-                                  callback_data="ret:ozon")],
-            [InlineKeyboardButton(text="◀ Назад", callback_data="menu:home")],
-        ])
-        await safe_edit_or_answer(cb.message, text, reply_markup=kb)
+    """Сразу Ozon-возвраты (WB пока скрыт). Раньше было подменю выбора
+    маркетплейса — лишний клик при единственном активном MP."""
+    from src.bot.handlers.returns import cb_ret_ozon
+    await cb_ret_ozon(cb)
 
 
 # ── menu:sku_link ─────────────────────────────────────────────────────────
