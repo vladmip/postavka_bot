@@ -654,10 +654,9 @@ async def _auto_book_explore(
     else:
         date_to_iso = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
 
-    # Реально Ozon отдаёт code:8 "per second" на /v1/draft/crossdock/create
-    # при ЛЮБОЙ конкуренции — semaphore=2 + holdback 30с давал 429 одно за другим.
-    # Жёстко serial-ный режим: одна заявка за раз + 1.5с между запросами.
-    # Клиент сам ретраит 429 теперь (этот path в _GLOBAL_LIMIT_PATHS).
+    # 1.5с pacing был агрессивнее чем Ozon разрешает (часто 429 серией). До
+    # параллельного эксперимента работало 5с pacing между кластерами. Делаем
+    # 8с — с запасом, чтобы per-second лимит не залипал.
     sem_draft = asyncio.Semaphore(1)
 
     async def _process_cluster(cl: str) -> None:
@@ -695,8 +694,9 @@ async def _auto_book_explore(
                 )
             except OzonAPIError as e:
                 err = e
-            # Pacing: Ozon лимит ~1 req/sec, делаем чуть свободнее.
-            await asyncio.sleep(1.5)
+            # Pacing 8с — раньше работало 5с стабильно. Запас на per-second
+            # лимит Ozon (он часто загружен другими продавцами).
+            await asyncio.sleep(8)
         if err is not None:
             status[cl] = f"❌ <b>{cl}</b>: draft_create — <code>{str(err)[:120]}</code>"
             return
@@ -3020,13 +3020,13 @@ async def _auto_poll_slots(
                 logger.warning("auto-poll: no creds for tg_id=%s, abort", tg_id)
                 return
             # Пересоздаём drafts которым >28 мин — иначе Ozon вернёт 404 expired.
-            # Ozon лимит ~1 req/sec на /v1/draft/*/create — пауза 1.5с между.
+            # Pacing 8с между draft_create — соответствует основному wizard'у.
             recreated_this_iter = 0
             need_pacing = False
             for fd in drafts:
                 if fd.get("created_ts") and _t.time() - fd["created_ts"] > recreate_after:
                     if need_pacing:
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(8)
                     new_id = await _recreate_draft_for_auto_poll(oz, rid, fd, tg_id or 0)
                     need_pacing = True
                     if new_id:

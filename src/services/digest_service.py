@@ -576,6 +576,7 @@ def build_digest_text(data: DigestData) -> str:
     # Акты, ждущие подтверждения.
     if data.acts_awaiting:
         lines.append("📋 <b>Акты ждут подтверждения</b>")
+        lines.append("")
         for a in data.acts_awaiting[:10]:
             state_icon = "🔴" if a.state == "REPORT_REJECTED" else "🟡"
             state_text = "акт отклонён" if a.state == "REPORT_REJECTED" else "ждёт подтверждения"
@@ -593,10 +594,6 @@ def build_digest_text(data: DigestData) -> str:
             )
         if len(data.acts_awaiting) > 10:
             lines.append(f"  …и ещё {len(data.acts_awaiting) - 10}")
-        lines.append(
-            '🔗 <a href="https://seller.ozon.ru/app/supply/orders?filter=ReportsConfirmation">'
-            "Открыть список в Ozon ЛК</a>"
-        )
         _sep(lines)
 
     # Возвраты — это товары к получению в ПВЗ + giveout-партии. Removals
