@@ -104,19 +104,39 @@ class OzonClient:
         # лимит, а не account-ban. Лечится backoff'ом, как timeslot/info.
         is_anti_abuse = path in anti_abuse_paths
 
+        # «Тяжёлые» эндпоинты: draft/*/create — Ozon per-second лимит для них
+        # часто загружен другими продавцами на 15-30 сек подряд. Короткий
+        # backoff 2-5с не успевает дождаться. Длинный backoff 5-45с × 6 ретраев
+        # даёт окно ~125с — достаточно чтобы лимит «отдышался».
+        heavy_limit_paths = {
+            "/v1/draft/crossdock/create",
+            "/v1/draft/direct/create",
+            "/v1/draft/multi-cluster/create",
+            "/v2/draft/supply/create",
+        }
+        is_heavy = path in heavy_limit_paths
+
         if retries_on_429 is None:
-            # Для global-limit endpoints даём 5 ретраев с короткой паузой
-            # (~20 сек окно). Для anti-abuse — 0 (любой ретрай продлевает бан).
-            # Для остальных (account-level) — 1.
+            # Для anti-abuse — 0 (любой ретрай продлевает бан).
+            # Для heavy-limit — 6 ретраев с долгим backoff (общее окно ~125с).
+            # Для остальных global-limit — 5 ретраев с коротким backoff (~20с).
+            # Для account-level (не global) — 1.
             if is_anti_abuse:
                 retries_on_429 = 0
+            elif is_heavy:
+                retries_on_429 = 6
             elif is_global:
                 retries_on_429 = 5
             else:
                 retries_on_429 = 1
-        # Для global-limit endpoints короткие ретраи 2-5с (лимит per-second),
-        # для account-level — единственный длинный 30с (потом cooldown).
-        backoff: List[int] = [30] if not is_global else [2, 3, 4, 5, 5, 5]
+        # Backoff: heavy — длинный (5-45с), global — короткий (2-5с),
+        # account-level — единственный 30с.
+        if is_heavy:
+            backoff: List[int] = [5, 10, 15, 20, 30, 45]
+        elif is_global:
+            backoff = [2, 3, 4, 5, 5, 5]
+        else:
+            backoff = [30]
 
         # Cooldown check — persistent (файл), переживает рестарт бота
         from src.integrations._cache import cooldown_remaining, cooldown_set
