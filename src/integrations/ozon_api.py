@@ -143,8 +143,10 @@ class OzonClient:
 
         # Cooldown check — persistent (файл), переживает рестарт бота
         from src.integrations._cache import cooldown_remaining, cooldown_set
-        # Глобальные лимиты не кулдауним (общая квота с другими продавцами).
-        if is_anti_abuse or not is_global:
+        # Кулдауним: anti-abuse, account-level (не global), и heavy
+        # (per-second лимит у нас обычно — мягкий аккаунт-бан Ozon, не
+        # глобальный шум, наши новые попытки его продлевают).
+        if is_anti_abuse or not is_global or is_heavy:
             remaining = cooldown_remaining(path)
             if remaining > 0:
                 wait_min = remaining // 60
@@ -219,6 +221,18 @@ class OzonClient:
                         f"Cooldown 15 мин — каждый ретрай продлевает бан."
                     )
                 if is_global or is_per_second:
+                    # Heavy paths: после исчерпанной серии 429 ставим локальный
+                    # cooldown 5 мин — Ozon явно нас «мягко банит» (часто из-за
+                    # серии невалидных drafts), наши новые попытки только
+                    # продлевают ban. Лучше переждать.
+                    if is_heavy:
+                        cooldown_set(path, 5 * 60)
+                        raise OzonAPIError(
+                            f"Ozon 429 на {path}: rate limit. "
+                            f"Cooldown 5 мин — подожди и повтори. "
+                            f"Если повторяется — проверь, что у товаров заполнены "
+                            f"габариты в Ozon Seller Center."
+                        )
                     raise OzonAPIError(
                         f"Ozon 429 на {path}: request rate limit per second. "
                         f"Повтори через 30-60 сек."
