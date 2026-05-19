@@ -701,16 +701,9 @@ def _render_request_card(req) -> tuple:
         if has_ozon and has_unbooked_ozon:
             # Тип Ozon-поставки фиксируется при создании. NULL = legacy-заявка
             # до миграции — даём юзеру выбрать тип однократно прямо здесь.
-            # cargo_format (BOX/PALLET) — спрашиваем тоже, перед запуском wizard'а.
-            # Кнопка «🎯 Авто-брон» убрана из карточки — авто-брон предлагается
-                # в финале /ship_plan flow (3 кнопки: 🎯 В одну дату / 🎯 В одно время / 🛠 Ручной).
-                # В карточке юзер видит только обычный wizard.
-            if req.ozon_supply_type and not req.cargo_format:
-                rows.append([InlineKeyboardButton(
-                    text="🚀 Создать поставку Ozon (выбрать формат)",
-                    callback_data=f"ship_pick_fmt:{req.id}",
-                )])
-            elif req.ozon_supply_type == "direct":
+            # cargo_format = BOX по умолчанию (раньше был отдельный экран выбора
+            # коробами/паллетами — убрали, формат влияет только на docx-генератор).
+            if req.ozon_supply_type == "direct":
                 rows.append([InlineKeyboardButton(
                     text="🚀 Создать поставку Ozon → Прямая",
                     callback_data=f"ozon_book_card:{req.id}:direct",
@@ -1526,6 +1519,10 @@ async def cb_ship_set_otype(cb: CallbackQuery) -> None:
             await cb.answer("Тип уже зафиксирован — изменить нельзя", show_alert=True)
             return
         req.ozon_supply_type = otype
+        # cargo_format убрали из UX (отдельный экран выбора был избыточен) —
+        # дефолтим BOX, реально влияет только на формат docx ТЗ.
+        if not req.cargo_format:
+            req.cargo_format = "BOX"
         text, kb = _render_request_card(req)
     label = "Прямая" if otype == "direct" else "Кросс-докинг"
     await cb.answer(f"Тип: {label}")

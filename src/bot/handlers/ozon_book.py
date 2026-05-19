@@ -1289,6 +1289,7 @@ async def _start_ozon_book_wizard(
         ob_rid=rid,
         ob_tg_id=tg_id,
         ob_clusters=[s[0] for s in summaries],
+        ob_booked_clusters=booked_clusters,  # для корректного счётчика в финале
         ob_date_from=date_from,
         ob_date_to=date_to,
         ob_date_picks=date_picks,
@@ -1960,12 +1961,10 @@ async def _show_scored_warehouse_picker(msg: Message, state: FSMContext) -> None
     draft_type = (data.get("ob_type") or "").upper()
     is_crossdock = "CROSSDOCK" in draft_type
 
-    # CROSSDOCK: складов выбирать не нужно, сразу к таймслотам
+    # CROSSDOCK: складов выбирать не нужно, сразу к таймслотам.
+    # (Раньше тут писали «Scoring готов» — ввело юзера в заблуждение, потому
+    # что дальше могло прилететь «нет таймслотов». Молча идём к таймслотам.)
     if is_crossdock:
-        await progress_add(
-            msg, state,
-            "✅ Scoring готов. Для CROSSDOCK РФЦ определяет Ozon — иду к таймслотам.",
-        )
         await state.update_data(
             ob_drafts=data.get("ob_drafts"),
             ob_date_from_iso=data.get("ob_date_from_iso"),
@@ -4059,8 +4058,9 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
     failed_scoring = data.get("ob_failed_clusters_scoring") or []
     failed_other = data.get("ob_failed_clusters") or []
     out_of_book = [c for c in failed_other if c not in failed_scoring]
+    pre_booked = data.get("ob_booked_clusters") or []
     skipped_block = ""
-    n_total = ok_count + fail_count + len(failed_scoring) + len(out_of_book)
+    n_total = ok_count + fail_count + len(failed_scoring) + len(out_of_book) + len(pre_booked)
     if failed_scoring:
         skipped_block += (
             f"\n\n🚫 <b>Без слотов на твои даты</b> ({len(failed_scoring)}):\n  "
@@ -4103,17 +4103,20 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
             url="https://seller.ozon.ru/app/supply-orders",
         )])
         n_polling = len(out_of_book)
+        # ok_total = новые брони (ok_count) + ранее забронированные (pre_booked).
+        # Юзер ждёт «N из M» где M = ВСЕ кластеры заявки, не только обрабатываемые.
+        ok_total = ok_count + len(pre_booked)
         if fail_count == 0 and not failed_scoring and not n_polling:
-            header = f"✅ Все {ok_count} забронированы. Что дальше?"
+            header = f"✅ Все {ok_total} забронированы. Что дальше?"
         elif fail_count == 0 and not failed_scoring and n_polling:
             header = (
-                f"✅ Забронировано {ok_count}/{n_total} · "
+                f"✅ Забронировано {ok_total}/{n_total} · "
                 f"⏳ {n_polling} ищу слот ещё час\n"
                 f"<i>Не нашлось — пришлю сообщение через час.</i>"
             )
         else:
             header = (
-                f"⚠ Забронировано {ok_count}/{n_total}. "
+                f"⚠ Забронировано {ok_total}/{n_total}. "
                 f"Не удалось: {fail_count + len(failed_scoring)}."
             )
             if n_polling:
@@ -4312,12 +4315,8 @@ async def _ask_dropoff_for_next_cluster(msg: Message, state: FSMContext) -> None
         except Exception as e:
             logger.warning("save crossdock_warehouses_json failed rid=%s: %s", rid, e)
 
-        # В «сардельку» — кратко: детали уже выше, в самом picker'е.
-        await progress_add(
-            msg, state,
-            f"\n✅ Drop-off-точки выбраны для {len(clusters)} кластер"
-            f"{'ов' if len(clusters) != 1 else 'а'}.",
-        )
+        # Молча идём дальше — детали drop-off'а уже виделись в самом picker'е,
+        # повторно дублировать «✅ выбраны для N кластеров» — лишний шум.
         await _create_drafts_and_fetch_scoring(msg, state)
         return
 
