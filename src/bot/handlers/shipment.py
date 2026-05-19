@@ -213,13 +213,292 @@ async def _collect_external_supplies(
         drop = o.get("drop_off_warehouse") or {}
         wh_name = (drop.get("name") or "")[:25]
         emoji = state_emoji.get(state, "🔵")
-        # Кнопка-ссылка прямо на поставку в Ozon ЛК.
-        url = f"https://seller.ozon.ru/app/supply/orders/{order_id}"
+        # Открываем карточку в боте (deep-link), а не URL в ЛК.
         rows.append([InlineKeyboardButton(
             text=f"{emoji} #{order_number} · {wh_name}"[:55],
-            url=url,
+            callback_data=f"ext_open:{order_id}",
         )])
     return rows, lines
+
+
+# ── ext_open / ext_tz — карточка ЛК-поставки + ТЗ Отгрузки ───────────────────
+
+_EXT_STATE_LABEL = {
+    "DATA_FILLING": "📝 Заполняется",
+    "READY_TO_SUPPLY": "📦 Готова к отгрузке",
+    "ACCEPTED_AT_SUPPLY_WAREHOUSE": "🏭 Принята на drop-off",
+    "IN_TRANSIT": "🚚 В пути",
+    "ACCEPTANCE_AT_STORAGE_WAREHOUSE": "🏬 На приёмке РФЦ",
+    "REPORTS_CONFIRMATION_AWAITING": "📋 Ждёт подтверждения акта",
+    "REPORT_REJECTED": "🔴 Акт отклонён",
+    "COMPLETED": "✅ Завершена",
+    "CANCELLED": "❌ Отменена",
+}
+
+
+def _fmt_ext_slot(timeslot: Optional[Dict]) -> str:
+    if not timeslot:
+        return ""
+    inner = timeslot.get("timeslot") or {}
+    fr, to = str(inner.get("from") or ""), str(inner.get("to") or "")
+    if not fr:
+        return ""
+    # 2026-05-13T15:00:00Z → «13.05 15:00–16:00»
+    try:
+        dt_from = datetime.fromisoformat(fr.replace("Z", "+00:00"))
+        dt_to = datetime.fromisoformat(to.replace("Z", "+00:00")) if to else None
+        out = dt_from.strftime("%d.%m %H:%M")
+        if dt_to:
+            out += "–" + dt_to.strftime("%H:%M")
+        return out
+    except (ValueError, TypeError):
+        return f"{fr[:16]}–{to[11:16] if to else ''}"
+
+
+async def _fetch_ext_order(tg_id: int, order_id: int) -> Optional[Dict]:
+    from src.services.user_service import get_ozon_client_for
+    from src.integrations.ozon_api import OzonAPIError
+    with db_session() as s:
+        oz = get_ozon_client_for(s, tg_id)
+    if oz is None:
+        return None
+    try:
+        orders = await oz.supply_order_get([order_id])
+    except OzonAPIError as e:
+        logger.warning("ext_open: supply_order_get failed: %s", e)
+        return None
+    return orders[0] if orders else None
+
+
+@router.callback_query(F.data.startswith("ext_open:"))
+async def cb_ext_open(cb: CallbackQuery) -> None:
+    """Карточка ЛК-поставки (не из бота)."""
+    order_id = int(cb.data.split(":", 1)[1])
+    await cb.answer("Тяну данные из Ozon…")
+    if not cb.message:
+        return
+    tg_id = cb.from_user.id if cb.from_user else 0
+
+    order = await _fetch_ext_order(tg_id, order_id)
+    if not order:
+        await safe_edit_or_answer(
+            cb.message,
+            f"⚠ Не удалось получить #{order_id} из Ozon. "
+            f"Открой в ЛК: https://seller.ozon.ru/app/supply/orders/{order_id}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀ К списку поставок",
+                                      callback_data="ships_ext:on")],
+            ]),
+        )
+        return
+
+    order_number = str(order.get("order_number") or order_id)
+    state = str(order.get("state") or "")
+    state_label = _EXT_STATE_LABEL.get(state, f"🔵 {state}")
+    drop = order.get("drop_off_warehouse") or {}
+    drop_name = drop.get("name") or "?"
+    drop_addr = (drop.get("address") or "")[:60]
+    slot_text = _fmt_ext_slot(order.get("timeslot"))
+
+    supplies = order.get("supplies") or []
+    n_supplies = len(supplies)
+    bundle_ids: List[str] = [str(s.get("bundle_id") or "") for s in supplies if s.get("bundle_id")]
+    n_items_total = 0
+    n_qty_total = 0
+    for s in supplies:
+        cargoes = s.get("cargoes") or []
+        for c in cargoes:
+            items = c.get("items") or []
+            for it in items:
+                n_items_total += 1
+                try:
+                    n_qty_total += int(it.get("quantity") or 0)
+                except (ValueError, TypeError):
+                    pass
+
+    lines = [
+        f"🌐 <b>ЛК поставка #{order_number}</b>",
+        "",
+        f"Статус: {state_label}",
+        f"Drop-off: <b>{drop_name}</b>",
+    ]
+    if drop_addr:
+        lines.append(f"  <i>{drop_addr}</i>")
+    if slot_text:
+        lines.append(f"Слот: <b>{slot_text}</b>")
+    if n_supplies:
+        lines.append(f"Поставок (supply): <b>{n_supplies}</b>")
+    if n_items_total or n_qty_total:
+        lines.append(
+            f"Состав: <b>{n_items_total} позиций</b>, "
+            f"всего <b>{n_qty_total} шт</b>"
+        )
+    elif bundle_ids:
+        lines.append("<i>Состав подгрузится при «Скачать ТЗ».</i>")
+
+    rows: List[List[InlineKeyboardButton]] = []
+    # ТЗ доступно если есть bundle_id (тянем через /v1/supply-order/bundle)
+    # или уже есть items в supplies (редко).
+    can_tz = bool(bundle_ids) or n_items_total > 0
+    if can_tz:
+        rows.append([InlineKeyboardButton(
+            text="📤 Скачать ТЗ Отгрузки",
+            callback_data=f"ext_tz:{order_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🌐 Открыть в Ozon ЛК",
+        url=f"https://seller.ozon.ru/app/supply/orders/{order_id}",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="◀ К списку поставок",
+        callback_data="ships_ext:on",
+    )])
+
+    await safe_edit_or_answer(
+        cb.message, "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("ext_tz:"))
+async def cb_ext_tz(cb: CallbackQuery) -> None:
+    """ТЗ Отгрузки для ЛК-поставки (не из бота). Тянет состав через bundle."""
+    from aiogram.types import BufferedInputFile
+    from src.generators.tz_otgruzka import generate_tz_otgruzka, OtgruzkaRow
+    from src.integrations.ozon_api import OzonAPIError
+    from src.services.user_service import get_ozon_client_for
+    from src.db.models import OzonProduct
+    from sqlalchemy import select
+
+    order_id = int(cb.data.split(":", 1)[1])
+    await cb.answer("Генерирую ТЗ Отгрузка…")
+    if not cb.message:
+        return
+    tg_id = cb.from_user.id if cb.from_user else 0
+
+    order = await _fetch_ext_order(tg_id, order_id)
+    if not order:
+        await cb.message.answer(f"⚠ Не получил #{order_id} из Ozon.")
+        return
+
+    drop = order.get("drop_off_warehouse") or {}
+    warehouse_name = drop.get("name") or "Ozon ЛК"
+
+    supplies = order.get("supplies") or []
+    # Собираем items: либо прямо из supplies[].cargoes[].items, либо
+    # дотягиваем через /v1/supply-order/bundle если items пусто.
+    items_raw: List[Dict] = []
+    for s in supplies:
+        for c in (s.get("cargoes") or []):
+            for it in (c.get("items") or []):
+                items_raw.append(it)
+    if not items_raw:
+        bundle_ids = [str(s.get("bundle_id") or "") for s in supplies if s.get("bundle_id")]
+        if bundle_ids:
+            with db_session() as ss:
+                oz = get_ozon_client_for(ss, tg_id)
+            if oz is None:
+                await cb.message.answer("⚠ Ozon-ключи не подключены.")
+                return
+            try:
+                items_raw = await oz.supply_order_bundle(bundle_ids)
+            except OzonAPIError as e:
+                await cb.message.answer(
+                    f"⚠ Ozon supply_order_bundle: <code>{str(e)[:200]}</code>"
+                )
+                return
+
+    if not items_raw:
+        await cb.message.answer(
+            f"⚠ Состав поставки #{order_id} не доступен через API. "
+            f"Открой в ЛК Ozon."
+        )
+        return
+
+    # Резолвим SKU/offer_id → barcode + name через локальный OzonProduct каталог.
+    rows: List[OtgruzkaRow] = []
+    skus_to_lookup: List[int] = []
+    offer_ids_to_lookup: List[str] = []
+    for it in items_raw:
+        try:
+            sku = int(it.get("sku") or 0)
+            if sku:
+                skus_to_lookup.append(sku)
+        except (ValueError, TypeError):
+            pass
+        oid = str(it.get("offer_id") or "").strip()
+        if oid:
+            offer_ids_to_lookup.append(oid)
+
+    sku_to_product: Dict[int, OzonProduct] = {}
+    oid_to_product: Dict[str, OzonProduct] = {}
+    if skus_to_lookup or offer_ids_to_lookup:
+        with db_session() as ss:
+            if skus_to_lookup:
+                q = ss.scalars(
+                    select(OzonProduct).where(OzonProduct.sku.in_(set(skus_to_lookup)))
+                ).all()
+                sku_to_product = {p.sku: p for p in q if p.sku}
+            if offer_ids_to_lookup:
+                q2 = ss.scalars(
+                    select(OzonProduct).where(OzonProduct.offer_id.in_(set(offer_ids_to_lookup)))
+                ).all()
+                oid_to_product = {p.offer_id: p for p in q2}
+
+    for it in items_raw:
+        try:
+            qty = int(it.get("quantity") or 0)
+        except (ValueError, TypeError):
+            qty = 0
+        if qty <= 0:
+            continue
+        try:
+            sku = int(it.get("sku") or 0)
+        except (ValueError, TypeError):
+            sku = 0
+        oid = str(it.get("offer_id") or "").strip()
+        product = sku_to_product.get(sku) or oid_to_product.get(oid)
+        if product:
+            barcode = product.barcode_primary or ""
+            name = product.name or ""
+            article = product.offer_id or oid
+        else:
+            barcode = str(it.get("barcode") or "")
+            name = str(it.get("name") or "")
+            article = oid or (str(sku) if sku else "")
+        rows.append(OtgruzkaRow(
+            barcode=barcode,
+            name=name,
+            qty=qty,
+            warehouse=warehouse_name,
+            marketplace="ozon",
+            supplier_article=article,
+        ))
+
+    if not rows:
+        await cb.message.answer(f"⚠ В составе #{order_id} нет позиций.")
+        return
+
+    try:
+        data = generate_tz_otgruzka(rows)
+    except Exception as e:
+        await cb.message.answer(
+            f"⚠ Ошибка генерации: <code>{type(e).__name__}: {e}</code>"
+        )
+        return
+
+    order_number = str(order.get("order_number") or order_id)
+    fname = f"TZ_Otgruzka_LK_{order_number}.xlsx"
+    total_qty = sum(r.qty for r in rows)
+    caption = (
+        f"📤 ТЗ Отгрузка для ЛК-поставки #{order_number}\n"
+        f"Drop-off: {warehouse_name}\n"
+        f"Строк: {len(rows)}, всего {total_qty} шт"
+    )
+    await cb.message.answer_document(
+        document=BufferedInputFile(data, filename=fname),
+        caption=caption,
+    )
 
 
 async def _render_ship_list(
@@ -2149,7 +2428,8 @@ async def cmd_ship_tz(msg: Message, command: CommandObject) -> None:
     except ValueError:
         await msg.answer("Использование: <code>/ship_tz ID</code>")
         return
-    await _send_ship_tz(msg, rid)
+    tg_id = msg.from_user.id if msg.from_user else 0
+    await _send_ship_tz(msg, rid, tg_id=tg_id)
 
 
 @router.callback_query(F.data.startswith("ship_items:"))
@@ -2226,10 +2506,12 @@ async def cb_ship_tz(cb: CallbackQuery) -> None:
     rid = int(cb.data.split(":", 1)[1])
     await cb.answer("Генерирую ТЗ Отгрузка…")
     if cb.message:
-        await _send_ship_tz(cb.message, rid)
+        # cb.message.from_user — это БОТ, не юзер. Берём tg_id из cb.from_user.
+        tg_id = cb.from_user.id if cb.from_user else 0
+        await _send_ship_tz(cb.message, rid, tg_id=tg_id)
 
 
-async def _send_ship_tz(msg: Message, rid: int) -> None:
+async def _send_ship_tz(msg: Message, rid: int, *, tg_id: int) -> None:
     from aiogram.types import BufferedInputFile
     from src.generators import generate_ship_tz
 
@@ -2239,9 +2521,8 @@ async def _send_ship_tz(msg: Message, rid: int) -> None:
     try:
         from src.services.ozon_supply_status_service import refresh_supply_status, is_cache_fresh
         if not is_cache_fresh(rid):
-            tg_id = current_user_id_from(msg)
             cli = None
-            if tg_id is not None:
+            if tg_id:
                 with db_session() as session:
                     cli = get_ozon_client_for(session, tg_id)
             if cli is not None:
@@ -2250,9 +2531,8 @@ async def _send_ship_tz(msg: Message, rid: int) -> None:
     except Exception as e:
         logger.warning("ship_tz: status refresh failed rid=%s: %s", rid, e)
 
-    tg_id_tz = msg.from_user.id if msg.from_user else 0
     with db_session() as session:
-        req = get_shipment_request(session, rid, user_id=tg_id_tz)
+        req = get_shipment_request(session, rid, user_id=tg_id)
         if not req:
             await msg.answer(f"Поставка #{rid} не найдена.")
             return

@@ -65,18 +65,24 @@ async def cmd_ozon_diag(msg: Message, _tg_id: int | None = None) -> None:
         "Api-Key": creds.api_key,
         "Content-Type": "application/json",
     }
-    # Минимальный payload — Ozon должен либо принять (вернуть op_id), либо
-    # ругнуться валидацией (400), либо отдать 429 с headers
+    # /v1/draft/create отключён 16.03.2026; актуальные сабпути:
+    # /v1/draft/crossdock/create, /v1/draft/direct/create, /v1/draft/multi-cluster/create.
+    # Дёргаем crossdock — минимальный payload, ожидаем 400 (валидация missing
+    # drop_off_point_warehouse_id) либо 200 с errors[]. 429 будет означать
+    # реальный rate-limit, а не «устаревший эндпоинт».
+    path = "/v1/draft/crossdock/create"
     payload = {
-        "items": [{"offer_id": "TEST-NONEXISTENT", "quantity": 1}],
-        "type": "CREATE_TYPE_CROSSDOCK",
+        "deletion_sku_mode": "PARTIAL",
+        "cluster_info": {
+            "items": [{"offer_id": "TEST-NONEXISTENT", "quantity": 1}],
+        },
     }
 
-    await msg.answer("🔬 Ozon diag: POST /v1/draft/create с минимальным payload…")
+    await msg.answer(f"🔬 Ozon diag: POST <code>{path}</code> с минимальным payload…")
 
     async with httpx.AsyncClient(timeout=20.0) as cli:
         try:
-            r = await cli.post(f"{OZON_BASE}/v1/draft/create", headers=headers, json=payload)
+            r = await cli.post(f"{OZON_BASE}{path}", headers=headers, json=payload)
         except Exception as e:
             await msg.answer(f"❌ {type(e).__name__}: <code>{str(e)[:200]}</code>")
             return
@@ -90,7 +96,7 @@ async def cmd_ozon_diag(msg: Message, _tg_id: int | None = None) -> None:
     body = (r.text or "")[:600]
 
     out = (
-        f"📡 <b>Ozon /v1/draft/create — диагностика</b>\n\n"
+        f"📡 <b>Ozon {path} — диагностика</b>\n\n"
         f"<b>Status</b>: <code>{r.status_code}</code>\n\n"
         f"<b>Rate-limit headers:</b>\n{rl_dump}\n\n"
         f"<b>Body:</b>\n<code>{body}</code>"

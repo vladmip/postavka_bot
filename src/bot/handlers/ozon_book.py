@@ -609,13 +609,24 @@ async def _auto_book_explore(
             pass
     allowed_hours_set = set(int(h) for h in hour_picks) if hour_picks else None
 
-    progress = await msg.answer(
-        f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
-        f"Кластеров: <b>{len(oz_clusters)}</b> ({', '.join(oz_clusters)})\n"
-        f"Дат: {', '.join(sorted(date_picks)) if date_picks else 'все 7 дней'}\n"
-        f"Часы: {sorted(allowed_hours_set) if allowed_hours_set else 'любые'}\n\n"
-        f"⏳ Создаю drafts… (~30-90с/кластер из-за лимита Ozon)"
-    )
+    # Per-cluster status — одна строка, обновляется по мере прогресса.
+    # Параллельный pipeline: фоновый refresh-таск показывает текущее состояние
+    # всех кластеров в одном progress-сообщении.
+    status: Dict[str, str] = {
+        cl: f"⏳ <b>{cl}</b>: в очереди" for cl in oz_clusters
+    }
+
+    def _render_progress() -> str:
+        body = "\n".join(f"  {status[cl]}" for cl in oz_clusters)
+        return (
+            f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
+            f"Кластеров: <b>{len(oz_clusters)}</b> · параллельный поиск\n"
+            f"Дат: {', '.join(sorted(date_picks)) if date_picks else 'все 7 дней'}\n"
+            f"Часы: {sorted(allowed_hours_set) if allowed_hours_set else 'любые'}\n\n"
+            f"{body}"
+        )
+
+    progress = await msg.answer(_render_progress())
 
     async def _edit(text: str) -> None:
         try:
@@ -623,10 +634,11 @@ async def _auto_book_explore(
         except Exception:
             pass  # MessageNotModified
 
-    # 4. Per-cluster: создать draft, дождаться scoring, дёрнуть timeslot/info
+    # 4. Per-cluster: параллельно создаём drafts (semaphore 2 + 30с holdback —
+    # соблюдаем лимит ~2 req/30с на /draft/supply/create), затем scoring и
+    # timeslot — без ограничений (lightweight для Ozon).
     slots_per_cluster: Dict[str, List] = {}
     drafts_meta: Dict[str, Dict] = {}  # cluster → {draft_id, cluster_id, wh_id, wh_name, drop_off}
-    log_lines: List[str] = []
     supply_type = 1 if is_cross else 2
     draft_type = "CREATE_TYPE_CROSSDOCK" if is_cross else "CREATE_TYPE_DIRECT"
 
@@ -642,17 +654,17 @@ async def _auto_book_explore(
     else:
         date_to_iso = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
 
-    for idx, cl in enumerate(oz_clusters, 1):
+    sem_draft = asyncio.Semaphore(2)
+
+    async def _process_cluster(cl: str) -> None:
         items = items_per_cluster[cl]
         if not items:
-            log_lines.append(f"  ⚠ <b>{cl}</b>: пустой состав")
-            continue
-        # cluster_id (macrolocal)
+            status[cl] = f"⚠ <b>{cl}</b>: пустой состав"
+            return
         cl_id = await _resolve_macrolocal_id(oz, cl)
         if not cl_id:
-            log_lines.append(f"  ⚠ <b>{cl}</b>: cluster_id не сматчил")
-            continue
-        # CROSSDOCK требует drop_off — из ShipmentRequest.crossdock_warehouses_json
+            status[cl] = f"⚠ <b>{cl}</b>: cluster_id не сматчил"
+            return
         drop_off = None
         if is_cross:
             v = crossdock_map.get(cl)
@@ -661,42 +673,47 @@ async def _auto_book_explore(
             except (ValueError, TypeError):
                 drop_off = None
             if not drop_off:
-                log_lines.append(
-                    f"  ⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off — задай через wizard"
+                status[cl] = f"⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off"
+                return
+
+        # Stage 1: draft_create (semaphore 2 + 30с holdback)
+        status[cl] = f"⏳ <b>{cl}</b>: жду очередь на draft…"
+        op_id: Optional[str] = None
+        err: Optional[Exception] = None
+        async with sem_draft:
+            status[cl] = f"⏳ <b>{cl}</b>: создаю draft…"
+            try:
+                op_id = await oz.draft_create(
+                    items=items,
+                    cluster_ids=[cl_id],
+                    draft_type=draft_type,
+                    drop_off_point_warehouse_id=drop_off,
                 )
-                continue
+            except OzonAPIError as e:
+                err = e
+            # Holdback 30с — соблюдаем лимит на /draft/supply/create
+            await asyncio.sleep(30)
+        if err is not None:
+            status[cl] = f"❌ <b>{cl}</b>: draft_create — <code>{str(err)[:80]}</code>"
+            return
 
-        await _edit(
-            f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
-            f"⏳ Кластер {idx}/{len(oz_clusters)}: <b>{cl}</b> — создаю draft…\n\n"
-            + "\n".join(log_lines)
-        )
-
-        try:
-            op_id = await oz.draft_create(
-                items=items,
-                cluster_ids=[cl_id],
-                draft_type=draft_type,
-                drop_off_point_warehouse_id=drop_off,
-            )
-        except OzonAPIError as e:
-            log_lines.append(f"  ❌ <b>{cl}</b>: draft_create — <code>{str(e)[:120]}</code>")
-            continue
-        if op_id.startswith("sync:"):
+        # Резолвим draft_id (sync vs async path)
+        if op_id and op_id.startswith("sync:"):
             draft_id = int(op_id.split(":", 1)[1])
         else:
-            # async — polling до DONE
+            status[cl] = f"⏳ <b>{cl}</b>: жду готовности draft…"
             try:
                 info = await _wait_draft_ready(oz, op_id, max_attempts=10)
             except OzonAPIError as e:
-                log_lines.append(f"  ❌ <b>{cl}</b>: poll — <code>{str(e)[:120]}</code>")
-                continue
+                status[cl] = f"❌ <b>{cl}</b>: poll — <code>{str(e)[:80]}</code>"
+                return
             draft_id = int(info.get("draft_id") or 0)
             if not draft_id:
-                log_lines.append(f"  ❌ <b>{cl}</b>: draft_id не получен")
-                continue
+                status[cl] = f"❌ <b>{cl}</b>: draft_id не получен"
+                return
 
-        # Wait scoring (FULL_AVAILABLE)
+        # Stage 2: scoring (параллельно с другими кластерами)
+        status[cl] = f"⏳ <b>{cl}</b>: жду scoring…"
         wh_id = None
         wh_name = ""
         for attempt in range(5):
@@ -716,19 +733,17 @@ async def _auto_book_explore(
                 if (w.get("availability_status") or {}).get("state") == "FULL_AVAILABLE"
             ]
             if avail:
-                # Берём top-1 по rank
                 avail.sort(key=lambda w: w.get("total_rank", 999))
                 sw = avail[0].get("storage_warehouse") or {}
                 wh_id = int(sw.get("warehouse_id") or 0)
                 wh_name = str(sw.get("name") or "")
                 break
         if not wh_id:
-            log_lines.append(
-                f"  ⚠ <b>{cl}</b>: scoring не нашёл подходящий склад (FULL_AVAILABLE)"
-            )
-            continue
+            status[cl] = f"⚠ <b>{cl}</b>: scoring не нашёл подходящий склад"
+            return
 
-        # Дёргаем timeslot/info
+        # Stage 3: timeslot/info (параллельно)
+        status[cl] = f"⏳ <b>{cl}</b> ({wh_name}): timeslot…"
         try:
             ts_response = await oz.draft_timeslot_info(
                 draft_id=draft_id,
@@ -740,8 +755,8 @@ async def _auto_book_explore(
                 retries_on_429=1,
             )
         except OzonAPIError as e:
-            log_lines.append(f"  ❌ <b>{cl}</b>: timeslot — <code>{str(e)[:120]}</code>")
-            continue
+            status[cl] = f"❌ <b>{cl}</b>: timeslot — <code>{str(e)[:80]}</code>"
+            return
         slots = parse_timeslot_response(
             ts_response, cluster=cl, warehouse_id=wh_id, warehouse_name=wh_name,
         )
@@ -752,13 +767,41 @@ async def _auto_book_explore(
             "drop_off_name": "", "supply_type": supply_type,
         }
         unique_dates = sorted(set(s.date for s in slots))
-        log_lines.append(
-            f"  ✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
+        status[cl] = (
+            f"✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
             f"{len(unique_dates)} дат"
         )
-        # Пауза между кластерами для соблюдения лимитов Ozon
-        if idx < len(oz_clusters):
-            await asyncio.sleep(5)
+
+    # Refresh-таск: раз в 4с edit progress-сообщения по текущему status.
+    refresh_running = True
+
+    async def _progress_refresh() -> None:
+        last_text = ""
+        while refresh_running:
+            text = _render_progress()
+            if text != last_text:
+                last_text = text
+                try:
+                    await progress.edit_text(text)
+                except Exception:
+                    pass
+            await asyncio.sleep(4)
+
+    refresh_task = asyncio.create_task(_progress_refresh())
+    try:
+        await asyncio.gather(
+            *[_process_cluster(cl) for cl in oz_clusters],
+            return_exceptions=True,
+        )
+    finally:
+        refresh_running = False
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+
+    log_lines: List[str] = [f"  {status[cl]}" for cl in oz_clusters]
 
     # 5. Алгоритм best_date
     best_date = find_best_common_date(
@@ -1376,6 +1419,11 @@ async def _fetch_scoring_persistent(
     import random
     max_outer = 4
     base_delay = 60  # сек, потом +jitter 0-30с
+    # Pre-sleep: Ozon scoring обычно не готов сразу после draft_create
+    # (sync-path возвращает draft_id раньше, чем engine успел оценить склады).
+    # Без этой паузы первая попытка стабильно отдаёт ошибку или пустой scoring.
+    await _say("  ⏳ Жду расчёт Ozon… <i>(обычно 30-60с)</i>")
+    await asyncio.sleep(7)
     for attempt in range(max_outer):
         wh_list: List[Dict] = []
         try:
@@ -1392,8 +1440,8 @@ async def _fetch_scoring_persistent(
             if attempt + 1 < max_outer:
                 delay = base_delay + random.randint(0, 30)
                 await _say(
-                    f"  ⏳ Попытка {attempt+1}/{max_outer}: <i>{err[:120]}</i>. "
-                    f"Жду {delay}с до попытки {attempt+2}/{max_outer}…"
+                    f"  ⏳ Ozon ещё считает (попытка {attempt+2}/{max_outer} "
+                    f"через {delay}с)…"
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -1532,8 +1580,7 @@ async def _fetch_scoring_persistent(
                     if n_unspecified > 0 else "Ozon ещё не закончил"
                 )
                 await _say(
-                    f"  ⏳ Попытка {attempt+1}/{max_outer}: {hint}. "
-                    f"Жду {delay}с до попытки {attempt+2}/{max_outer}…"
+                    f"  ⏳ {hint} (попытка {attempt+2}/{max_outer} через {delay}с)…"
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -4112,10 +4159,29 @@ async def _run_bulk_book(bot, msg: Message, state: FSMContext) -> None:
             )
             if n_polling:
                 header += f"\n⏳ Ещё {n_polling} в авто-поиске на час."
-        try:
-            await msg.answer(header, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-        except Exception:
-            pass
+        # Финал — НЕ новое сообщение, а edit сардельки (max_edit принцип).
+        # Если не влезает (4096 байт) или сардельки нет — fallback на answer.
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        data_state = await state.get_data()
+        sausage_id = data_state.get("ob_progress_msg_id")
+        sausage_text = data_state.get("ob_progress_text") or ""
+        final_text = (sausage_text + "\n\n" + header) if sausage_text else header
+        sent = False
+        if sausage_id and len(final_text) <= 3900:
+            try:
+                await msg.bot.edit_message_text(
+                    final_text, chat_id=msg.chat.id, message_id=sausage_id,
+                    reply_markup=kb,
+                )
+                sent = True
+            except Exception as e:
+                logger.debug("bulk-book final edit failed: %s — fallback to answer", e)
+        if not sent:
+            try:
+                await msg.answer(header, reply_markup=kb)
+            except Exception:
+                pass
+        await progress_reset(state)
         _wizard_release(int(rid))
     await state.clear()
 

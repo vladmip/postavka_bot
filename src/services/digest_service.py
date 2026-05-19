@@ -563,10 +563,15 @@ def _fmt_sku_line(line: SkuLine, *, show_days: bool = True) -> str:
 def build_digest_text(data: DigestData) -> str:
     """HTML-сводка для отправки в Telegram."""
     msk_now = data.generated_at + timedelta(hours=3)
+
+    def _sep(lst: List[str]) -> None:
+        """Визуальный разделитель между секциями: 2 пустые строки + черта."""
+        lst.extend(["", "━━━━━━━━━━━━━", ""])
+
     lines: List[str] = [
         f"☀ <b>Утренняя сводка</b> · {msk_now.strftime('%d.%m %H:%M')} МСК",
-        "",
     ]
+    _sep(lines)
 
     # Акты, ждущие подтверждения (главное сверху — срочные deadline'ы Ozon).
     if data.acts_awaiting:
@@ -596,7 +601,7 @@ def build_digest_text(data: DigestData) -> str:
             '🔗 <a href="https://seller.ozon.ru/app/supply/orders?filter=ReportsConfirmation">'
             "Открыть список в Ozon ЛК</a>"
         )
-        lines.append("")
+        _sep(lines)
 
     # Возвраты — это товары к получению в ПВЗ + giveout-партии. Removals
     # (вывозы со стока FBO) — отдельная сущность ниже, в этом блоке их не
@@ -615,7 +620,7 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"  • ✅ Партии уже в ПВЗ продавца: <b>{r.giveouts_at_pvz}</b>")
         if r.pdf_bytes:
             lines.append("  • 📄 Этикетка партии — отдельным сообщением ниже.")
-    lines.append("")
+    _sep(lines)
 
     # Вывозы со стока FBO (товар, который продавец заказал вывезти со склада).
     if r.removal_from_stock:
@@ -624,7 +629,7 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(_fmt_removal_group(g))
         if len(r.removal_from_stock) > 8:
             lines.append(f"  …и ещё {len(r.removal_from_stock) - 8} групп")
-        lines.append("")
+        _sep(lines)
 
     # Вывозы с поставки (отбраковка приёмки).
     if r.removal_from_supply:
@@ -633,7 +638,7 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(_fmt_removal_group(g))
         if len(r.removal_from_supply) > 8:
             lines.append(f"  …и ещё {len(r.removal_from_supply) - 8} групп")
-        lines.append("")
+        _sep(lines)
 
     # Срочно отгрузить — топ-5 по требуемому количеству к отгрузке.
     # `ads` (ср. продажи/день) и `idc` (дни покрытия) — из Ozon
@@ -653,7 +658,7 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(_fmt_sku_line(line))
         if len(data.urgent) > TOP_URGENT_LIMIT:
             lines.append(f"  …и ещё {len(data.urgent) - TOP_URGENT_LIMIT} в очереди")
-    lines.append("")
+    _sep(lines)
 
     # Runout — топ-5 🔴 + топ-3 🟡 + счётчик 🟢. Без подзаголовков-секций:
     # эмодзи слева у каждой строки уже сообщает «красная»/«жёлтая» зону.
@@ -678,7 +683,7 @@ def build_digest_text(data: DigestData) -> str:
             lines.append(f"🟢 ещё {len(green)} SKU с запасом &gt; {RUNOUT_GREEN_DAYS} дн")
 
     if data.errors:
-        lines.append("")
+        _sep(lines)
         lines.append("<i>⚠ Не всё API ответило:</i>")
         for err in data.errors:
             lines.append(f"  · <code>{err[:160]}</code>")

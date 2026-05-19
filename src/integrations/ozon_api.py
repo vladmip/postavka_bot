@@ -974,6 +974,19 @@ class OzonClient:
         resp = await self._post("/v3/supply-order/get", payload)
         return resp.get("orders") or []
 
+    async def supply_order_bundle(self, bundle_ids: List[str]) -> List[Dict[str, Any]]:
+        """POST /v1/supply-order/bundle — состав поставки по bundle_id.
+
+        bundle_ids берутся из supplies[].bundle_id (от supply_order_get).
+        Возвращает items[] с полями: sku, offer_id, name, quantity, barcode и т.п.
+        Если bundle_ids пуст — возвращает [].
+        """
+        if not bundle_ids:
+            return []
+        payload = {"bundle_ids": [str(x) for x in bundle_ids]}
+        resp = await self._post("/v1/supply-order/bundle", payload)
+        return resp.get("items") or resp.get("bundle_items") or []
+
     async def supply_order_cancel(self, order_id: int) -> str:
         """POST /v1/supply-order/cancel — асинхронная отмена supply order.
         Возвращает operation_id для последующего poll'а через cancel/status."""
