@@ -118,21 +118,24 @@ class OzonClient:
 
         if retries_on_429 is None:
             # Для anti-abuse — 0 (любой ретрай продлевает бан).
-            # Для heavy-limit — 6 ретраев с долгим backoff (общее окно ~125с).
+            # Для heavy-limit — 2 ретрая (общее окно ~60с). Большее долбить
+            # бесполезно: наши попытки сами участвуют в перегрузке per-second
+            # лимита Ozon. После исчерпания — отдаём юзеру ❌, пусть нажмёт
+            # повтор через 1-2 мин (за это время другие продавцы отпустят).
             # Для остальных global-limit — 5 ретраев с коротким backoff (~20с).
             # Для account-level (не global) — 1.
             if is_anti_abuse:
                 retries_on_429 = 0
             elif is_heavy:
-                retries_on_429 = 6
+                retries_on_429 = 2
             elif is_global:
                 retries_on_429 = 5
             else:
                 retries_on_429 = 1
-        # Backoff: heavy — длинный (5-45с), global — короткий (2-5с),
+        # Backoff: heavy — длинный 20+40 (~60с окно), global — короткий 2-5с,
         # account-level — единственный 30с.
         if is_heavy:
-            backoff: List[int] = [5, 10, 15, 20, 30, 45]
+            backoff: List[int] = [20, 40]
         elif is_global:
             backoff = [2, 3, 4, 5, 5, 5]
         else:
