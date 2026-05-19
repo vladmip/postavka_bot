@@ -609,24 +609,13 @@ async def _auto_book_explore(
             pass
     allowed_hours_set = set(int(h) for h in hour_picks) if hour_picks else None
 
-    # Per-cluster status — одна строка, обновляется по мере прогресса.
-    # Параллельный pipeline: фоновый refresh-таск показывает текущее состояние
-    # всех кластеров в одном progress-сообщении.
-    status: Dict[str, str] = {
-        cl: f"⏳ <b>{cl}</b>: в очереди" for cl in oz_clusters
-    }
-
-    def _render_progress() -> str:
-        body = "\n".join(f"  {status[cl]}" for cl in oz_clusters)
-        return (
-            f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
-            f"Кластеров: <b>{len(oz_clusters)}</b> · параллельный поиск\n"
-            f"Дат: {', '.join(sorted(date_picks)) if date_picks else 'все 7 дней'}\n"
-            f"Часы: {sorted(allowed_hours_set) if allowed_hours_set else 'любые'}\n\n"
-            f"{body}"
-        )
-
-    progress = await msg.answer(_render_progress())
+    progress = await msg.answer(
+        f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
+        f"Кластеров: <b>{len(oz_clusters)}</b> ({', '.join(oz_clusters)})\n"
+        f"Дат: {', '.join(sorted(date_picks)) if date_picks else 'все 7 дней'}\n"
+        f"Часы: {sorted(allowed_hours_set) if allowed_hours_set else 'любые'}\n\n"
+        f"⏳ Создаю drafts… (~30-90с/кластер из-за лимита Ozon)"
+    )
 
     async def _edit(text: str) -> None:
         try:
@@ -634,11 +623,11 @@ async def _auto_book_explore(
         except Exception:
             pass  # MessageNotModified
 
-    # 4. Per-cluster: параллельно создаём drafts (semaphore 2 + 30с holdback —
-    # соблюдаем лимит ~2 req/30с на /draft/supply/create), затем scoring и
-    # timeslot — без ограничений (lightweight для Ozon).
+    # 4. Per-cluster: serial — создаём draft, ждём scoring, тянем timeslot/info,
+    # пауза 5с между кластерами (соблюдаем per-second лимит Ozon).
     slots_per_cluster: Dict[str, List] = {}
     drafts_meta: Dict[str, Dict] = {}  # cluster → {draft_id, cluster_id, wh_id, wh_name, drop_off}
+    log_lines: List[str] = []
     supply_type = 1 if is_cross else 2
     draft_type = "CREATE_TYPE_CROSSDOCK" if is_cross else "CREATE_TYPE_DIRECT"
 
@@ -654,20 +643,15 @@ async def _auto_book_explore(
     else:
         date_to_iso = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
 
-    # 1.5с pacing был агрессивнее чем Ozon разрешает (часто 429 серией). До
-    # параллельного эксперимента работало 5с pacing между кластерами. Делаем
-    # 8с — с запасом, чтобы per-second лимит не залипал.
-    sem_draft = asyncio.Semaphore(1)
-
-    async def _process_cluster(cl: str) -> None:
+    for idx, cl in enumerate(oz_clusters, 1):
         items = items_per_cluster[cl]
         if not items:
-            status[cl] = f"⚠ <b>{cl}</b>: пустой состав"
-            return
+            log_lines.append(f"  ⚠ <b>{cl}</b>: пустой состав")
+            continue
         cl_id = await _resolve_macrolocal_id(oz, cl)
         if not cl_id:
-            status[cl] = f"⚠ <b>{cl}</b>: cluster_id не сматчил"
-            return
+            log_lines.append(f"  ⚠ <b>{cl}</b>: cluster_id не сматчил")
+            continue
         drop_off = None
         if is_cross:
             v = crossdock_map.get(cl)
@@ -676,48 +660,41 @@ async def _auto_book_explore(
             except (ValueError, TypeError):
                 drop_off = None
             if not drop_off:
-                status[cl] = f"⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off"
-                return
-
-        # Stage 1: draft_create — serial + 1.5с pacing. Клиент сам ретраит 429.
-        status[cl] = f"⏳ <b>{cl}</b>: жду очередь на draft…"
-        op_id: Optional[str] = None
-        err: Optional[Exception] = None
-        async with sem_draft:
-            status[cl] = f"⏳ <b>{cl}</b>: создаю draft…"
-            try:
-                op_id = await oz.draft_create(
-                    items=items,
-                    cluster_ids=[cl_id],
-                    draft_type=draft_type,
-                    drop_off_point_warehouse_id=drop_off,
+                log_lines.append(
+                    f"  ⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off — задай через wizard"
                 )
-            except OzonAPIError as e:
-                err = e
-            # Pacing 8с — раньше работало 5с стабильно. Запас на per-second
-            # лимит Ozon (он часто загружен другими продавцами).
-            await asyncio.sleep(8)
-        if err is not None:
-            status[cl] = f"❌ <b>{cl}</b>: draft_create — <code>{str(err)[:120]}</code>"
-            return
+                continue
 
-        # Резолвим draft_id (sync vs async path)
-        if op_id and op_id.startswith("sync:"):
+        await _edit(
+            f"🎯 <b>Авто-брон поставки #{rid}</b>\n\n"
+            f"⏳ Кластер {idx}/{len(oz_clusters)}: <b>{cl}</b> — создаю draft…\n\n"
+            + "\n".join(log_lines)
+        )
+
+        try:
+            op_id = await oz.draft_create(
+                items=items,
+                cluster_ids=[cl_id],
+                draft_type=draft_type,
+                drop_off_point_warehouse_id=drop_off,
+            )
+        except OzonAPIError as e:
+            log_lines.append(f"  ❌ <b>{cl}</b>: draft_create — <code>{str(e)[:120]}</code>")
+            continue
+        if op_id.startswith("sync:"):
             draft_id = int(op_id.split(":", 1)[1])
         else:
-            status[cl] = f"⏳ <b>{cl}</b>: жду готовности draft…"
             try:
                 info = await _wait_draft_ready(oz, op_id, max_attempts=10)
             except OzonAPIError as e:
-                status[cl] = f"❌ <b>{cl}</b>: poll — <code>{str(e)[:80]}</code>"
-                return
+                log_lines.append(f"  ❌ <b>{cl}</b>: poll — <code>{str(e)[:120]}</code>")
+                continue
             draft_id = int(info.get("draft_id") or 0)
             if not draft_id:
-                status[cl] = f"❌ <b>{cl}</b>: draft_id не получен"
-                return
+                log_lines.append(f"  ❌ <b>{cl}</b>: draft_id не получен")
+                continue
 
-        # Stage 2: scoring (параллельно с другими кластерами)
-        status[cl] = f"⏳ <b>{cl}</b>: жду scoring…"
+        # Wait scoring (FULL_AVAILABLE)
         wh_id = None
         wh_name = ""
         for attempt in range(5):
@@ -743,11 +720,12 @@ async def _auto_book_explore(
                 wh_name = str(sw.get("name") or "")
                 break
         if not wh_id:
-            status[cl] = f"⚠ <b>{cl}</b>: scoring не нашёл подходящий склад"
-            return
+            log_lines.append(
+                f"  ⚠ <b>{cl}</b>: scoring не нашёл подходящий склад (FULL_AVAILABLE)"
+            )
+            continue
 
-        # Stage 3: timeslot/info (параллельно)
-        status[cl] = f"⏳ <b>{cl}</b> ({wh_name}): timeslot…"
+        # Дёргаем timeslot/info
         try:
             ts_response = await oz.draft_timeslot_info(
                 draft_id=draft_id,
@@ -759,8 +737,8 @@ async def _auto_book_explore(
                 retries_on_429=1,
             )
         except OzonAPIError as e:
-            status[cl] = f"❌ <b>{cl}</b>: timeslot — <code>{str(e)[:80]}</code>"
-            return
+            log_lines.append(f"  ❌ <b>{cl}</b>: timeslot — <code>{str(e)[:120]}</code>")
+            continue
         slots = parse_timeslot_response(
             ts_response, cluster=cl, warehouse_id=wh_id, warehouse_name=wh_name,
         )
@@ -771,41 +749,13 @@ async def _auto_book_explore(
             "drop_off_name": "", "supply_type": supply_type,
         }
         unique_dates = sorted(set(s.date for s in slots))
-        status[cl] = (
-            f"✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
+        log_lines.append(
+            f"  ✅ <b>{cl}</b> ({wh_name}): {len(slots)} слотов, "
             f"{len(unique_dates)} дат"
         )
-
-    # Refresh-таск: раз в 4с edit progress-сообщения по текущему status.
-    refresh_running = True
-
-    async def _progress_refresh() -> None:
-        last_text = ""
-        while refresh_running:
-            text = _render_progress()
-            if text != last_text:
-                last_text = text
-                try:
-                    await progress.edit_text(text)
-                except Exception:
-                    pass
-            await asyncio.sleep(4)
-
-    refresh_task = asyncio.create_task(_progress_refresh())
-    try:
-        await asyncio.gather(
-            *[_process_cluster(cl) for cl in oz_clusters],
-            return_exceptions=True,
-        )
-    finally:
-        refresh_running = False
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
-
-    log_lines: List[str] = [f"  {status[cl]}" for cl in oz_clusters]
+        # Пауза между кластерами для соблюдения лимитов Ozon
+        if idx < len(oz_clusters):
+            await asyncio.sleep(5)
 
     # 5. Алгоритм best_date
     best_date = find_best_common_date(
