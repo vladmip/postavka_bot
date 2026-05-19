@@ -489,15 +489,8 @@ async def cb_ext_tz(cb: CallbackQuery) -> None:
 
     order_number = str(order.get("order_number") or order_id)
     fname = f"TZ_Otgruzka_LK_{order_number}.xlsx"
-    total_qty = sum(r.qty for r in rows)
-    caption = (
-        f"📤 ТЗ Отгрузка для ЛК-поставки #{order_number}\n"
-        f"Drop-off: {warehouse_name}\n"
-        f"Строк: {len(rows)}, всего {total_qty} шт"
-    )
     await cb.message.answer_document(
         document=BufferedInputFile(data, filename=fname),
-        caption=caption,
     )
 
 
@@ -2546,16 +2539,6 @@ async def _send_ship_tz(msg: Message, rid: int, *, tg_id: int) -> None:
         clusters_oz = sorted({i.cluster for i in req.items if i.marketplace == "ozon"})
 
     fname = f"TZ_Otgruzka_request_{rid}.xlsx"
-    caption = (
-        f"📤 ТЗ Отгрузка для заявки #{rid}\n"
-        f"Строк: {n_items}\n"
-    )
-    if clusters_wb:
-        caption += f"WB кластеры: {', '.join(clusters_wb)}\n"
-    if clusters_oz:
-        caption += f"Ozon кластеры: {', '.join(clusters_oz)}\n"
-    caption += "\nКолонки supply_id и дата заполнятся после бронирования."
     await msg.answer_document(
         document=BufferedInputFile(data, filename=fname),
-        caption=caption,
     )

@@ -59,6 +59,13 @@ class OzonClient:
         # v2 финализация — с 16.03.2026 заменяет /v1/draft/supply/create.
         "/v2/draft/supply/create",
         "/v2/draft/supply/create/status",
+        # Новые сабпути draft_create (после 16.03.2026 заменили /v1/draft/create).
+        # Ozon отдаёт по ним code:8 «per second» — это глобальный лимит, не
+        # account-ban. Лечится коротким backoff (2-5с × 5 ретраев), а не одним
+        # 30-секундным.
+        "/v1/draft/crossdock/create",
+        "/v1/draft/direct/create",
+        "/v1/draft/multi-cluster/create",
     })
 
     def __init__(self, client_id: str, api_key: str, timeout: float = 30.0,

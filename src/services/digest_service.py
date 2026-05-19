@@ -573,13 +573,9 @@ def build_digest_text(data: DigestData) -> str:
     ]
     _sep(lines)
 
-    # Акты, ждущие подтверждения (главное сверху — срочные deadline'ы Ozon).
+    # Акты, ждущие подтверждения.
     if data.acts_awaiting:
         lines.append("📋 <b>Акты ждут подтверждения</b>")
-        lines.append(
-            "<i>Ozon принял поставки, но без твоего подтверждения через ~5 дней "
-            "цифры замораживаются автоматически. Открой каждую и сверь приход.</i>"
-        )
         for a in data.acts_awaiting[:10]:
             state_icon = "🔴" if a.state == "REPORT_REJECTED" else "🟡"
             state_text = "акт отклонён" if a.state == "REPORT_REJECTED" else "ждёт подтверждения"

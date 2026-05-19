@@ -654,7 +654,11 @@ async def _auto_book_explore(
     else:
         date_to_iso = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
 
-    sem_draft = asyncio.Semaphore(2)
+    # Реально Ozon отдаёт code:8 "per second" на /v1/draft/crossdock/create
+    # при ЛЮБОЙ конкуренции — semaphore=2 + holdback 30с давал 429 одно за другим.
+    # Жёстко serial-ный режим: одна заявка за раз + 1.5с между запросами.
+    # Клиент сам ретраит 429 теперь (этот path в _GLOBAL_LIMIT_PATHS).
+    sem_draft = asyncio.Semaphore(1)
 
     async def _process_cluster(cl: str) -> None:
         items = items_per_cluster[cl]
@@ -676,7 +680,7 @@ async def _auto_book_explore(
                 status[cl] = f"⚠ <b>{cl}</b>: для CROSSDOCK нужен drop-off"
                 return
 
-        # Stage 1: draft_create (semaphore 2 + 30с holdback)
+        # Stage 1: draft_create — serial + 1.5с pacing. Клиент сам ретраит 429.
         status[cl] = f"⏳ <b>{cl}</b>: жду очередь на draft…"
         op_id: Optional[str] = None
         err: Optional[Exception] = None
@@ -691,10 +695,10 @@ async def _auto_book_explore(
                 )
             except OzonAPIError as e:
                 err = e
-            # Holdback 30с — соблюдаем лимит на /draft/supply/create
-            await asyncio.sleep(30)
+            # Pacing: Ozon лимит ~1 req/sec, делаем чуть свободнее.
+            await asyncio.sleep(1.5)
         if err is not None:
-            status[cl] = f"❌ <b>{cl}</b>: draft_create — <code>{str(err)[:80]}</code>"
+            status[cl] = f"❌ <b>{cl}</b>: draft_create — <code>{str(err)[:120]}</code>"
             return
 
         # Резолвим draft_id (sync vs async path)
@@ -3016,10 +3020,15 @@ async def _auto_poll_slots(
                 logger.warning("auto-poll: no creds for tg_id=%s, abort", tg_id)
                 return
             # Пересоздаём drafts которым >28 мин — иначе Ozon вернёт 404 expired.
+            # Ozon лимит ~1 req/sec на /v1/draft/*/create — пауза 1.5с между.
             recreated_this_iter = 0
+            need_pacing = False
             for fd in drafts:
                 if fd.get("created_ts") and _t.time() - fd["created_ts"] > recreate_after:
+                    if need_pacing:
+                        await asyncio.sleep(1.5)
                     new_id = await _recreate_draft_for_auto_poll(oz, rid, fd, tg_id or 0)
+                    need_pacing = True
                     if new_id:
                         logger.info("auto-poll: recreated draft for cluster=%s old=%d new=%d",
                                     fd["cluster"], fd["draft_id"], new_id)

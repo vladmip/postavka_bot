@@ -260,9 +260,11 @@ def _fill_sheet(
     # ФФ-сотруднику, артикул всегда виден первым. После него ШК / Название / Поставщик.
     if is_oz:
         fixed_left = ["Артикул Поставщика", "ШК", "Название товара", "Поставщик"]
+        # «Полный адрес Озон склада» — только адрес drop-off. Таймслот теперь
+        # отдельной строкой R3 под supply_id в колонке кластера.
         fixed_right = [
             "Упаковка для товара", "примечание",
-            "Полный адрес Озон склада и таймслот",
+            "Полный адрес Озон склада",
         ]
     else:
         fixed_left = ["ШК", "Название товара", "Поставщик"]
@@ -280,11 +282,10 @@ def _fill_sheet(
         cell.border = border
     ws.row_dimensions[1].height = 32
 
-    # Шапка под R1:
-    #   WB: R2 = supply_id, R3 = слот.
-    #   Ozon: R2 = № заявки ЛК (под каждой колонкой-кластером).
-    #         Drop-off + дата+таймслот вписываются в правую колонку «Полный адрес»
-    #         per-row, рядом с данными — так юзеру удобнее видеть всё в одной точке.
+    # Шапка под R1 (одинаково для WB и Ozon):
+    #   R2 = supply_id (под колонкой склада/кластера).
+    #   R3 = дата+таймслот.
+    # Drop-off для Ozon идёт в правую колонку «Полный адрес Озон склада» per-row.
     order_numbers = order_numbers or {}
     dropoffs = dropoffs or {}
     slots_full = slots_full or {}
@@ -297,19 +298,23 @@ def _fill_sheet(
                 col_idx = first_dyn + i
                 _cluster, _wh, supply_id, _slot = col
                 bsid = supply_id or ""
-                num = order_numbers.get(bsid, bsid)
-                cell = ws.cell(row=2, column=col_idx, value=num)
-                cell.font = normal
-                cell.alignment = center
-                cell.border = border
-            # Заполнить остальные клетки строки 2 рамкой и пустотой.
+                num = order_numbers.get(bsid, bsid) if bsid else ""
+                slot_s = slots_full.get(bsid, "") if bsid else ""
+                r2 = ws.cell(row=2, column=col_idx, value=num)
+                r3 = ws.cell(row=3, column=col_idx, value=slot_s)
+                for r in (r2, r3):
+                    r.font = normal
+                    r.alignment = center
+                    r.border = border
+            # Заполнить остальные клетки строк 2/3 рамкой и пустотой.
             for c in range(1, n_cols + 1):
-                cell = ws.cell(row=2, column=c)
-                cell.border = border
-                if cell.value is None:
-                    cell.value = ""
-                if not cell.font or cell.font.name != "Arial":
-                    cell.font = normal
+                for r in (2, 3):
+                    cell = ws.cell(row=r, column=c)
+                    cell.border = border
+                    if cell.value is None:
+                        cell.value = ""
+                    if not cell.font or cell.font.name != "Arial":
+                        cell.font = normal
     else:
         first_dyn = len(fixed_left) + 1
         for i, col in enumerate(cols):
@@ -330,10 +335,11 @@ def _fill_sheet(
                 if not cell.font or cell.font.name != "Arial":
                     cell.font = normal
 
-    # Данные. Для Ozon: если есть бронирования — данные с R3, иначе с R2.
+    # Данные. Для Ozon: если есть бронирования — данные с R4 (как WB),
+    # иначе с R2 (нет шапки supply_id/slot).
     if is_oz:
         any_oz_book = any(c[2] for c in cols)
-        data_row_start = 3 if any_oz_book else 2
+        data_row_start = 4 if any_oz_book else 2
     else:
         data_row_start = 4
     row = data_row_start
@@ -371,8 +377,8 @@ def _fill_sheet(
         if hint_notes:
             c_notes.alignment = left
         if is_oz:
-            # Полный адрес + таймслот: для каждого supply_id, в который у строки
-            # есть qty, формируем «<drop-off> · <дата+таймслот>».
+            # Полный адрес drop-off: для каждого supply_id, в который у строки
+            # есть qty, добавляем drop-off. Таймслот уже в R3 под supply_id.
             parts = []
             for col in cols:
                 qty = by_col_sku.get((col, sku_id))
@@ -381,9 +387,8 @@ def _fill_sheet(
                 _cluster, _wh, supply_id, _slot = col
                 bsid = supply_id or ""
                 drop = dropoffs.get(bsid, "")
-                slot_s = slots_full.get(bsid, "")
-                if drop or slot_s:
-                    parts.append(" · ".join(p for p in (drop, slot_s) if p))
+                if drop:
+                    parts.append(drop)
             if parts:
                 ws.cell(row=row, column=right_start + 2,
                         value="; ".join(parts)).alignment = left
